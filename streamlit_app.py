@@ -177,7 +177,7 @@ with st.sidebar:
         format_func=lambda i: item_labels.get(i, str(i)),
     )
 
-    lookback = st.slider("Lookback (days)", 30, 365, 120, step=30)
+    lookback = st.slider("Lookback (days)", 30, 365, 30, step=30)
 
 
 # ─── Load ────────────────────────────────────────────────────────────────────
