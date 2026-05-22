@@ -39,9 +39,15 @@ SQL_DIR = Path(__file__).parent / "sql"
 
 # ─── Auth + BigQuery client (cached across the session) ──────────────────────
 @st.cache_resource
+def _get_sa_info():
+    """Parse the service account JSON blob from secrets."""
+    import json
+    return json.loads(st.secrets["gcp_service_account_json"])
+
+@st.cache_resource
 def get_bq_client():
     """Build a BigQuery client from the service account key in st.secrets."""
-    sa_info = dict(st.secrets["gcp_service_account"])
+    sa_info = _get_sa_info()
     credentials = service_account.Credentials.from_service_account_info(sa_info)
     return bigquery.Client(credentials=credentials, project=sa_info["project_id"])
 
@@ -49,7 +55,7 @@ def get_bq_client():
 def _load_sql(filename: str) -> str:
     """Read a SQL file and substitute {project} / {dataset} from secrets."""
     text = (SQL_DIR / filename).read_text()
-    project = st.secrets["gcp_service_account"]["project_id"]
+    project = _get_sa_info()["project_id"]
     dataset = st.secrets["bigquery"]["dataset"]
     return text.replace("{project}", project).replace("{dataset}", dataset)
 
