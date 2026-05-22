@@ -1,14 +1,10 @@
--- Daily DC inventory from DC Item Measures + DC Dimensions for the DC name.
--- Output columns aliased back to original CSV names so funpop_core consumes
--- the dataframe without modification.
+-- Daily DC inventory from dc_item + dc_dim for the DC name.
+-- Real table names confirmed against wmt-dv-bi-link-prod.dv_supplier.
 --
 -- NOTE on unit conversion:
---   `ty_on_hand_whpk_qty` is the count of warehouse packs (not eaches).
---   The CSV column `on_hand_warehouse_inventory_in_units_this_year` is
---   labeled "in units" — which historically Walmart exports as eaches.
---   If your dashboard numbers look ~6x or ~208x too small after first run,
---   multiply by `ty_whpk_each_qty` to convert packs -> eaches. The COALESCE
---   pattern below makes that swap a one-line edit.
+--   ty_on_hand_whpk_qty = warehouse PACKS (not eaches).
+--   If dashboard numbers look ~6x or ~208x too small, multiply by ty_whpk_each_qty
+--   to convert packs to eaches.
 
 SELECT
   dim.invt_dt                                AS inventory_date,
@@ -22,10 +18,10 @@ SELECT
   COALESCE(dim.ly_order_whpk_qty, 0)         AS on_order_warehouse_quantity_in_units_last_year,
   COALESCE(dim.ty_outs_each_qty, 0)          AS out_of_stock_each_quantity_this_year,
   COALESCE(dim.ly_outs_each_qty, 0)          AS out_of_stock_each_quantity_last_year
-FROM `{project}.{dataset}.dc_item_measures` AS dim
-LEFT JOIN `{project}.{dataset}.dc_dimensions` AS dcd
+FROM `{project}.{dataset}.dc_item` AS dim
+LEFT JOIN `{project}.{dataset}.dc_dim` AS dcd
   ON dim.dc_nbr = dcd.dc_nbr
-LEFT JOIN `{project}.{dataset}.item_dimensions` AS idim
+LEFT JOIN `{project}.{dataset}.item_dim` AS idim
   ON dim.wm_item_nbr = idim.wm_item_nbr
 WHERE
   dim.wm_item_nbr IN UNNEST(@active_items)
