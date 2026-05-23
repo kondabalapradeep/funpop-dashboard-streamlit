@@ -110,7 +110,7 @@ def _load_sql(filename: str) -> str:
 
 
 # ─── Data loaders ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner="Loading store data from BigQuery...")
+@st.cache_data(ttl=86400, show_spinner="Loading store data from BigQuery...")
 def load_store_data(lookback_days: int) -> pd.DataFrame:
     client = get_bq_client()
     sql = _load_sql("store_query.sql")
@@ -141,7 +141,7 @@ def load_store_data(lookback_days: int) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=600, show_spinner="Loading DC data from BigQuery...")
+@st.cache_data(ttl=86400, show_spinner="Loading DC data from BigQuery...")
 def load_dc_data(lookback_days: int) -> pd.DataFrame:
     try:
         client = get_bq_client()
@@ -187,7 +187,7 @@ with st.sidebar:
     if st.button("🔄 Refresh data", help="Clear cache, re-pull from BigQuery"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Auto-refreshes every 10 min. Click for manual refresh.")
+    st.caption("Data is cached for 24 hours. Click the button above to pull fresh data.")
 
     st.divider()
     st.subheader("Filters")
@@ -371,8 +371,10 @@ if not weekly_sales.empty:
 
     show = weekly_sales[["week_label", "units_ty", "units_ly", "yoy_units", "yoy_pct", "sales_ty"]].copy()
     show.columns = ["Week", "Units TY", "Units LY", "YoY Units", "YoY %", "Sales TY ($)"]
+    # Newest week at top
+    show = show.tail(8).iloc[::-1]
     st.dataframe(
-        show.tail(8),
+        show,
         use_container_width=True, hide_index=True,
         column_config={
             "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
@@ -819,5 +821,5 @@ if not dc_df.empty:
 st.divider()
 st.caption(
     f"BigQuery rows: {len(df):,} store · {len(dc_df):,} DC · "
-    f"Cache TTL: 10 min · Sidebar refresh button for manual reload"
+    f"Cache TTL: 24 hr · Sidebar refresh button for manual reload"
 )
