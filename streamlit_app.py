@@ -343,7 +343,7 @@ weekly_sales["yoy_pct"] = np.where(
     (weekly_sales["yoy_units"] / weekly_sales["units_ly"] * 100).round(1),
     0,
 )
-weekly_sales["week_label"] = weekly_sales["week_start"].dt.strftime("Wk %b %d")
+weekly_sales["week_label"] = "WM Wk " + weekly_sales["walmart_calendar_week"].astype(str).str[-2:]
 
 if not weekly_sales.empty:
     melted = weekly_sales.melt(
@@ -381,7 +381,172 @@ if not weekly_sales.empty:
     )
 
 
-# ─── SECTION 4 — Weekly inventory trend ──────────────────────────────────────
+# ─── SECTION 4 — Velocity (U/S/W) ────────────────────────────────────────────
+st.subheader("Velocity — Units per Store per Week (U/S/W)")
+st.caption(
+    "Total units a week, normalized by the number of stores that actually moved "
+    "product. Separates a sales decline from a distribution decline: if total units "
+    "drop but U/S/W holds, it's a distribution problem; if U/S/W is also dropping, "
+    "customers aren't buying."
+)
+
+# Weekly U/S/W — for each week, count active stores (TY and LY separately)
+def _active_stores_count(g, year_col):
+    return g[g[year_col] > 0]["store_number"].nunique()
+
+weekly_uspw = df.groupby("walmart_calendar_week", as_index=False).apply(
+    lambda g: pd.Series({
+        "week_start": g["business_date"].min(),
+        "units_ty": g["pos_quantity_this_year"].sum(),
+        "units_ly": g["pos_quantity_last_year"].sum(),
+        "stores_ty": _active_stores_count(g, "pos_quantity_this_year"),
+        "stores_ly": _active_stores_count(g, "pos_quantity_last_year"),
+    }),
+    include_groups=False,
+).reset_index(drop=True)
+weekly_uspw["uspw_ty"] = np.where(
+    weekly_uspw["stores_ty"] > 0,
+    (weekly_uspw["units_ty"] / weekly_uspw["stores_ty"]).round(2),
+    0,
+)
+weekly_uspw["uspw_ly"] = np.where(
+    weekly_uspw["stores_ly"] > 0,
+    (weekly_uspw["units_ly"] / weekly_uspw["stores_ly"]).round(2),
+    0,
+)
+weekly_uspw["uspw_yoy_pct"] = np.where(
+    weekly_uspw["uspw_ly"] > 0,
+    ((weekly_uspw["uspw_ty"] - weekly_uspw["uspw_ly"]) / weekly_uspw["uspw_ly"] * 100).round(1),
+    0,
+)
+weekly_uspw["week_label"] = "WM Wk " + weekly_uspw["walmart_calendar_week"].astype(str).str[-2:]
+weekly_uspw = weekly_uspw.sort_values("walmart_calendar_week").reset_index(drop=True)
+
+if not weekly_uspw.empty:
+    uspw_melted = weekly_uspw.melt(
+        id_vars=["week_label", "walmart_calendar_week"],
+        value_vars=["uspw_ty", "uspw_ly"],
+        var_name="Period", value_name="U/S/W",
+    )
+    uspw_melted["Period"] = uspw_melted["Period"].map({"uspw_ty": "This Year", "uspw_ly": "Last Year"})
+    uspw_chart = (
+        alt.Chart(uspw_melted)
+        .mark_line(point=alt.OverlayMarkDef(size=80), strokeWidth=3)
+        .encode(
+            x=alt.X("week_label:N", sort=list(weekly_uspw["week_label"]), title="Week",
+                    axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("U/S/W:Q", title="Units per Store per Week"),
+            color=alt.Color("Period:N",
+                            scale=alt.Scale(domain=["This Year", "Last Year"],
+                                            range=["#185FA5", "#A0A09A"])),
+            tooltip=["week_label", "Period", alt.Tooltip("U/S/W:Q", format=".2f")],
+        )
+        .properties(height=300)
+    )
+    st.altair_chart(uspw_chart, use_container_width=True)
+
+# U/S/W by item — current period summary
+st.markdown("**U/S/W by item (period total)**")
+item_uspw = df.groupby("walmart_item_number", as_index=False).apply(
+    lambda g: pd.Series({
+        "units_ty": g["pos_quantity_this_year"].sum(),
+        "units_ly": g["pos_quantity_last_year"].sum(),
+        "stores_ty": _active_stores_count(g, "pos_quantity_this_year"),
+        "stores_ly": _active_stores_count(g, "pos_quantity_last_year"),
+    }),
+    include_groups=False,
+)
+# Re-attach the walmart_item_number after apply
+item_uspw["walmart_item_number"] = df.groupby("walmart_item_number").size().index
+item_uspw["item"] = item_uspw["walmart_item_number"].map(ITEM_LABELS).fillna(
+    item_uspw["walmart_item_number"].astype(str)
+)
+item_uspw["uspw_ty"] = np.where(
+    item_uspw["stores_ty"] > 0,
+    (item_uspw["units_ty"] / item_uspw["stores_ty"] / weeks_in_period).round(2),
+    0,
+)
+item_uspw["uspw_ly"] = np.where(
+    item_uspw["stores_ly"] > 0,
+    (item_uspw["units_ly"] / item_uspw["stores_ly"] / weeks_in_period).round(2),
+    0,
+)
+item_uspw["uspw_yoy_pct"] = np.where(
+    item_uspw["uspw_ly"] > 0,
+    ((item_uspw["uspw_ty"] - item_uspw["uspw_ly"]) / item_uspw["uspw_ly"] * 100).round(1),
+    0,
+)
+
+if len(item_uspw) > 0:
+    item_cols = st.columns(len(item_uspw))
+    for col, (_, row) in zip(item_cols, item_uspw.iterrows()):
+        with col:
+            yoy_pct = row["uspw_yoy_pct"]
+            st.metric(
+                f"{row['item']}",
+                f"{row['uspw_ty']:.2f} U/S/W",
+                delta=f"{yoy_pct:+.1f}% vs LY ({row['uspw_ly']:.2f})",
+                delta_color="normal" if yoy_pct >= 0 else "inverse",
+            )
+
+# Store-level U/S/W distribution — see whether decline is concentrated or broad
+st.markdown("**Store-level velocity distribution**")
+st.caption(
+    "Each bar = number of stores at that velocity tier. A flatter distribution means "
+    "consistent performance across the network; a tall left bar means most stores are "
+    "selling little, only a few are driving the totals."
+)
+
+store_uspw = df.groupby("store_number", as_index=False).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+)
+store_uspw["uspw_ty"] = (store_uspw["units_ty"] / weeks_in_period).round(1)
+store_uspw["uspw_ly"] = (store_uspw["units_ly"] / weeks_in_period).round(1)
+
+# Bucket stores into velocity tiers
+def _bucket_label(v):
+    if v == 0: return "0 (none)"
+    if v < 1:  return "0-1"
+    if v < 3:  return "1-3"
+    if v < 5:  return "3-5"
+    if v < 10: return "5-10"
+    if v < 20: return "10-20"
+    return "20+"
+
+BUCKET_ORDER = ["0 (none)", "0-1", "1-3", "3-5", "5-10", "10-20", "20+"]
+
+store_uspw["bucket_ty"] = store_uspw["uspw_ty"].apply(_bucket_label)
+store_uspw["bucket_ly"] = store_uspw["uspw_ly"].apply(_bucket_label)
+
+dist_ty = store_uspw["bucket_ty"].value_counts().reindex(BUCKET_ORDER, fill_value=0).reset_index()
+dist_ty.columns = ["bucket", "stores"]
+dist_ty["Period"] = "This Year"
+
+dist_ly = store_uspw["bucket_ly"].value_counts().reindex(BUCKET_ORDER, fill_value=0).reset_index()
+dist_ly.columns = ["bucket", "stores"]
+dist_ly["Period"] = "Last Year"
+
+dist_combined = pd.concat([dist_ty, dist_ly], ignore_index=True)
+
+dist_chart = (
+    alt.Chart(dist_combined)
+    .mark_bar()
+    .encode(
+        x=alt.X("bucket:N", sort=BUCKET_ORDER, title="Units per Store per Week (tier)"),
+        y=alt.Y("stores:Q", title="Number of stores"),
+        color=alt.Color("Period:N",
+                        scale=alt.Scale(domain=["This Year", "Last Year"],
+                                        range=["#185FA5", "#A0A09A"])),
+        xOffset="Period:N",
+        tooltip=["bucket", "Period", alt.Tooltip("stores:Q", format=",")],
+    )
+    .properties(height=300)
+)
+st.altair_chart(dist_chart, use_container_width=True)
+
+
+# ─── SECTION 5 — Weekly inventory trend ──────────────────────────────────────
 st.subheader("Weekly inventory trend (network total)")
 
 last_day_per_week = df.groupby("walmart_calendar_week")["business_date"].max().reset_index()
@@ -399,7 +564,7 @@ weekly_inv = end_of_week.groupby("walmart_calendar_week", as_index=False).agg(
     in_transit=("store_in_transit_quantity_this_year", "sum"),
     snapshot_date=("snapshot_date", "first"),
 ).sort_values("walmart_calendar_week").reset_index(drop=True)
-weekly_inv["week_label"] = weekly_inv["snapshot_date"].dt.strftime("Wk %b %d")
+weekly_inv["week_label"] = "WM Wk " + weekly_inv["walmart_calendar_week"].astype(str).str[-2:]
 
 if not weekly_inv.empty:
     inv_melted = weekly_inv.melt(
@@ -438,7 +603,7 @@ if not weekly_inv.empty:
         )
 
 
-# ─── SECTION 5 — Item performance comparison ─────────────────────────────────
+# ─── SECTION 6 — Item performance comparison ─────────────────────────────────
 st.subheader("Item performance")
 
 latest_snapshot = df[df["business_date"] == most_recent]
@@ -477,7 +642,7 @@ if len(item_perf) > 0:
             st.metric("Weeks of supply", wos_label)
 
 
-# ─── SECTION 6 — Stockout risk ──────────────────────────────────────────────
+# ─── SECTION 7 — Stockout risk ──────────────────────────────────────────────
 st.subheader("Stockout risk")
 
 oos_daily_records = []
@@ -532,7 +697,7 @@ with co2:
         st.altair_chart(oos_chart, use_container_width=True)
 
 
-# ─── SECTION 7 — Store rankings ──────────────────────────────────────────────
+# ─── SECTION 8 — Store rankings ──────────────────────────────────────────────
 st.subheader("Top & bottom store movers")
 
 store_perf = df.groupby(
@@ -568,7 +733,7 @@ with s_right:
                  column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
 
 
-# ─── SECTION 8 — Performance by state ────────────────────────────────────────
+# ─── SECTION 9 — Performance by state ────────────────────────────────────────
 st.subheader("Performance by state (top 20)")
 
 state_perf = df.groupby("state_or_province_code", as_index=False).agg(
@@ -607,7 +772,7 @@ st_chart = (
 st.altair_chart(st_chart, use_container_width=True)
 
 
-# ─── SECTION 9 — DC pipeline health ──────────────────────────────────────────
+# ─── SECTION 10 — DC pipeline health ─────────────────────────────────────────
 if not dc_df.empty:
     st.subheader("DC pipeline health")
 
