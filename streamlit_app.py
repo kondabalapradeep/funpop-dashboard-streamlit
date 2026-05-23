@@ -43,6 +43,14 @@ ITEM_LABELS = {
     666209064: "Shelf",
 }
 
+# DC inventory comes in case packs, not eaches. Multiplier converts to units.
+# Source: confirmed with Nathan (full bin = 208 ea, half bin = 126 ea, shelf = 6 ea).
+CASE_PACK_UNITS = {
+    658442128: 208,  # Full Bin
+    658442130: 126,  # Half Bin
+    666209064: 6,    # Shelf
+}
+
 
 # ─── Auth + BigQuery client ──────────────────────────────────────────────────
 @st.cache_resource
@@ -118,6 +126,18 @@ def load_dc_data(lookback_days: int) -> pd.DataFrame:
             "out_of_stock_each_quantity_last_year",
         ]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+        # Convert case packs -> eaches using per-item multiplier.
+        # Walmart's DC tables report on_hand/on_order in warehouse packs, not units.
+        # The OOS columns are already in eaches, so we skip those.
+        multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+        for c in [
+            "on_hand_warehouse_inventory_in_units_this_year",
+            "on_hand_warehouse_inventory_in_units_last_year",
+            "on_order_warehouse_quantity_in_units_this_year",
+            "on_order_warehouse_quantity_in_units_last_year",
+        ]:
+            df[c] = (df[c] * multiplier).astype("int64")
         return df
     except Exception as e:
         st.warning(f"DC query failed; dashboard will run without DC analysis. ({e})")
@@ -208,7 +228,69 @@ k4.metric("Stores w/ sales", f"{stores_selling:,}/{stores_total:,}",
 k5.metric("Avg units/store/wk", f"{weekly_velocity:.1f}")
 
 
-# ─── SECTION 2 — Weekly sales trend ──────────────────────────────────────────
+# ─── SECTION 2 — Last 10 days daily detail ───────────────────────────────────
+st.subheader("Last 10 days — daily detail")
+
+cutoff = most_recent - timedelta(days=9)
+last10 = df[df["business_date"] >= cutoff].copy()
+
+daily = last10.groupby("business_date", as_index=False).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+    sales_ty=("pos_sales_this_year", "sum"),
+).sort_values("business_date")
+# Stores selling on each day
+stores_per_day = (
+    last10[last10["pos_quantity_this_year"] > 0]
+    .groupby("business_date")["store_number"].nunique()
+    .reset_index()
+    .rename(columns={"store_number": "stores_selling"})
+)
+daily = daily.merge(stores_per_day, on="business_date", how="left").fillna({"stores_selling": 0})
+daily["yoy_units"] = daily["units_ty"] - daily["units_ly"]
+daily["yoy_pct"] = np.where(
+    daily["units_ly"] > 0,
+    (daily["yoy_units"] / daily["units_ly"] * 100).round(1),
+    0,
+)
+daily["weekday"] = daily["business_date"].dt.strftime("%a")
+daily["date_str"] = daily["business_date"].dt.strftime("%b %d")
+
+col_left, col_right = st.columns([3, 2])
+
+with col_left:
+    daily_melted = daily.melt(
+        id_vars=["date_str", "weekday", "business_date"],
+        value_vars=["units_ty", "units_ly"],
+        var_name="Period", value_name="Units",
+    )
+    daily_melted["Period"] = daily_melted["Period"].map({"units_ty": "This Year", "units_ly": "Last Year"})
+    daily_chart = (
+        alt.Chart(daily_melted)
+        .mark_line(point=True, strokeWidth=2.5)
+        .encode(
+            x=alt.X("date_str:N", sort=list(daily["date_str"]), title="Date", axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("Units:Q", title="Units"),
+            color=alt.Color("Period:N",
+                            scale=alt.Scale(domain=["This Year", "Last Year"],
+                                            range=["#185FA5", "#A0A09A"])),
+            tooltip=["date_str", "weekday", "Period", alt.Tooltip("Units:Q", format=",")],
+        )
+        .properties(height=300)
+    )
+    st.altair_chart(daily_chart, use_container_width=True)
+
+with col_right:
+    show_daily = daily[["weekday", "date_str", "units_ty", "yoy_pct", "stores_selling"]].iloc[::-1].copy()
+    show_daily["stores_selling"] = show_daily["stores_selling"].astype(int)
+    show_daily.columns = ["Day", "Date", "Units TY", "YoY %", "Stores Selling"]
+    st.dataframe(
+        show_daily, use_container_width=True, hide_index=True, height=380,
+        column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")},
+    )
+
+
+# ─── SECTION 3 — Weekly sales trend ──────────────────────────────────────────
 st.subheader("Weekly sales trend")
 
 weekly_sales = df.groupby("walmart_calendar_week", as_index=False).agg(
@@ -262,7 +344,7 @@ if not weekly_sales.empty:
     )
 
 
-# ─── SECTION 3 — Weekly inventory trend ──────────────────────────────────────
+# ─── SECTION 4 — Weekly inventory trend ──────────────────────────────────────
 st.subheader("Weekly inventory trend (network total)")
 
 last_day_per_week = df.groupby("walmart_calendar_week")["business_date"].max().reset_index()
@@ -317,68 +399,6 @@ if not weekly_inv.empty:
             f"Latest week network on-hand: **{int(latest_oh_ty):,}** units "
             f"({yoy_inv_pct:+.1f}% vs LY {int(latest_oh_ly):,})"
         )
-
-
-# ─── SECTION 4 — Last 10 days daily detail ───────────────────────────────────
-st.subheader("Last 10 days — daily detail")
-
-cutoff = most_recent - timedelta(days=9)
-last10 = df[df["business_date"] >= cutoff].copy()
-
-daily = last10.groupby("business_date", as_index=False).agg(
-    units_ty=("pos_quantity_this_year", "sum"),
-    units_ly=("pos_quantity_last_year", "sum"),
-    sales_ty=("pos_sales_this_year", "sum"),
-).sort_values("business_date")
-# Stores selling on each day
-stores_per_day = (
-    last10[last10["pos_quantity_this_year"] > 0]
-    .groupby("business_date")["store_number"].nunique()
-    .reset_index()
-    .rename(columns={"store_number": "stores_selling"})
-)
-daily = daily.merge(stores_per_day, on="business_date", how="left").fillna({"stores_selling": 0})
-daily["yoy_units"] = daily["units_ty"] - daily["units_ly"]
-daily["yoy_pct"] = np.where(
-    daily["units_ly"] > 0,
-    (daily["yoy_units"] / daily["units_ly"] * 100).round(1),
-    0,
-)
-daily["weekday"] = daily["business_date"].dt.strftime("%a")
-daily["date_str"] = daily["business_date"].dt.strftime("%b %d")
-
-col_left, col_right = st.columns([3, 2])
-
-with col_left:
-    daily_melted = daily.melt(
-        id_vars=["date_str", "weekday", "business_date"],
-        value_vars=["units_ty", "units_ly"],
-        var_name="Period", value_name="Units",
-    )
-    daily_melted["Period"] = daily_melted["Period"].map({"units_ty": "This Year", "units_ly": "Last Year"})
-    daily_chart = (
-        alt.Chart(daily_melted)
-        .mark_line(point=True, strokeWidth=2.5)
-        .encode(
-            x=alt.X("date_str:N", sort=list(daily["date_str"]), title="Date", axis=alt.Axis(labelAngle=-30)),
-            y=alt.Y("Units:Q", title="Units"),
-            color=alt.Color("Period:N",
-                            scale=alt.Scale(domain=["This Year", "Last Year"],
-                                            range=["#185FA5", "#A0A09A"])),
-            tooltip=["date_str", "weekday", "Period", alt.Tooltip("Units:Q", format=",")],
-        )
-        .properties(height=300)
-    )
-    st.altair_chart(daily_chart, use_container_width=True)
-
-with col_right:
-    show_daily = daily[["weekday", "date_str", "units_ty", "yoy_pct", "stores_selling"]].copy()
-    show_daily["stores_selling"] = show_daily["stores_selling"].astype(int)
-    show_daily.columns = ["Day", "Date", "Units TY", "YoY %", "Stores Selling"]
-    st.dataframe(
-        show_daily, use_container_width=True, hide_index=True, height=380,
-        column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")},
-    )
 
 
 # ─── SECTION 5 — Item performance comparison ─────────────────────────────────
