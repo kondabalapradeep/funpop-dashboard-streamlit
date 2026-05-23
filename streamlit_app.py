@@ -1,25 +1,26 @@
 """
-streamlit_app.py — FunPop Sales Dashboard, Streamlit edition.
+streamlit_app.py — FunPop Sales Dashboard, redesigned.
 
-Architecture
-------------
-* Authenticates to BigQuery using the service-account key stored in st.secrets.
-* Queries the JOINed store data and the DC data — same SQL we wrote before.
-* Caches both DataFrames for 10 minutes; the "Refresh data" sidebar button
-  clears the cache and forces a fresh pull.
-* Reuses prepare_data / build_core / build_dc_analysis from funpop_core.py.
-* Renders the result with native Streamlit components — st.metric for KPIs,
-  st.dataframe for tables, st.line_chart for trends.
-
-Secrets file required (.streamlit/secrets.toml) — see secrets.toml.example.
+Sections, top to bottom:
+  1. Headline KPIs
+  2. Weekly sales trend (TY vs LY, with YoY%)
+  3. Weekly inventory trend (network on-hand + total supply)
+  4. Last 10 days — daily detail
+  5. Item performance comparison (3 items side by side)
+  6. Stockout risk — store-level OOS counts over time
+  7. Top + bottom store movers
+  8. State-level performance
+  9. DC pipeline health
 """
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 import streamlit as st
+import altair as alt
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -36,35 +37,36 @@ st.set_page_config(
 
 SQL_DIR = Path(__file__).parent / "sql"
 
+ITEM_LABELS = {
+    658442130: "Half Bin",
+    658442128: "Full Bin",
+    666209064: "Shelf",
+}
 
-# ─── Auth + BigQuery client (cached across the session) ──────────────────────
+
+# ─── Auth + BigQuery client ──────────────────────────────────────────────────
 @st.cache_resource
 def _get_sa_info():
-    """Parse the service account JSON blob from secrets."""
-    import json
     return json.loads(st.secrets["gcp_service_account_json"])
 
 
 @st.cache_resource
 def get_bq_client():
-    """Build a BigQuery client from the service account key in st.secrets."""
     sa_info = _get_sa_info()
-    credentials = service_account.Credentials.from_service_account_info(sa_info)
-    return bigquery.Client(credentials=credentials, project=sa_info["project_id"])
+    creds = service_account.Credentials.from_service_account_info(sa_info)
+    return bigquery.Client(credentials=creds, project=sa_info["project_id"])
 
 
 def _load_sql(filename: str) -> str:
-    """Read a SQL file and substitute {project} / {dataset} from secrets."""
     text = (SQL_DIR / filename).read_text()
     project = _get_sa_info()["project_id"]
     dataset = st.secrets["bigquery"]["dataset"]
     return text.replace("{project}", project).replace("{dataset}", dataset)
 
 
-# ─── Cached data loaders ─────────────────────────────────────────────────────
+# ─── Data loaders ────────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner="Loading store data from BigQuery...")
-def load_store_data(lookback_days: int = 120) -> pd.DataFrame:
-    """Pull joined daily store data. Cached for 10 min."""
+def load_store_data(lookback_days: int) -> pd.DataFrame:
     client = get_bq_client()
     sql = _load_sql("store_query.sql")
     job_config = bigquery.QueryJobConfig(query_parameters=[
@@ -72,41 +74,30 @@ def load_store_data(lookback_days: int = 120) -> pd.DataFrame:
         bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
     ])
     df = client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=False)
-
     if df.empty:
         return df
-
     df["business_date"] = pd.to_datetime(df["business_date"])
-    numeric_cols = [
+    for c in [
         "pos_quantity_this_year", "pos_quantity_last_year",
         "store_on_hand_quantity_this_year", "store_on_hand_quantity_last_year",
         "store_in_warehouse_quantity_this_year", "store_in_transit_quantity_this_year",
         "store_specific_retail_amount_this_year",
         "pos_sales_this_year", "pos_sales_last_year",
-    ]
-    for c in numeric_cols:
+    ]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-    # Mirror the unit-price correction the original load() did, in case the
-    # retail column is delivered as an aggregated $ sum rather than unit price.
     sold = df[df["pos_quantity_this_year"] > 0]
     if len(sold) and sold["store_specific_retail_amount_this_year"].median() > 10:
         unit_price = np.where(
             df["pos_quantity_this_year"] > 0,
-            (df["pos_sales_this_year"] /
-             df["pos_quantity_this_year"].replace(0, np.nan)).round(2),
+            (df["pos_sales_this_year"] / df["pos_quantity_this_year"].replace(0, np.nan)).round(2),
             0,
         )
-        df["store_specific_retail_amount_this_year"] = np.where(
-            np.isnan(unit_price), 0, unit_price,
-        )
-
+        df["store_specific_retail_amount_this_year"] = np.where(np.isnan(unit_price), 0, unit_price)
     return df
 
 
 @st.cache_data(ttl=600, show_spinner="Loading DC data from BigQuery...")
-def load_dc_data(lookback_days: int = 120) -> pd.DataFrame:
-    """Pull DC data. Returns empty DataFrame if the query fails — DC is optional."""
+def load_dc_data(lookback_days: int) -> pd.DataFrame:
     try:
         client = get_bq_client()
         sql = _load_sql("dc_query.sql")
@@ -133,182 +124,478 @@ def load_dc_data(lookback_days: int = 120) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ─── Compute the dashboard data for the current filter selection ─────────────
-def compute_dashboard(df: pd.DataFrame, dc_df: pd.DataFrame, item_filter: list) -> dict:
-    """Filter the raw data by selected items and run the original build_core /
-    build_dc_analysis. Returns the same dict the HTML version consumed."""
-    df_filt = df if not item_filter else df[df["walmart_item_number"].isin(item_filter)]
-    if df_filt.empty:
-        return {}
-    weeks = sorted(df_filt["walmart_calendar_week"].unique())
-    data = core.build_core(df_filt, weeks)
-    if not data:
-        return {}
-    if dc_df is not None and not dc_df.empty:
-        dc_filt = dc_df if not item_filter else dc_df[dc_df["walmart_item_number"].isin(item_filter)]
-        if not dc_filt.empty:
-            data["dc"] = core.build_dc_analysis(dc_filt, df_filt)
-    return data
-
-
-# ─── Sidebar — filters and refresh ───────────────────────────────────────────
+# ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
-
-    if st.button("🔄 Refresh data", help="Clear cache and re-pull from BigQuery"):
+    if st.button("🔄 Refresh data", help="Clear cache, re-pull from BigQuery"):
         st.cache_data.clear()
         st.rerun()
-
-    st.caption("Data refreshes from BigQuery every 10 minutes automatically.")
+    st.caption("Auto-refreshes every 10 min. Click for manual refresh.")
 
     st.divider()
     st.subheader("Filters")
 
-    # Item filter — multiselect with friendly labels from BIN_ITEMS / non-bin items
     item_options = list(core.ACTIVE_ITEMS)
-    item_labels = {
-        i: f"{i} ({'Bin' if i in core.BIN_ITEMS else 'Shelf'})"
-        for i in item_options
-    }
     item_filter = st.multiselect(
         "Items",
         options=item_options,
         default=item_options,
-        format_func=lambda i: item_labels.get(i, str(i)),
+        format_func=lambda i: f"{ITEM_LABELS.get(i, i)} ({i})",
     )
 
-    lookback = st.slider("Lookback (days)", 30, 365, 30, step=30)
+    lookback = st.slider(
+        "Lookback (days)",
+        min_value=14,
+        max_value=120,
+        value=30,
+        step=7,
+        help="Larger lookback = slower load. 30 days covers a healthy weekly view.",
+    )
 
 
-# ─── Load ────────────────────────────────────────────────────────────────────
+# ─── Load + filter ───────────────────────────────────────────────────────────
 df = load_store_data(lookback_days=lookback)
 dc_df = load_dc_data(lookback_days=lookback)
 
 if df.empty:
     st.error(
-        "No store data returned for the selected lookback window. "
-        "Check that the BQ tables contain rows for items "
-        f"{list(core.ACTIVE_ITEMS)} within the last {lookback} days."
+        f"No store data for the last {lookback} days. "
+        f"Check that items {list(core.ACTIVE_ITEMS)} have sales in this window."
     )
     st.stop()
 
-data = compute_dashboard(df, dc_df, item_filter)
-if not data:
-    st.warning("No data after applying current filters.")
+if item_filter:
+    df = df[df["walmart_item_number"].isin(item_filter)].copy()
+    if not dc_df.empty:
+        dc_df = dc_df[dc_df["walmart_item_number"].isin(item_filter)].copy()
+
+if df.empty:
+    st.warning("No data matches the current item filter.")
     st.stop()
+
+most_recent = df["business_date"].max()
+weeks_in_period = max(1, lookback / 7)
 
 
 # ─── Header ──────────────────────────────────────────────────────────────────
-left, right = st.columns([3, 1])
-with left:
-    st.title("FunPop Sales Dashboard")
-    st.caption(f"{data['kpi']['date_range']} · {df['business_date'].max().strftime('%b %d, %Y')} most recent")
-with right:
-    yoy_pct = data['kpi']['yoy_pct']
-    delta_color = "normal" if yoy_pct >= 0 else "inverse"
-    st.metric("Period YOY", f"{yoy_pct:+.1f}%", delta=f"{data['kpi']['yoy']:+,} units", delta_color=delta_color)
+st.title("FunPop Sales Dashboard")
+st.caption(
+    f"**{lookback}-day window** ending **{most_recent.strftime('%b %d, %Y')}** · "
+    f"{df['store_number'].nunique():,} stores · {len(item_filter)} item(s)"
+)
 
 
-# ─── KPI bar ─────────────────────────────────────────────────────────────────
-st.subheader("Period KPIs")
+# ─── SECTION 1 — Headline KPIs ───────────────────────────────────────────────
+st.subheader("Period at a glance")
+
+units_ty = int(df["pos_quantity_this_year"].sum())
+units_ly = int(df["pos_quantity_last_year"].sum())
+units_yoy = units_ty - units_ly
+units_yoy_pct = (units_yoy / units_ly * 100) if units_ly else 0
+sales_ty = float(df["pos_sales_this_year"].sum())
+sales_ly = float(df["pos_sales_last_year"].sum())
+sales_yoy_pct = ((sales_ty - sales_ly) / sales_ly * 100) if sales_ly else 0
+stores_selling = df[df["pos_quantity_this_year"] > 0]["store_number"].nunique()
+stores_total = df["store_number"].nunique()
+weekly_velocity = units_ty / stores_total / weeks_in_period if stores_total else 0
+
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("POS Units TY", f"{data['kpi']['ty']:,}")
-k2.metric("POS Units LY", f"{data['kpi']['ly']:,}")
-k3.metric("YOY Units", f"{data['kpi']['yoy']:+,}")
-k4.metric("Last 7d TY", f"{data['totals7d']['ty']:,}", delta=f"{data['totals7d']['pct']:+.1f}% vs LY")
-k5.metric("Last 7d YOY", f"{data['totals7d']['yoy']:+,}")
+k1.metric("Units sold", f"{units_ty:,}", f"{units_yoy_pct:+.1f}% YoY")
+k2.metric("Sales", f"${sales_ty:,.0f}", f"{sales_yoy_pct:+.1f}% YoY")
+k3.metric("YoY units", f"{units_yoy:+,}")
+k4.metric("Stores w/ sales", f"{stores_selling:,}/{stores_total:,}",
+          f"{(stores_selling/stores_total*100 if stores_total else 0):.0f}%")
+k5.metric("Avg units/store/wk", f"{weekly_velocity:.1f}")
 
 
-# ─── 7-day tracker ───────────────────────────────────────────────────────────
-st.subheader("Last 7 Days")
-tracker_df = pd.DataFrame(data["tracker7d"])
-if not tracker_df.empty:
-    tracker_df = tracker_df[["date", "day", "ty", "ly", "yoy", "yoy_pct"]]
-    tracker_df.columns = ["Date", "Day", "Units TY", "Units LY", "YOY", "YOY %"]
-    st.dataframe(tracker_df, use_container_width=True, hide_index=True)
+# ─── SECTION 2 — Weekly sales trend ──────────────────────────────────────────
+st.subheader("Weekly sales trend")
 
+weekly_sales = df.groupby("walmart_calendar_week", as_index=False).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+    sales_ty=("pos_sales_this_year", "sum"),
+    sales_ly=("pos_sales_last_year", "sum"),
+    week_start=("business_date", "min"),
+).sort_values("walmart_calendar_week").reset_index(drop=True)
+weekly_sales["yoy_units"] = weekly_sales["units_ty"] - weekly_sales["units_ly"]
+weekly_sales["yoy_pct"] = np.where(
+    weekly_sales["units_ly"] > 0,
+    (weekly_sales["yoy_units"] / weekly_sales["units_ly"] * 100).round(1),
+    0,
+)
+weekly_sales["week_label"] = weekly_sales["week_start"].dt.strftime("Wk %b %d")
 
-# ─── 4-week trend chart ──────────────────────────────────────────────────────
-st.subheader("4-Week Daily Trend")
-chart_df = pd.DataFrame(data["chart4w"])
-if not chart_df.empty:
-    chart_df["date"] = pd.to_datetime(chart_df["date"])
-    chart_df = chart_df.set_index("date")[["ty", "ly"]]
-    chart_df.columns = ["This Year", "Last Year"]
-    st.line_chart(chart_df, use_container_width=True)
+if not weekly_sales.empty:
+    melted = weekly_sales.melt(
+        id_vars=["week_label", "walmart_calendar_week"],
+        value_vars=["units_ty", "units_ly"],
+        var_name="Period", value_name="Units",
+    )
+    melted["Period"] = melted["Period"].map({"units_ty": "This Year", "units_ly": "Last Year"})
+    chart = (
+        alt.Chart(melted)
+        .mark_bar()
+        .encode(
+            x=alt.X("week_label:N", sort=list(weekly_sales["week_label"]), title="Week",
+                    axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("Units:Q", title="Units"),
+            color=alt.Color("Period:N",
+                            scale=alt.Scale(domain=["This Year", "Last Year"],
+                                            range=["#185FA5", "#A0A09A"])),
+            xOffset="Period:N",
+            tooltip=["week_label", "Period", alt.Tooltip("Units:Q", format=",")],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
-
-# ─── Inventory snapshot ──────────────────────────────────────────────────────
-st.subheader(f"Store Inventory — {data.get('inv_date', 'latest')}")
-inv_df = pd.DataFrame(data["inventory"])
-if not inv_df.empty:
-    inv_show = inv_df[[
-        "item", "stores", "on_hand_ty", "on_hand_ly",
-        "warehouse", "in_transit", "total_supply", "wos",
-    ]].copy()
-    inv_show.columns = [
-        "Item", "Stores", "On Hand TY", "On Hand LY",
-        "In Warehouse", "In Transit", "Total Supply", "Weeks of Supply",
-    ]
-    st.dataframe(inv_show, use_container_width=True, hide_index=True)
-
-
-# ─── Store rankings ──────────────────────────────────────────────────────────
-st.subheader("Store Rankings")
-rank_df = pd.DataFrame(data["rankings"])
-if not rank_df.empty:
-    rank_show = rank_df[[
-        "rank_ty", "store", "name", "city", "state",
-        "ty", "ly", "yoy", "yoy_pct", "sales_ty",
-        "on_hand", "cur_price", "status",
-    ]].copy()
-    rank_show.columns = [
-        "Rank", "Store #", "Name", "City", "State",
-        "Units TY", "Units LY", "YOY", "YOY %", "Sales TY ($)",
-        "On Hand", "Current Price", "Trend",
-    ]
+    show = weekly_sales[["week_label", "units_ty", "units_ly", "yoy_units", "yoy_pct", "sales_ty"]].copy()
+    show.columns = ["Week", "Units TY", "Units LY", "YoY Units", "YoY %", "Sales TY ($)"]
     st.dataframe(
-        rank_show,
-        use_container_width=True,
-        hide_index=True,
-        height=min(600, 40 + 35 * len(rank_show)),
+        show.tail(8),
+        use_container_width=True, hide_index=True,
         column_config={
-            "Sales TY ($)": st.column_config.NumberColumn(format="$%.2f"),
-            "Current Price": st.column_config.NumberColumn(format="$%.2f"),
-            "YOY %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
+            "YoY %": st.column_config.NumberColumn(format="%.1f%%"),
         },
     )
 
 
-# ─── DC analysis (only if we got DC data) ────────────────────────────────────
-if "dc" in data and data["dc"]:
-    dc = data["dc"]
-    st.divider()
-    st.header("Distribution Center Analysis")
+# ─── SECTION 3 — Weekly inventory trend ──────────────────────────────────────
+st.subheader("Weekly inventory trend (network total)")
 
-    # DC KPI strip
-    if "kpis" in dc:
-        cols = st.columns(len(dc["kpis"]))
-        for col, kpi in zip(cols, dc["kpis"]):
-            col.metric(kpi.get("label", ""), kpi.get("value", ""), delta=kpi.get("delta"))
+last_day_per_week = df.groupby("walmart_calendar_week")["business_date"].max().reset_index()
+last_day_per_week.columns = ["walmart_calendar_week", "snapshot_date"]
+end_of_week = df.merge(
+    last_day_per_week,
+    left_on=["walmart_calendar_week", "business_date"],
+    right_on=["walmart_calendar_week", "snapshot_date"],
+    how="inner",
+)
+weekly_inv = end_of_week.groupby("walmart_calendar_week", as_index=False).agg(
+    on_hand_ty=("store_on_hand_quantity_this_year", "sum"),
+    on_hand_ly=("store_on_hand_quantity_last_year", "sum"),
+    in_warehouse=("store_in_warehouse_quantity_this_year", "sum"),
+    in_transit=("store_in_transit_quantity_this_year", "sum"),
+    snapshot_date=("snapshot_date", "first"),
+).sort_values("walmart_calendar_week").reset_index(drop=True)
+weekly_inv["week_label"] = weekly_inv["snapshot_date"].dt.strftime("Wk %b %d")
 
-    # Critical / overstock tables
-    for section_key, label in [("critical", "DCs Critically Low (≤7 days supply)"),
-                                ("overstock", "DCs Overstocked (>30 days supply)")]:
-        rows = dc.get(section_key, [])
-        if rows:
-            st.markdown(f"**{label}**")
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+if not weekly_inv.empty:
+    inv_melted = weekly_inv.melt(
+        id_vars=["week_label", "walmart_calendar_week"],
+        value_vars=["on_hand_ty", "in_warehouse", "in_transit"],
+        var_name="Component", value_name="Units",
+    )
+    inv_melted["Component"] = inv_melted["Component"].map({
+        "on_hand_ty": "On Hand (stores)",
+        "in_warehouse": "In Warehouse",
+        "in_transit": "In Transit",
+    })
+    inv_chart = (
+        alt.Chart(inv_melted)
+        .mark_area()
+        .encode(
+            x=alt.X("week_label:N", sort=list(weekly_inv["week_label"]),
+                    title="Week (end-of-week snapshot)", axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("Units:Q", stack="zero", title="Units"),
+            color=alt.Color("Component:N",
+                            scale=alt.Scale(domain=["On Hand (stores)", "In Warehouse", "In Transit"],
+                                            range=["#185FA5", "#5BA3D8", "#A8D0E6"])),
+            tooltip=["week_label", "Component", alt.Tooltip("Units:Q", format=",")],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(inv_chart, use_container_width=True)
 
-    # Full DC table
-    if dc.get("full_table"):
-        with st.expander("Full DC table"):
-            st.dataframe(pd.DataFrame(dc["full_table"]), use_container_width=True, hide_index=True)
+    if len(weekly_inv) >= 1:
+        latest_oh_ty = weekly_inv.iloc[-1]["on_hand_ty"]
+        latest_oh_ly = weekly_inv.iloc[-1]["on_hand_ly"]
+        yoy_inv_pct = ((latest_oh_ty - latest_oh_ly) / latest_oh_ly * 100) if latest_oh_ly else 0
+        st.caption(
+            f"Latest week network on-hand: **{int(latest_oh_ty):,}** units "
+            f"({yoy_inv_pct:+.1f}% vs LY {int(latest_oh_ly):,})"
+        )
+
+
+# ─── SECTION 4 — Last 10 days daily detail ───────────────────────────────────
+st.subheader("Last 10 days — daily detail")
+
+cutoff = most_recent - timedelta(days=9)
+last10 = df[df["business_date"] >= cutoff].copy()
+
+daily = last10.groupby("business_date", as_index=False).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+    sales_ty=("pos_sales_this_year", "sum"),
+).sort_values("business_date")
+# Stores selling on each day
+stores_per_day = (
+    last10[last10["pos_quantity_this_year"] > 0]
+    .groupby("business_date")["store_number"].nunique()
+    .reset_index()
+    .rename(columns={"store_number": "stores_selling"})
+)
+daily = daily.merge(stores_per_day, on="business_date", how="left").fillna({"stores_selling": 0})
+daily["yoy_units"] = daily["units_ty"] - daily["units_ly"]
+daily["yoy_pct"] = np.where(
+    daily["units_ly"] > 0,
+    (daily["yoy_units"] / daily["units_ly"] * 100).round(1),
+    0,
+)
+daily["weekday"] = daily["business_date"].dt.strftime("%a")
+daily["date_str"] = daily["business_date"].dt.strftime("%b %d")
+
+col_left, col_right = st.columns([3, 2])
+
+with col_left:
+    daily_melted = daily.melt(
+        id_vars=["date_str", "weekday", "business_date"],
+        value_vars=["units_ty", "units_ly"],
+        var_name="Period", value_name="Units",
+    )
+    daily_melted["Period"] = daily_melted["Period"].map({"units_ty": "This Year", "units_ly": "Last Year"})
+    daily_chart = (
+        alt.Chart(daily_melted)
+        .mark_line(point=True, strokeWidth=2.5)
+        .encode(
+            x=alt.X("date_str:N", sort=list(daily["date_str"]), title="Date", axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("Units:Q", title="Units"),
+            color=alt.Color("Period:N",
+                            scale=alt.Scale(domain=["This Year", "Last Year"],
+                                            range=["#185FA5", "#A0A09A"])),
+            tooltip=["date_str", "weekday", "Period", alt.Tooltip("Units:Q", format=",")],
+        )
+        .properties(height=300)
+    )
+    st.altair_chart(daily_chart, use_container_width=True)
+
+with col_right:
+    show_daily = daily[["weekday", "date_str", "units_ty", "yoy_pct", "stores_selling"]].copy()
+    show_daily["stores_selling"] = show_daily["stores_selling"].astype(int)
+    show_daily.columns = ["Day", "Date", "Units TY", "YoY %", "Stores Selling"]
+    st.dataframe(
+        show_daily, use_container_width=True, hide_index=True, height=380,
+        column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")},
+    )
+
+
+# ─── SECTION 5 — Item performance comparison ─────────────────────────────────
+st.subheader("Item performance")
+
+latest_snapshot = df[df["business_date"] == most_recent]
+item_oh = latest_snapshot.groupby("walmart_item_number")["store_on_hand_quantity_this_year"].sum().to_dict()
+
+item_perf = df.groupby("walmart_item_number", as_index=False).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+    sales_ty=("pos_sales_this_year", "sum"),
+    stores=("store_number", "nunique"),
+)
+item_perf["on_hand"] = item_perf["walmart_item_number"].map(item_oh).fillna(0).astype(int)
+item_perf["item"] = item_perf["walmart_item_number"].map(ITEM_LABELS).fillna(item_perf["walmart_item_number"].astype(str))
+item_perf["yoy_units"] = item_perf["units_ty"] - item_perf["units_ly"]
+item_perf["yoy_pct"] = np.where(
+    item_perf["units_ly"] > 0,
+    (item_perf["yoy_units"] / item_perf["units_ly"] * 100).round(1),
+    0,
+)
+item_perf["wos"] = np.where(
+    item_perf["units_ty"] > 0,
+    (item_perf["on_hand"] / (item_perf["units_ty"] / weeks_in_period)).round(1),
+    np.inf,
+)
+
+if len(item_perf) > 0:
+    cols = st.columns(len(item_perf))
+    for col, (_, row) in zip(cols, item_perf.iterrows()):
+        with col:
+            st.markdown(f"### {row['item']}")
+            st.caption(f"Item {int(row['walmart_item_number'])}")
+            st.metric("Units sold", f"{int(row['units_ty']):,}", f"{row['yoy_pct']:+.1f}% YoY")
+            st.metric("Sales", f"${row['sales_ty']:,.0f}")
+            st.metric("On hand (latest)", f"{int(row['on_hand']):,}")
+            wos_label = "∞" if not np.isfinite(row['wos']) else f"{row['wos']:.1f} wks"
+            st.metric("Weeks of supply", wos_label)
+
+
+# ─── SECTION 6 — Stockout risk ──────────────────────────────────────────────
+st.subheader("Stockout risk")
+
+oos_daily_records = []
+for date, g in df.groupby("business_date"):
+    # Per-store latest on_hand on that date (if multi-item: store-item rows)
+    store_totals = g.groupby("store_number")["store_on_hand_quantity_this_year"].sum()
+    oos_daily_records.append({
+        "business_date": date,
+        "oos_stores": int((store_totals == 0).sum()),
+        "total_stores": int(len(store_totals)),
+    })
+oos_daily = pd.DataFrame(oos_daily_records).sort_values("business_date").reset_index(drop=True)
+oos_daily["oos_pct"] = (oos_daily["oos_stores"] / oos_daily["total_stores"] * 100).round(1)
+
+co1, co2 = st.columns([2, 3])
+
+with co1:
+    if len(oos_daily):
+        latest_oos = oos_daily.iloc[-1]
+        week_ago = oos_daily.iloc[-8] if len(oos_daily) >= 8 else oos_daily.iloc[0]
+        oos_delta = int(latest_oos["oos_stores"] - week_ago["oos_stores"])
+        st.metric("Stores OOS today", f"{int(latest_oos['oos_stores']):,}",
+                  delta=f"{oos_delta:+,} vs week ago", delta_color="inverse")
+        st.metric("OOS rate today", f"{latest_oos['oos_pct']:.1f}%")
+    # Chronic: store had on_hand=0 on >=7 days in the window
+    days_oos_per_store = (
+        df.groupby(["business_date", "store_number"])["store_on_hand_quantity_this_year"]
+        .sum().reset_index()
+    )
+    days_oos_per_store = days_oos_per_store[days_oos_per_store["store_on_hand_quantity_this_year"] == 0]
+    chronic_counts = days_oos_per_store.groupby("store_number").size()
+    chronic = int((chronic_counts >= 7).sum())
+    st.metric(f"Chronically OOS (≥7 days)", f"{chronic:,} stores")
+
+with co2:
+    if not oos_daily.empty:
+        oos_chart = (
+            alt.Chart(oos_daily)
+            .mark_area(opacity=0.3, color="#791F1F")
+            .encode(
+                x=alt.X("business_date:T", title="Date"),
+                y=alt.Y("oos_stores:Q", title="Stores with on-hand = 0"),
+                tooltip=[alt.Tooltip("business_date:T", title="Date"),
+                         alt.Tooltip("oos_stores:Q", format=",", title="OOS stores")],
+            )
+            .properties(height=280)
+        ) + (
+            alt.Chart(oos_daily)
+            .mark_line(color="#791F1F", strokeWidth=2)
+            .encode(x="business_date:T", y="oos_stores:Q")
+        )
+        st.altair_chart(oos_chart, use_container_width=True)
+
+
+# ─── SECTION 7 — Store rankings ──────────────────────────────────────────────
+st.subheader("Top & bottom store movers")
+
+store_perf = df.groupby(
+    ["store_number", "store_name", "city_name", "state_or_province_code"], as_index=False
+).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+    sales_ty=("pos_sales_this_year", "sum"),
+)
+store_perf["yoy_units"] = store_perf["units_ty"] - store_perf["units_ly"]
+store_perf["yoy_pct"] = np.where(
+    store_perf["units_ly"] > 0,
+    (store_perf["yoy_units"] / store_perf["units_ly"] * 100).round(1),
+    np.nan,
+)
+
+s_left, s_right = st.columns(2)
+with s_left:
+    st.markdown("**Top 20 by units sold**")
+    top = store_perf.nlargest(20, "units_ty")[
+        ["store_number", "store_name", "state_or_province_code", "units_ty", "units_ly", "yoy_pct"]
+    ].copy()
+    top.columns = ["Store #", "Name", "State", "Units TY", "Units LY", "YoY %"]
+    st.dataframe(top, use_container_width=True, hide_index=True,
+                 column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
+with s_right:
+    st.markdown("**Biggest decliners** (Bottom 20 by YoY)")
+    declining = store_perf[store_perf["units_ly"] > 0].nsmallest(20, "yoy_units")[
+        ["store_number", "store_name", "state_or_province_code", "units_ty", "units_ly", "yoy_units", "yoy_pct"]
+    ].copy()
+    declining.columns = ["Store #", "Name", "State", "Units TY", "Units LY", "YoY Δ", "YoY %"]
+    st.dataframe(declining, use_container_width=True, hide_index=True,
+                 column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
+
+
+# ─── SECTION 8 — Performance by state ────────────────────────────────────────
+st.subheader("Performance by state (top 20)")
+
+state_perf = df.groupby("state_or_province_code", as_index=False).agg(
+    units_ty=("pos_quantity_this_year", "sum"),
+    units_ly=("pos_quantity_last_year", "sum"),
+    sales_ty=("pos_sales_this_year", "sum"),
+    stores=("store_number", "nunique"),
+)
+state_perf["yoy_pct"] = np.where(
+    state_perf["units_ly"] > 0,
+    ((state_perf["units_ty"] - state_perf["units_ly"]) / state_perf["units_ly"] * 100).round(1),
+    0,
+)
+state_perf["units_per_store"] = (state_perf["units_ty"] / state_perf["stores"]).round(1)
+state_perf = state_perf.sort_values("units_ty", ascending=False).head(20)
+
+st_chart = (
+    alt.Chart(state_perf)
+    .mark_bar()
+    .encode(
+        x=alt.X("units_ty:Q", title="Units TY"),
+        y=alt.Y("state_or_province_code:N", sort="-x", title="State"),
+        color=alt.Color("yoy_pct:Q",
+                        scale=alt.Scale(scheme="redyellowgreen", domainMid=0),
+                        legend=alt.Legend(title="YoY %")),
+        tooltip=[
+            alt.Tooltip("state_or_province_code:N", title="State"),
+            alt.Tooltip("units_ty:Q", format=",", title="Units TY"),
+            alt.Tooltip("units_ly:Q", format=",", title="Units LY"),
+            alt.Tooltip("yoy_pct:Q", format=".1f", title="YoY %"),
+            alt.Tooltip("stores:Q", title="Stores"),
+        ],
+    )
+    .properties(height=420)
+)
+st.altair_chart(st_chart, use_container_width=True)
+
+
+# ─── SECTION 9 — DC pipeline health ──────────────────────────────────────────
+if not dc_df.empty:
+    st.subheader("DC pipeline health")
+
+    latest_dc_date = dc_df["inventory_date"].max()
+    dc_latest = dc_df[dc_df["inventory_date"] == latest_dc_date].copy()
+
+    total_units_per_day = df["pos_quantity_this_year"].sum() / max(1, lookback)
+    dc_count = max(1, dc_latest["distribution_center_number"].nunique())
+    daily_per_dc = total_units_per_day / dc_count
+
+    dc_summary = dc_latest.groupby(
+        ["distribution_center_number", "name_of_the_dc"], as_index=False
+    ).agg(
+        on_hand=("on_hand_warehouse_inventory_in_units_this_year", "sum"),
+        on_order=("on_order_warehouse_quantity_in_units_this_year", "sum"),
+        oos=("out_of_stock_each_quantity_this_year", "sum"),
+    )
+    dc_summary["total_supply"] = dc_summary["on_hand"] + dc_summary["on_order"]
+    dc_summary["wos_oh"] = np.where(
+        daily_per_dc > 0, (dc_summary["on_hand"] / (daily_per_dc * 7)).round(1), 0
+    )
+    dc_summary = dc_summary.sort_values("on_hand", ascending=False)
+
+    dc_left, dc_right = st.columns([1, 2])
+    with dc_left:
+        st.metric("Network DC on-hand", f"{int(dc_summary['on_hand'].sum()):,}")
+        st.metric("Network DC on-order", f"{int(dc_summary['on_order'].sum()):,}")
+        critical_dcs = int((dc_summary["wos_oh"] <= 1).sum())
+        st.metric("DCs ≤ 1 wk supply", f"{critical_dcs:,}", delta_color="inverse")
+        st.caption(f"Snapshot: {latest_dc_date.strftime('%b %d, %Y')}")
+
+    with dc_right:
+        show_dc = dc_summary[
+            ["distribution_center_number", "name_of_the_dc", "on_hand", "on_order", "total_supply", "wos_oh"]
+        ].copy()
+        show_dc.columns = ["DC #", "DC Name", "On Hand", "On Order", "Total Supply", "WOS (OH)"]
+        st.dataframe(
+            show_dc, use_container_width=True, hide_index=True, height=420,
+            column_config={"WOS (OH)": st.column_config.NumberColumn(format="%.1f wks")},
+        )
 
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"BigQuery rows: {len(df):,} store · {len(dc_df):,} DC  ·  "
-    f"Cache TTL: 10 min  ·  Use sidebar to refresh manually."
+    f"BigQuery rows: {len(df):,} store · {len(dc_df):,} DC · "
+    f"Cache TTL: 10 min · Sidebar refresh button for manual reload"
 )
