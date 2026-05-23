@@ -71,7 +71,7 @@ def load_store_data(lookback_days: int = 120) -> pd.DataFrame:
         bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
         bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
     ])
-    df = client.query(sql, job_config=job_config).to_dataframe()
+    df = client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=False)
 
     if df.empty:
         return df
@@ -114,7 +114,7 @@ def load_dc_data(lookback_days: int = 120) -> pd.DataFrame:
             bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
-        df = client.query(sql, job_config=job_config).to_dataframe()
+        df = client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=False)
         if df.empty:
             return df
         df["inventory_date"] = pd.to_datetime(df["inventory_date"])
