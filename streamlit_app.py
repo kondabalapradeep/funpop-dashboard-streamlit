@@ -35,6 +35,43 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Responsive CSS — stacks multi-column layouts vertically on phones/small tablets
+# while keeping the wide desktop layout. Breakpoint: 900px (covers phones in
+# any orientation and tablets in portrait; landscape tablets get desktop view).
+st.markdown(
+    """
+    <style>
+    @media (max-width: 900px) {
+        /* Stack st.columns content vertically */
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+            width: 100% !important;
+        }
+        /* Tighten page padding for narrow screens */
+        .block-container {
+            padding-top: 1rem;
+            padding-left: 0.75rem;
+            padding-right: 0.75rem;
+        }
+        /* Slightly smaller metric values so labels stop wrapping */
+        div[data-testid="stMetricValue"] {
+            font-size: 1.5rem;
+        }
+        /* Make tables horizontally scrollable rather than crammed */
+        div[data-testid="stDataFrame"] {
+            overflow-x: auto;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 SQL_DIR = Path(__file__).parent / "sql"
 
 ITEM_LABELS = {
