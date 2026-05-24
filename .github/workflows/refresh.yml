@@ -1,0 +1,44 @@
+# Hourly auto-refresh for the FunPop Sales Dashboard.
+#
+# Strategy:
+#   * Cron fires once per hour starting 6am Central, daily.
+#   * Each run pings the dashboard URL with curl. The first visit after each
+#     hour's slot change triggers a fresh BigQuery pull.
+#   * Inside the app, once today's data is confirmed fresh, the slot locks
+#     to a "today_done" marker — subsequent pings hit the cache only.
+#
+# DST handling:
+#   GitHub Actions cron is UTC only. Central time is UTC-6 (CST, Nov-Mar) and
+#   UTC-5 (CDT, Mar-Nov). We schedule for BOTH UTC offsets — the off-season
+#   triggers run an hour "off" but just hit cache, so they're harmless.
+#
+# Hours covered: 6am–11pm Central. After 11pm we stop trying for the day
+# (data didn't land = something's broken; tomorrow's first ping at 6am will
+# re-attempt).
+#
+# To disable: delete this file or comment out the `schedule:` section.
+
+name: Dashboard hourly refresh
+
+on:
+  schedule:
+    # CDT (Mar–Nov, UTC-5): 6am Central = 11:00 UTC, 7am = 12:00 UTC, etc.
+    # 6am–11pm CDT  →  11:00–04:00 UTC (next day for late hours)
+    - cron: '0 11-23 * * *'   # 6am–6pm CDT
+    - cron: '0 0-4 * * *'     # 7pm–11pm CDT (UTC next-day hours)
+    # CST (Nov–Mar, UTC-6): 6am Central = 12:00 UTC, 7am = 13:00 UTC, etc.
+    # 6am–11pm CST  →  12:00–05:00 UTC
+    - cron: '0 12-23 * * *'   # 6am–5pm CST
+    - cron: '0 0-5 * * *'     # 6pm–11pm CST (UTC next-day hours)
+  workflow_dispatch:           # manual trigger from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake and refresh dashboard
+        run: |
+          echo "Pinging dashboard at $(date -u) UTC..."
+          curl -sS --max-time 180 -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" \
+            https://funpop-dashboard.streamlit.app/ || true
+          echo "Done."
