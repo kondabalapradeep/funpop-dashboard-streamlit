@@ -28,6 +28,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+import numpy as np
+import streamlit as st
+import altair as alt
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+import funpop_core as core
+
 # Walmart is in Bentonville (Central Time). Daily BI Link feeds typically
 # land around 7am Central, sometimes later.
 CENTRAL_TZ = ZoneInfo("America/Chicago")
@@ -82,16 +91,6 @@ def _confirm_freshness_if_current(max_date) -> None:
     # accept it just in case to avoid pointless re-pulls.
     if max_d >= yesterday:
         _freshness_state()["confirmed_date"] = today.isoformat()
-
-
-import pandas as pd
-import numpy as np
-import streamlit as st
-import altair as alt
-from google.cloud import bigquery
-from google.oauth2 import service_account
-
-import funpop_core as core
 
 
 # ─── Page setup ──────────────────────────────────────────────────────────────
