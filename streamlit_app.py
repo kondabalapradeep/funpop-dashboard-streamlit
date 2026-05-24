@@ -262,7 +262,10 @@ sales_ly = float(df["pos_sales_last_year"].sum())
 sales_yoy_pct = ((sales_ty - sales_ly) / sales_ly * 100) if sales_ly else 0
 stores_selling = df[df["pos_quantity_this_year"] > 0]["store_number"].nunique()
 stores_total = df["store_number"].nunique()
-weekly_velocity = units_ty / stores_total / weeks_in_period if stores_total else 0
+# U/S/W uses *selling* stores so it matches the weekly U/S/W chart in Section 4.
+# Using stores_total here would deflate the velocity number for any store that
+# carried inventory but sold zero in the window.
+weekly_velocity = units_ty / stores_selling / weeks_in_period if stores_selling else 0
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Units sold", f"{units_ty:,}", f"{units_yoy_pct:+.1f}% YoY")
@@ -559,12 +562,19 @@ st.altair_chart(dist_chart, use_container_width=True)
 # ─── SECTION 5 — Weekly inventory trend ──────────────────────────────────────
 st.subheader("Weekly inventory trend (network total)")
 
-last_day_per_week = df.groupby("walmart_calendar_week")["business_date"].max().reset_index()
-last_day_per_week.columns = ["walmart_calendar_week", "snapshot_date"]
+# End-of-week snapshot PER ITEM, then sum across items.
+# Previous version picked the single latest day in the week for any item, which
+# would zero out items whose last data point was earlier in that week.
+last_day_per_week_item = (
+    df.groupby(["walmart_calendar_week", "walmart_item_number"])["business_date"]
+    .max()
+    .reset_index()
+    .rename(columns={"business_date": "snapshot_date"})
+)
 end_of_week = df.merge(
-    last_day_per_week,
-    left_on=["walmart_calendar_week", "business_date"],
-    right_on=["walmart_calendar_week", "snapshot_date"],
+    last_day_per_week_item,
+    left_on=["walmart_calendar_week", "walmart_item_number", "business_date"],
+    right_on=["walmart_calendar_week", "walmart_item_number", "snapshot_date"],
     how="inner",
 )
 weekly_inv = end_of_week.groupby("walmart_calendar_week", as_index=False).agg(
@@ -572,7 +582,7 @@ weekly_inv = end_of_week.groupby("walmart_calendar_week", as_index=False).agg(
     on_hand_ly=("store_on_hand_quantity_last_year", "sum"),
     in_warehouse=("store_in_warehouse_quantity_this_year", "sum"),
     in_transit=("store_in_transit_quantity_this_year", "sum"),
-    snapshot_date=("snapshot_date", "first"),
+    snapshot_date=("snapshot_date", "max"),
 ).sort_values("walmart_calendar_week").reset_index(drop=True)
 weekly_inv["week_label"] = "WM Wk " + weekly_inv["walmart_calendar_week"].astype(str).str[-2:]
 
@@ -616,14 +626,26 @@ if not weekly_inv.empty:
 # ─── SECTION 6 — Item performance comparison ─────────────────────────────────
 st.subheader("Item performance")
 
-latest_snapshot = df[df["business_date"] == most_recent]
-item_oh = latest_snapshot.groupby("walmart_item_number")["store_on_hand_quantity_this_year"].sum().to_dict()
+# Use each item's OWN latest reporting date. Reporting cadence may differ across
+# items (rare but possible); using a global most_recent silently zeros out items
+# whose last record predates the network max.
+latest_per_item = df.groupby("walmart_item_number")["business_date"].max().to_dict()
+item_oh = {}
+for item, item_max_date in latest_per_item.items():
+    snap = df[(df["walmart_item_number"] == item) & (df["business_date"] == item_max_date)]
+    item_oh[item] = int(snap["store_on_hand_quantity_this_year"].sum())
 
 item_perf = df.groupby("walmart_item_number", as_index=False).agg(
     units_ty=("pos_quantity_this_year", "sum"),
     units_ly=("pos_quantity_last_year", "sum"),
     sales_ty=("pos_sales_this_year", "sum"),
+    sales_ly=("pos_sales_last_year", "sum"),
     stores=("store_number", "nunique"),
+)
+item_perf["sales_yoy_pct"] = np.where(
+    item_perf["sales_ly"] > 0,
+    ((item_perf["sales_ty"] - item_perf["sales_ly"]) / item_perf["sales_ly"] * 100).round(1),
+    0,
 )
 item_perf["on_hand"] = item_perf["walmart_item_number"].map(item_oh).fillna(0).astype(int)
 item_perf["item"] = item_perf["walmart_item_number"].map(ITEM_LABELS).fillna(item_perf["walmart_item_number"].astype(str))
@@ -646,7 +668,12 @@ if len(item_perf) > 0:
             st.markdown(f"### {row['item']}")
             st.caption(f"Item {int(row['walmart_item_number'])}")
             st.metric("Units sold", f"{int(row['units_ty']):,}", f"{row['yoy_pct']:+.1f}% YoY")
-            st.metric("Sales", f"${row['sales_ty']:,.0f}")
+            st.metric(
+                "Sales",
+                f"${row['sales_ty']:,.0f}",
+                delta=f"{row['sales_yoy_pct']:+.1f}% YoY",
+                delta_color="normal" if row['sales_yoy_pct'] >= 0 else "inverse",
+            )
             st.metric("On hand (latest)", f"{int(row['on_hand']):,}")
             wos_label = "∞" if not np.isfinite(row['wos']) else f"{row['wos']:.1f} wks"
             st.metric("Weeks of supply", wos_label)
@@ -752,8 +779,6 @@ if not dc_df.empty:
     dc_latest = dc_df[dc_df["inventory_date"] == latest_dc_date].copy()
 
     total_units_per_day = df["pos_quantity_this_year"].sum() / max(1, lookback)
-    dc_count = max(1, dc_latest["distribution_center_number"].nunique())
-    daily_per_dc = total_units_per_day / dc_count
 
     dc_summary = dc_latest.groupby(
         ["distribution_center_number", "name_of_the_dc"], as_index=False
@@ -763,8 +788,19 @@ if not dc_df.empty:
         oos=("out_of_stock_each_quantity_this_year", "sum"),
     )
     dc_summary["total_supply"] = dc_summary["on_hand"] + dc_summary["on_order"]
+
+    # Allocate network daily demand to each DC by its share of network on-hand.
+    # This is a proxy: it assumes a DC holding more inventory serves more demand,
+    # which is generally true since Walmart sizes DC inventory to store volume.
+    # Caveat: directional only. For exact per-DC demand we would need to join
+    # against the dc_alignment table (store->DC mapping) and sum store sales there.
+    network_oh_total = max(1, dc_summary["on_hand"].sum())
+    dc_summary["demand_share"] = dc_summary["on_hand"] / network_oh_total
+    dc_summary["daily_demand_est"] = dc_summary["demand_share"] * total_units_per_day
     dc_summary["wos_oh"] = np.where(
-        daily_per_dc > 0, (dc_summary["on_hand"] / (daily_per_dc * 7)).round(1), 0
+        dc_summary["daily_demand_est"] > 0,
+        (dc_summary["on_hand"] / (dc_summary["daily_demand_est"] * 7)).round(1),
+        0,
     )
     dc_summary = dc_summary.sort_values("on_hand", ascending=False)
 
