@@ -442,12 +442,12 @@ with tab_overview:
                                             range=["#185FA5", "#A0A09A"])),
             tooltip=["date_str", "weekday", "Period", alt.Tooltip("Units:Q", format=",")],
         ).properties(height=300))
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width='stretch')
     with c_r:
         show = daily[["weekday", "date_str", "units_ty", "yoy_pct", "stores_selling"]].iloc[::-1].copy()
         show["stores_selling"] = show["stores_selling"].astype(int)
         show.columns = ["Day", "Date", "Units TY", "YoY %", "Stores Selling"]
-        st.dataframe(show, use_container_width=True, hide_index=True, height=380,
+        st.dataframe(show, width='stretch', hide_index=True, height=380,
                      column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
 
     # ── Item performance ─────────────────────────────────────────────────────
@@ -528,7 +528,7 @@ with tab_overview:
                 alt.Chart(oos_daily).mark_line(color="#791F1F", strokeWidth=2)
                 .encode(x="business_date:T", y="oos_stores:Q")
             )
-            st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, width='stretch')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -563,12 +563,12 @@ with tab_sales:
                             range=["#185FA5", "#A0A09A"])),
             xOffset="Period:N",
             tooltip=["week_label", "Period", alt.Tooltip("Units:Q", format=",")],
-        ).properties(height=320)), use_container_width=True)
+        ).properties(height=320)), width='stretch')
 
         show = weekly_sales[["week_label", "units_ty", "units_ly", "yoy_units", "yoy_pct", "sales_ty"]].copy()
         show.columns = ["Week", "Units TY", "Units LY", "YoY Units", "YoY %", "Sales TY ($)"]
         show = show.tail(8).iloc[::-1]
-        st.dataframe(show, use_container_width=True, hide_index=True,
+        st.dataframe(show, width='stretch', hide_index=True,
                      column_config={
                          "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
                          "YoY %": st.column_config.NumberColumn(format="%.1f%%"),
@@ -582,18 +582,23 @@ with tab_sales:
         "if U/S/W also drops, customers aren't buying."
     )
 
-    def _active(g, col): return g[g[col] > 0]["store_number"].nunique()
-
-    weekly_uspw = df.groupby("walmart_calendar_week", as_index=False).apply(
-        lambda g: pd.Series({
-            "week_start": g["business_date"].min(),
-            "units_ty": g["pos_quantity_this_year"].sum(),
-            "units_ly": g["pos_quantity_last_year"].sum(),
-            "stores_ty": _active(g, "pos_quantity_this_year"),
-            "stores_ly": _active(g, "pos_quantity_last_year"),
-        }),
-        include_groups=False,
-    ).reset_index(drop=True)
+    # Build weekly U/S/W with plain agg (pandas-3-safe; avoids groupby.apply)
+    weekly_uspw = df.groupby("walmart_calendar_week", as_index=False).agg(
+        week_start=("business_date", "min"),
+        units_ty=("pos_quantity_this_year", "sum"),
+        units_ly=("pos_quantity_last_year", "sum"),
+    )
+    # Active stores per week, per year, computed separately and merged
+    ty_active = (df[df["pos_quantity_this_year"] > 0]
+                 .groupby("walmart_calendar_week")["store_number"].nunique()
+                 .rename("stores_ty").reset_index())
+    ly_active = (df[df["pos_quantity_last_year"] > 0]
+                 .groupby("walmart_calendar_week")["store_number"].nunique()
+                 .rename("stores_ly").reset_index())
+    weekly_uspw = weekly_uspw.merge(ty_active, on="walmart_calendar_week", how="left")
+    weekly_uspw = weekly_uspw.merge(ly_active, on="walmart_calendar_week", how="left")
+    weekly_uspw["stores_ty"] = weekly_uspw["stores_ty"].fillna(0).astype(int)
+    weekly_uspw["stores_ly"] = weekly_uspw["stores_ly"].fillna(0).astype(int)
     weekly_uspw["uspw_ty"] = np.where(weekly_uspw["stores_ty"] > 0,
         (weekly_uspw["units_ty"] / weekly_uspw["stores_ty"]).round(2), 0)
     weekly_uspw["uspw_ly"] = np.where(weekly_uspw["stores_ly"] > 0,
@@ -613,20 +618,24 @@ with tab_sales:
             color=alt.Color("Period:N", scale=alt.Scale(domain=["This Year", "Last Year"],
                             range=["#185FA5", "#A0A09A"])),
             tooltip=["week_label", "Period", alt.Tooltip("U/S/W:Q", format=".2f")],
-        ).properties(height=300)), use_container_width=True)
+        ).properties(height=300)), width='stretch')
 
     # ── U/S/W by item ────────────────────────────────────────────────────────
     st.markdown("**U/S/W by item (period total)**")
-    item_uspw = df.groupby("walmart_item_number", as_index=False).apply(
-        lambda g: pd.Series({
-            "units_ty": g["pos_quantity_this_year"].sum(),
-            "units_ly": g["pos_quantity_last_year"].sum(),
-            "stores_ty": _active(g, "pos_quantity_this_year"),
-            "stores_ly": _active(g, "pos_quantity_last_year"),
-        }),
-        include_groups=False,
+    item_uspw = df.groupby("walmart_item_number", as_index=False).agg(
+        units_ty=("pos_quantity_this_year", "sum"),
+        units_ly=("pos_quantity_last_year", "sum"),
     )
-    item_uspw["walmart_item_number"] = df.groupby("walmart_item_number").size().index
+    ty_active_item = (df[df["pos_quantity_this_year"] > 0]
+                      .groupby("walmart_item_number")["store_number"].nunique()
+                      .rename("stores_ty").reset_index())
+    ly_active_item = (df[df["pos_quantity_last_year"] > 0]
+                      .groupby("walmart_item_number")["store_number"].nunique()
+                      .rename("stores_ly").reset_index())
+    item_uspw = item_uspw.merge(ty_active_item, on="walmart_item_number", how="left")
+    item_uspw = item_uspw.merge(ly_active_item, on="walmart_item_number", how="left")
+    item_uspw["stores_ty"] = item_uspw["stores_ty"].fillna(0).astype(int)
+    item_uspw["stores_ly"] = item_uspw["stores_ly"].fillna(0).astype(int)
     item_uspw["item"] = item_uspw["walmart_item_number"].map(ITEM_LABELS).fillna(
         item_uspw["walmart_item_number"].astype(str))
     item_uspw["uspw_ty"] = np.where(item_uspw["stores_ty"] > 0,
@@ -676,7 +685,7 @@ with tab_sales:
                         range=["#185FA5", "#A0A09A"])),
         xOffset="Period:N",
         tooltip=["bucket", "Period", alt.Tooltip("stores:Q", format=",")],
-    ).properties(height=300)), use_container_width=True)
+    ).properties(height=300)), width='stretch')
 
     # ── NEW: Forecast attainment ────────────────────────────────────────────
     st.divider()
@@ -724,11 +733,11 @@ with tab_sales:
                                 range=["#A0A09A", "#185FA5"])),
                 xOffset="Series:N",
                 tooltip=["week_label", "Series", alt.Tooltip("Units:Q", format=",")],
-            ).properties(height=320)), use_container_width=True)
+            ).properties(height=320)), width='stretch')
         with fa_r:
             show = weekly_attn[["week_label", "actual", "forecast", "attainment_pct"]].iloc[::-1].copy()
             show.columns = ["Week", "Actual", "Forecast", "Attainment %"]
-            st.dataframe(show, use_container_width=True, hide_index=True,
+            st.dataframe(show, width='stretch', hide_index=True,
                          column_config={"Attainment %": st.column_config.NumberColumn(format="%.1f%%")})
 
         avg_attn = weekly_attn["attainment_pct"].mean()
@@ -774,7 +783,7 @@ with tab_inv:
                 domain=["On Hand (stores)", "In Warehouse", "In Transit"],
                 range=["#185FA5", "#5BA3D8", "#A8D0E6"])),
             tooltip=["week_label", "Component", alt.Tooltip("Units:Q", format=",")],
-        ).properties(height=320)), use_container_width=True)
+        ).properties(height=320)), width='stretch')
 
         latest = weekly_inv.iloc[-1]
         yoy = ((latest["on_hand_ty"] - latest["on_hand_ly"]) / latest["on_hand_ly"] * 100) if latest["on_hand_ly"] else 0
@@ -819,7 +828,7 @@ with tab_inv:
                     ),
                     tooltip=[alt.Tooltip("adjustment_date:T", title="Date"),
                              alt.Tooltip("net_adj:Q", format=",.0f", title="Net adj")],
-                ).properties(height=280)), use_container_width=True)
+                ).properties(height=280)), width='stretch')
             with pi_r:
                 net_total = int(br_filt["adjustment_qty_ty"].sum())
                 abs_total = int(br_filt["adjustment_qty_ty"].abs().sum())
@@ -900,7 +909,7 @@ with tab_inv:
                                   "on_hand", "on_order", "total_supply", "wos_oh"]].copy()
             show_dc["wos_oh"] = show_dc["wos_oh"].replace(np.inf, np.nan)
             show_dc.columns = ["DC #", "DC Name", "On Hand", "On Order", "Total Supply", "WOS (OH)"]
-            st.dataframe(show_dc, use_container_width=True, hide_index=True, height=420,
+            st.dataframe(show_dc, width='stretch', hide_index=True, height=420,
                          column_config={"WOS (OH)": st.column_config.NumberColumn(format="%.1f wks")})
 
 
@@ -956,7 +965,7 @@ with tab_channels:
                 tooltip=["service_channel:N", alt.Tooltip("units_ty:Q", format=","),
                          alt.Tooltip("units_ly:Q", format=","),
                          alt.Tooltip("yoy_pct:Q", format=".1f")],
-            ).properties(height=280)), use_container_width=True)
+            ).properties(height=280)), width='stretch')
 
     # ── eComm Inventory ──────────────────────────────────────────────────────
     st.divider()
@@ -995,7 +1004,7 @@ with tab_channels:
                     color=alt.Color("Series:N", scale=alt.Scale(domain=["On Hand", "Available to Sell"],
                                     range=["#185FA5", "#5BA3D8"])),
                     tooltip=[alt.Tooltip("report_date:T"), "Series", alt.Tooltip("Units:Q", format=",")],
-                ).properties(height=280)), use_container_width=True)
+                ).properties(height=280)), width='stretch')
 
     # ── Store Returns ────────────────────────────────────────────────────────
     st.divider()
@@ -1050,7 +1059,7 @@ with tab_channels:
                                     range=["#791F1F", "#A0A09A"])),
                     xOffset="Period:N",
                     tooltip=["week_label", "Period", alt.Tooltip("Returns:Q", format=",")],
-                ).properties(height=280)), use_container_width=True)
+                ).properties(height=280)), width='stretch')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1094,7 +1103,7 @@ with tab_dist:
                     "Selling but not in plan": selling_not_in_plan,
                 })
             cov_df = pd.DataFrame(rows)
-            st.dataframe(cov_df, use_container_width=True, hide_index=True,
+            st.dataframe(cov_df, width='stretch', hide_index=True,
                          column_config={"Coverage %": st.column_config.NumberColumn(format="%.1f%%")})
 
             # KPI bar across items
@@ -1131,7 +1140,7 @@ with tab_dist:
                  alt.Tooltip("units_ly:Q", format=",", title="Units LY"),
                  alt.Tooltip("yoy_pct:Q", format=".1f", title="YoY %"),
                  alt.Tooltip("stores:Q", title="Stores")],
-    ).properties(height=420)), use_container_width=True)
+    ).properties(height=420)), width='stretch')
 
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
