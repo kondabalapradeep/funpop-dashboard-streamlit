@@ -539,16 +539,30 @@ with tab_sales:
     st.subheader("Weekly sales trend")
 
     weekly_sales = df.groupby("walmart_calendar_week", as_index=False).agg(
-        units_ty=("pos_quantity_this_year", "sum"),
-        units_ly=("pos_quantity_last_year", "sum"),
-        sales_ty=("pos_sales_this_year", "sum"),
-        sales_ly=("pos_sales_last_year", "sum"),
+        units_ty_raw=("pos_quantity_this_year", "sum"),
+        units_ly_raw=("pos_quantity_last_year", "sum"),
+        sales_ty_raw=("pos_sales_this_year", "sum"),
+        sales_ly_raw=("pos_sales_last_year", "sum"),
+        days_in_week=("business_date", "nunique"),
         week_start=("business_date", "min"),
     ).sort_values("walmart_calendar_week").reset_index(drop=True)
+    # Normalize each week to a 7-day equivalent based on days of data present.
+    # This keeps the current (in-progress) week comparable to completed weeks.
+    norm = 7 / weekly_sales["days_in_week"].clip(lower=1)
+    weekly_sales["units_ty"] = (weekly_sales["units_ty_raw"] * norm).round().astype(int)
+    weekly_sales["units_ly"] = (weekly_sales["units_ly_raw"] * norm).round().astype(int)
+    weekly_sales["sales_ty"] = (weekly_sales["sales_ty_raw"] * norm).round(2)
+    weekly_sales["sales_ly"] = (weekly_sales["sales_ly_raw"] * norm).round(2)
     weekly_sales["yoy_units"] = weekly_sales["units_ty"] - weekly_sales["units_ly"]
     weekly_sales["yoy_pct"] = np.where(weekly_sales["units_ly"] > 0,
         (weekly_sales["yoy_units"] / weekly_sales["units_ly"] * 100).round(1), 0)
-    weekly_sales["week_label"] = "WM Wk " + weekly_sales["walmart_calendar_week"].astype(str).str[-2:]
+    # Flag in-progress weeks
+    weekly_sales["is_partial"] = weekly_sales["days_in_week"] < 7
+    weekly_sales["week_label"] = np.where(
+        weekly_sales["is_partial"],
+        "WM Wk " + weekly_sales["walmart_calendar_week"].astype(str).str[-2:] + " *",
+        "WM Wk " + weekly_sales["walmart_calendar_week"].astype(str).str[-2:],
+    )
 
     if not weekly_sales.empty:
         m = weekly_sales.melt(id_vars=["week_label", "walmart_calendar_week"],
@@ -565,8 +579,15 @@ with tab_sales:
             tooltip=["week_label", "Period", alt.Tooltip("Units:Q", format=",")],
         ).properties(height=320)), width='stretch')
 
+        if weekly_sales["is_partial"].any():
+            partial_wk = weekly_sales[weekly_sales["is_partial"]].iloc[-1]
+            st.caption(
+                f"Note: week marked with `*` ({partial_wk['week_label']}) is in-progress "
+                f"({int(partial_wk['days_in_week'])}/7 days). Values shown are extrapolated "
+                f"to a full-week equivalent for fair comparison."
+            )
         show = weekly_sales[["week_label", "units_ty", "units_ly", "yoy_units", "yoy_pct", "sales_ty"]].copy()
-        show.columns = ["Week", "Units TY", "Units LY", "YoY Units", "YoY %", "Sales TY ($)"]
+        show.columns = ["Week", "Units TY (7d eq)", "Units LY (7d eq)", "YoY Units", "YoY %", "Sales TY ($)"]
         show = show.tail(8).iloc[::-1]
         st.dataframe(show, width='stretch', hide_index=True,
                      column_config={
@@ -585,10 +606,11 @@ with tab_sales:
     # Build weekly U/S/W with plain agg (pandas-3-safe; avoids groupby.apply)
     weekly_uspw = df.groupby("walmart_calendar_week", as_index=False).agg(
         week_start=("business_date", "min"),
-        units_ty=("pos_quantity_this_year", "sum"),
-        units_ly=("pos_quantity_last_year", "sum"),
+        units_ty_raw=("pos_quantity_this_year", "sum"),
+        units_ly_raw=("pos_quantity_last_year", "sum"),
+        days_in_week=("business_date", "nunique"),
     )
-    # Active stores per week, per year, computed separately and merged
+    # Active stores per week (count of distinct stores across the week, not affected by partial-week)
     ty_active = (df[df["pos_quantity_this_year"] > 0]
                  .groupby("walmart_calendar_week")["store_number"].nunique()
                  .rename("stores_ty").reset_index())
@@ -599,11 +621,20 @@ with tab_sales:
     weekly_uspw = weekly_uspw.merge(ly_active, on="walmart_calendar_week", how="left")
     weekly_uspw["stores_ty"] = weekly_uspw["stores_ty"].fillna(0).astype(int)
     weekly_uspw["stores_ly"] = weekly_uspw["stores_ly"].fillna(0).astype(int)
+    # Normalize partial-week units to 7-day equivalent for fair YoY comparison
+    norm = 7 / weekly_uspw["days_in_week"].clip(lower=1)
+    weekly_uspw["units_ty"] = weekly_uspw["units_ty_raw"] * norm
+    weekly_uspw["units_ly"] = weekly_uspw["units_ly_raw"] * norm
     weekly_uspw["uspw_ty"] = np.where(weekly_uspw["stores_ty"] > 0,
         (weekly_uspw["units_ty"] / weekly_uspw["stores_ty"]).round(2), 0)
     weekly_uspw["uspw_ly"] = np.where(weekly_uspw["stores_ly"] > 0,
         (weekly_uspw["units_ly"] / weekly_uspw["stores_ly"]).round(2), 0)
-    weekly_uspw["week_label"] = "WM Wk " + weekly_uspw["walmart_calendar_week"].astype(str).str[-2:]
+    weekly_uspw["is_partial"] = weekly_uspw["days_in_week"] < 7
+    weekly_uspw["week_label"] = np.where(
+        weekly_uspw["is_partial"],
+        "WM Wk " + weekly_uspw["walmart_calendar_week"].astype(str).str[-2:] + " *",
+        "WM Wk " + weekly_uspw["walmart_calendar_week"].astype(str).str[-2:],
+    )
     weekly_uspw = weekly_uspw.sort_values("walmart_calendar_week").reset_index(drop=True)
 
     if not weekly_uspw.empty:
