@@ -192,13 +192,21 @@ with st.sidebar:
     st.divider()
     st.subheader("Filters")
 
-    item_options = list(core.ACTIVE_ITEMS)
-    item_filter = st.multiselect(
-        "Items",
-        options=item_options,
-        default=item_options,
-        format_func=lambda i: f"{ITEM_LABELS.get(i, i)} ({i})",
+    # Both bins share the same UPC (different item numbers for full/half config),
+    # so we treat them as one consumer-facing item for analytics.
+    BIN_ITEMS_SET = [658442128, 658442130]
+    SHELF_ITEMS_SET = [666209064]
+    item_view = st.radio(
+        "View",
+        options=["Total (all items)", "Both Bins (full + half)", "Shelf only"],
+        index=0,
     )
+    if item_view == "Total (all items)":
+        item_filter = list(core.ACTIVE_ITEMS)
+    elif item_view == "Both Bins (full + half)":
+        item_filter = BIN_ITEMS_SET
+    else:
+        item_filter = SHELF_ITEMS_SET
 
     lookback = st.slider(
         "Lookback (days)",
@@ -238,7 +246,7 @@ weeks_in_period = max(1, lookback / 7)
 st.title("FunPop Sales Dashboard")
 st.caption(
     f"**{lookback}-day window** ending **{most_recent.strftime('%b %d, %Y')}** · "
-    f"{df['store_number'].nunique():,} stores · {len(item_filter)} item(s)"
+    f"{df['store_number'].nunique():,} stores · {item_view}"
 )
 
 
@@ -647,16 +655,15 @@ if len(item_perf) > 0:
 # ─── SECTION 7 — Stockout risk ──────────────────────────────────────────────
 st.subheader("Stockout risk")
 
-oos_daily_records = []
-for date, g in df.groupby("business_date"):
-    # Per-store latest on_hand on that date (if multi-item: store-item rows)
-    store_totals = g.groupby("store_number")["store_on_hand_quantity_this_year"].sum()
-    oos_daily_records.append({
-        "business_date": date,
-        "oos_stores": int((store_totals == 0).sum()),
-        "total_stores": int(len(store_totals)),
-    })
-oos_daily = pd.DataFrame(oos_daily_records).sort_values("business_date").reset_index(drop=True)
+# Vectorized OOS daily — aggregate to store-day totals first, then count
+store_day_oh = df.groupby(["business_date", "store_number"], as_index=False)[
+    "store_on_hand_quantity_this_year"
+].sum()
+store_day_oh["is_oos"] = (store_day_oh["store_on_hand_quantity_this_year"] == 0).astype(int)
+oos_daily = store_day_oh.groupby("business_date", as_index=False).agg(
+    oos_stores=("is_oos", "sum"),
+    total_stores=("store_number", "nunique"),
+).sort_values("business_date").reset_index(drop=True)
 oos_daily["oos_pct"] = (oos_daily["oos_stores"] / oos_daily["total_stores"] * 100).round(1)
 
 co1, co2 = st.columns([2, 3])
@@ -699,82 +706,45 @@ with co2:
         st.altair_chart(oos_chart, use_container_width=True)
 
 
-# ─── SECTION 8 — Store rankings ──────────────────────────────────────────────
-st.subheader("Top & bottom store movers")
+# ─── SECTION 8 — Performance by state (collapsed) ────────────────────────────
+with st.expander("Performance by state (top 20)", expanded=False):
+ state_perf = df.groupby("state_or_province_code", as_index=False).agg(
+     units_ty=("pos_quantity_this_year", "sum"),
+     units_ly=("pos_quantity_last_year", "sum"),
+     sales_ty=("pos_sales_this_year", "sum"),
+     stores=("store_number", "nunique"),
+ )
+ state_perf["yoy_pct"] = np.where(
+     state_perf["units_ly"] > 0,
+     ((state_perf["units_ty"] - state_perf["units_ly"]) / state_perf["units_ly"] * 100).round(1),
+     0,
+ )
+ state_perf["units_per_store"] = (state_perf["units_ty"] / state_perf["stores"]).round(1)
+ state_perf = state_perf.sort_values("units_ty", ascending=False).head(20)
 
-store_perf = df.groupby(
-    ["store_number", "store_name", "city_name", "state_or_province_code"], as_index=False
-).agg(
-    units_ty=("pos_quantity_this_year", "sum"),
-    units_ly=("pos_quantity_last_year", "sum"),
-    sales_ty=("pos_sales_this_year", "sum"),
-)
-store_perf["yoy_units"] = store_perf["units_ty"] - store_perf["units_ly"]
-store_perf["yoy_pct"] = np.where(
-    store_perf["units_ly"] > 0,
-    (store_perf["yoy_units"] / store_perf["units_ly"] * 100).round(1),
-    np.nan,
-)
-
-s_left, s_right = st.columns(2)
-with s_left:
-    st.markdown("**Top 20 by units sold**")
-    top = store_perf.nlargest(20, "units_ty")[
-        ["store_number", "store_name", "state_or_province_code", "units_ty", "units_ly", "yoy_pct"]
-    ].copy()
-    top.columns = ["Store #", "Name", "State", "Units TY", "Units LY", "YoY %"]
-    st.dataframe(top, use_container_width=True, hide_index=True,
-                 column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
-with s_right:
-    st.markdown("**Biggest decliners** (Bottom 20 by YoY)")
-    declining = store_perf[store_perf["units_ly"] > 0].nsmallest(20, "yoy_units")[
-        ["store_number", "store_name", "state_or_province_code", "units_ty", "units_ly", "yoy_units", "yoy_pct"]
-    ].copy()
-    declining.columns = ["Store #", "Name", "State", "Units TY", "Units LY", "YoY Δ", "YoY %"]
-    st.dataframe(declining, use_container_width=True, hide_index=True,
-                 column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
-
-
-# ─── SECTION 9 — Performance by state ────────────────────────────────────────
-st.subheader("Performance by state (top 20)")
-
-state_perf = df.groupby("state_or_province_code", as_index=False).agg(
-    units_ty=("pos_quantity_this_year", "sum"),
-    units_ly=("pos_quantity_last_year", "sum"),
-    sales_ty=("pos_sales_this_year", "sum"),
-    stores=("store_number", "nunique"),
-)
-state_perf["yoy_pct"] = np.where(
-    state_perf["units_ly"] > 0,
-    ((state_perf["units_ty"] - state_perf["units_ly"]) / state_perf["units_ly"] * 100).round(1),
-    0,
-)
-state_perf["units_per_store"] = (state_perf["units_ty"] / state_perf["stores"]).round(1)
-state_perf = state_perf.sort_values("units_ty", ascending=False).head(20)
-
-st_chart = (
-    alt.Chart(state_perf)
-    .mark_bar()
-    .encode(
-        x=alt.X("units_ty:Q", title="Units TY"),
-        y=alt.Y("state_or_province_code:N", sort="-x", title="State"),
-        color=alt.Color("yoy_pct:Q",
-                        scale=alt.Scale(scheme="redyellowgreen", domainMid=0),
-                        legend=alt.Legend(title="YoY %")),
-        tooltip=[
-            alt.Tooltip("state_or_province_code:N", title="State"),
-            alt.Tooltip("units_ty:Q", format=",", title="Units TY"),
-            alt.Tooltip("units_ly:Q", format=",", title="Units LY"),
-            alt.Tooltip("yoy_pct:Q", format=".1f", title="YoY %"),
-            alt.Tooltip("stores:Q", title="Stores"),
-        ],
-    )
-    .properties(height=420)
-)
-st.altair_chart(st_chart, use_container_width=True)
+ st_chart = (
+     alt.Chart(state_perf)
+     .mark_bar()
+     .encode(
+         x=alt.X("units_ty:Q", title="Units TY"),
+         y=alt.Y("state_or_province_code:N", sort="-x", title="State"),
+         color=alt.Color("yoy_pct:Q",
+                         scale=alt.Scale(scheme="redyellowgreen", domainMid=0),
+                         legend=alt.Legend(title="YoY %")),
+         tooltip=[
+             alt.Tooltip("state_or_province_code:N", title="State"),
+             alt.Tooltip("units_ty:Q", format=",", title="Units TY"),
+             alt.Tooltip("units_ly:Q", format=",", title="Units LY"),
+             alt.Tooltip("yoy_pct:Q", format=".1f", title="YoY %"),
+             alt.Tooltip("stores:Q", title="Stores"),
+         ],
+     )
+     .properties(height=420)
+ )
+ st.altair_chart(st_chart, use_container_width=True)
 
 
-# ─── SECTION 10 — DC pipeline health ─────────────────────────────────────────
+# ─── SECTION 9 — DC pipeline health ──────────────────────────────────────────
 if not dc_df.empty:
     st.subheader("DC pipeline health")
 
