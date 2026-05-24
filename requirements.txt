@@ -1,10 +1,11 @@
-# Pin to known-stable versions. Avoid pandas 3.0 / numpy 2.4 / Python 3.14
-# bleeding-edge combos that break subtle pandas groupby patterns.
-streamlit>=1.32,<2.0
-pandas>=2.0,<3.0
-numpy>=1.24,<2.0
-google-cloud-bigquery>=3.0,<4.0
-google-auth>=2.20,<3.0
-pyarrow>=15.0,<20.0
-db-dtypes>=1.0,<2.0
-altair>=5.0,<6.0
+# Loosened pins for Python 3.14 compatibility on Streamlit Cloud.
+# Critical pin: pandas < 3.0 to avoid the groupby() API breakage we hit.
+# Everything else: latest stable, the code is broadly compatible.
+streamlit
+pandas<3.0
+numpy
+google-cloud-bigquery
+google-auth
+pyarrow
+db-dtypes
+altair
