@@ -112,7 +112,7 @@ class VelocityModel:
     raw_coef: dict
     r2: float
     n: int
-    n_states: int
+    n_areas: int
     resid_std: float
     units_per_store_mean: float
     weekend_share: float
@@ -146,7 +146,7 @@ class VelocityModel:
     @property
     def confidence_note(self) -> str:
         return (
-            f"Fit on {self.n:,} state-days across {self.n_states} states · "
+            f"Fit on {self.n:,} area-days across {self.n_areas} local weather areas · "
             f"R²={self.r2:.2f} (share of day-to-day velocity swings the model explains)."
         )
 
@@ -245,7 +245,7 @@ def fit_velocity_model(panel: pd.DataFrame) -> VelocityModel | None:
         raw_coef=raw_coef,
         r2=max(0.0, r2),
         n=len(data),
-        n_states=int(data["state_or_province_code"].nunique()) if "state_or_province_code" in data else 0,
+        n_areas=int(data["area"].nunique()) if "area" in data else 0,
         resid_std=resid_std,
         units_per_store_mean=float(y.mean()),
         weekend_share=float(pd.to_datetime(data["date"]).dt.weekday.isin([5, 6]).mean()),
@@ -316,7 +316,7 @@ if __name__ == "__main__":
         for d in dates:
             temp = rng.normal(86, 9)
             precip = max(0, rng.normal(0.08, 0.18))
-            rows.append({"state_or_province_code": st_code, "date": d,
+            rows.append({"area": st_code, "date": d,
                          "temperature_max_f": temp, "precipitation_in": precip})
     panel = add_weather_features(pd.DataFrame(rows))
     is_wknd = panel["date"].dt.weekday.isin([5, 6]).astype(float)
@@ -329,7 +329,7 @@ if __name__ == "__main__":
     assert model is not None, "model should fit on 240 state-days"
     print("=== Fit ===")
     print("coef:", {k: round(v, 3) for k, v in model.coef.items()})
-    print("R²:", round(model.r2, 3), "n:", model.n, "states:", model.n_states,
+    print("R²:", round(model.r2, 3), "n:", model.n, "areas:", model.n_areas,
           "confidence:", model.confidence)
     for b in model.driver_summary():
         print("  •", b.replace("**", ""))
