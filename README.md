@@ -9,6 +9,7 @@ A Streamlit app that pulls live data from BigQuery using your service-account JS
 | File | What it is |
 |---|---|
 | `streamlit_app.py` | The Streamlit app — auth, BQ queries, UI rendering. |
+| `weather_model.py` | Weather→sales engine for the Weather & Demand tab (pure, unit-tested functions: heat/rain/hot-dry velocity model, sales-change attribution, forecast projection). Run `python weather_model.py` for its self-test. |
 | `funpop_core.py` | Original data-prep logic, reused unchanged (HTML template is in here too but unused). |
 | `sql/store_query.sql` | The store JOIN query. |
 | `sql/dc_query.sql` | The DC query. |
