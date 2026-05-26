@@ -27,12 +27,15 @@ name: Dashboard hourly refresh
 
 on:
   schedule:
+    # Offset to :17 past the hour, not :00. GitHub heavily throttles/drops
+    # scheduled runs at the top of the hour (highest contention), which caused
+    # overnight runs to be skipped. A non-zero minute is far more reliable.
     # CDT (Mar-Nov, UTC-5): 6am Central = 11:00 UTC, 7am = 12:00 UTC, etc.
-    - cron: '0 11-23 * * *'   # 6am-6pm CDT
-    - cron: '0 0-4 * * *'     # 7pm-11pm CDT (UTC next-day hours)
+    - cron: '17 11-23 * * *'   # 6am-6pm CDT
+    - cron: '17 0-4 * * *'     # 7pm-11pm CDT (UTC next-day hours)
     # CST (Nov-Mar, UTC-6): 6am Central = 12:00 UTC, 7am = 13:00 UTC, etc.
-    - cron: '0 12-23 * * *'   # 6am-5pm CST
-    - cron: '0 0-5 * * *'     # 6pm-11pm CST (UTC next-day hours)
+    - cron: '17 12-23 * * *'   # 6am-5pm CST
+    - cron: '17 0-5 * * *'     # 6pm-11pm CST (UTC next-day hours)
   workflow_dispatch:           # manual trigger from the Actions tab
 
 # Don't let a slow run overlap the next scheduled one.
