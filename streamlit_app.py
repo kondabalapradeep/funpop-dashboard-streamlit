@@ -256,15 +256,22 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
             "out_of_stock_each_quantity_last_year",
         ]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        # Convert case packs → eaches for on_hand and on_order (OOS is already eaches)
-        multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+        # Convert warehouse packs → eaches for on_hand and on_order (OOS already
+        # eaches). Prefer the real per-row eaches-per-pack from BigQuery; fall back
+        # to the known constant only where the feed is missing or zero.
+        if "warehouse_pack_each_quantity" in df.columns:
+            pack_each = pd.to_numeric(df["warehouse_pack_each_quantity"], errors="coerce").fillna(0)
+            fallback = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+            multiplier = pack_each.where(pack_each > 0, fallback)
+        else:
+            multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
         for c in [
             "on_hand_warehouse_inventory_in_units_this_year",
             "on_hand_warehouse_inventory_in_units_last_year",
             "on_order_warehouse_quantity_in_units_this_year",
             "on_order_warehouse_quantity_in_units_last_year",
         ]:
-            df[c] = (df[c] * multiplier).astype("int64")
+            df[c] = (df[c] * multiplier).round().astype("int64")
         return df
     except Exception as e:
         _section_error("DC data", e)
@@ -557,10 +564,16 @@ with st.sidebar:
         _today_central = datetime.now(CENTRAL_TZ).date()
         _days_since_sat = (_today_central.weekday() - 5) % 7  # 0 on a Saturday
         _days_into_current = _days_since_sat + 1               # +1 to include today
-        lookback = 28 + _days_into_current                      # 4 full wks + current
+        # Window must start on the Saturday 4 weeks before the current WM week.
+        # The BQ filter is `bus_dt >= today - lookback`, so:
+        #   lookback = 27 + days_into_current
+        #            = 28 full-week days + (days_into_current - 1) elapsed days.
+        # (Using 28 + days_into_current pulled one extra day, creating a stray
+        #  1-day partial week at the left edge of the weekly charts.)
+        lookback = 27 + _days_into_current
         st.caption(
-            f"📅 Showing **{lookback} days**: 4 full Walmart weeks + "
-            f"{_days_into_current} day(s) into current week"
+            f"📅 Showing **4 full Walmart weeks + {_days_into_current} day(s)** "
+            f"into the current week ({lookback + 1} calendar days)"
         )
     else:
         lookback = st.slider(

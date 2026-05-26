@@ -1,44 +1,88 @@
 # Hourly auto-refresh for the FunPop Sales Dashboard.
 #
 # Strategy:
-#   * Cron fires once per hour starting 6am Central, daily.
-#   * Each run pings the dashboard URL with curl. The first visit after each
-#     hour's slot change triggers a fresh BigQuery pull.
-#   * Inside the app, once today's data is confirmed fresh, the slot locks
-#     to a "today_done" marker — subsequent pings hit the cache only.
+#   * Cron fires once per hour from 6am Central, daily.
+#   * Each run loads the dashboard in a real headless browser (Playwright).
+#     A plain `curl` only fetches Streamlit's static page shell and does NOT
+#     run the Python script — Streamlit executes the script (and warms the
+#     @st.cache_data BigQuery cache) only inside a real browser/WebSocket
+#     session. The browser load is what actually triggers the fresh BQ pull.
+#   * Inside the app, once the previous day's data is confirmed fresh, the
+#     cache slot locks to a "today_done" marker, so later loads hit cache only.
 #
 # DST handling:
 #   GitHub Actions cron is UTC only. Central time is UTC-6 (CST, Nov-Mar) and
 #   UTC-5 (CDT, Mar-Nov). We schedule for BOTH UTC offsets — the off-season
 #   triggers run an hour "off" but just hit cache, so they're harmless.
 #
-# Hours covered: 6am–11pm Central. After 11pm we stop trying for the day
+# Hours covered: 6am-11pm Central. After 11pm we stop trying for the day
 # (data didn't land = something's broken; tomorrow's first ping at 6am will
 # re-attempt).
 #
-# To disable: delete this file or comment out the `schedule:` section.
+# Note: GitHub Actions cron is best-effort and can be delayed or skipped under
+# load, so timing is approximate. To disable: delete this file or comment out
+# the `schedule:` section.
 
 name: Dashboard hourly refresh
 
 on:
   schedule:
-    # CDT (Mar–Nov, UTC-5): 6am Central = 11:00 UTC, 7am = 12:00 UTC, etc.
-    # 6am–11pm CDT  →  11:00–04:00 UTC (next day for late hours)
-    - cron: '0 11-23 * * *'   # 6am–6pm CDT
-    - cron: '0 0-4 * * *'     # 7pm–11pm CDT (UTC next-day hours)
-    # CST (Nov–Mar, UTC-6): 6am Central = 12:00 UTC, 7am = 13:00 UTC, etc.
-    # 6am–11pm CST  →  12:00–05:00 UTC
-    - cron: '0 12-23 * * *'   # 6am–5pm CST
-    - cron: '0 0-5 * * *'     # 6pm–11pm CST (UTC next-day hours)
+    # CDT (Mar-Nov, UTC-5): 6am Central = 11:00 UTC, 7am = 12:00 UTC, etc.
+    - cron: '0 11-23 * * *'   # 6am-6pm CDT
+    - cron: '0 0-4 * * *'     # 7pm-11pm CDT (UTC next-day hours)
+    # CST (Nov-Mar, UTC-6): 6am Central = 12:00 UTC, 7am = 13:00 UTC, etc.
+    - cron: '0 12-23 * * *'   # 6am-5pm CST
+    - cron: '0 0-5 * * *'     # 6pm-11pm CST (UTC next-day hours)
   workflow_dispatch:           # manual trigger from the Actions tab
 
+# Don't let a slow run overlap the next scheduled one.
+concurrency:
+  group: dashboard-warm
+  cancel-in-progress: false
+
 jobs:
-  ping:
+  warm:
     runs-on: ubuntu-latest
     steps:
-      - name: Wake and refresh dashboard
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright (Chromium)
         run: |
-          echo "Pinging dashboard at $(date -u) UTC..."
-          curl -sS --max-time 180 -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" \
-            https://funpop-dashboard.streamlit.app/ || true
-          echo "Done."
+          npm init -y
+          npm install playwright@1.48.0
+          npx playwright install --with-deps chromium
+
+      - name: Warm dashboard (real browser session runs the app + BQ pull)
+        env:
+          DASHBOARD_URL: https://funpop-dashboard.streamlit.app/
+        run: |
+          cat > warm.mjs <<'EOF'
+          import { chromium } from 'playwright';
+
+          const url = process.env.DASHBOARD_URL;
+          const browser = await chromium.launch();
+          try {
+            const page = await browser.newPage();
+            console.log(`Loading ${url} ...`);
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+
+            // If Community Cloud put the app to sleep, click the wake button.
+            try {
+              await page.getByRole('button', { name: /get this app back up/i })
+                .click({ timeout: 8000 });
+              console.log('Clicked wake button.');
+            } catch { /* app was already awake */ }
+
+            // Let Streamlit open its WebSocket and finish a full script run
+            // (the BigQuery pull) so st.cache_data is warmed for real visitors.
+            await page.waitForLoadState('networkidle', { timeout: 120000 }).catch(() => {});
+            await page.waitForTimeout(60000);
+
+            console.log('Warmed. Title:', await page.title());
+          } finally {
+            await browser.close();
+          }
+          EOF
+          node warm.mjs
