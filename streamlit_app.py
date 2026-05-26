@@ -3,6 +3,7 @@ streamlit_app.py — FunPop Sales Dashboard
 
 Tab structure:
   Overview          — KPIs, last 10 days, item performance, stockout risk
+  Weather           — Heat/dryness correlation, maps, forward weather demand outlook
   Sales & Velocity  — Weekly sales, U/S/W, forecast attainment
   Inventory & DC    — Weekly inventory, phantom inventory, DC pipeline (true alignment)
   Channels          — Omni sales, eComm inventory, store returns
@@ -24,6 +25,8 @@ on one source produces a section-local warning rather than a page crash.
 """
 
 import json
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -144,6 +147,26 @@ CASE_PACK_UNITS = {
     658442128: 208,  # Full Bin
     658442130: 126,  # Half Bin
     666209064: 6,    # Shelf
+}
+
+STATE_CENTROIDS = {
+    "AL": (32.806671, -86.791130), "AK": (61.370716, -152.404419), "AZ": (33.729759, -111.431221),
+    "AR": (34.969704, -92.373123), "CA": (36.116203, -119.681564), "CO": (39.059811, -105.311104),
+    "CT": (41.597782, -72.755371), "DE": (39.318523, -75.507141), "FL": (27.766279, -81.686783),
+    "GA": (33.040619, -83.643074), "HI": (21.094318, -157.498337), "ID": (44.240459, -114.478828),
+    "IL": (40.349457, -88.986137), "IN": (39.849426, -86.258278), "IA": (42.011539, -93.210526),
+    "KS": (38.526600, -96.726486), "KY": (37.668140, -84.670067), "LA": (31.169546, -91.867805),
+    "ME": (44.693947, -69.381927), "MD": (39.063946, -76.802101), "MA": (42.230171, -71.530106),
+    "MI": (43.326618, -84.536095), "MN": (45.694454, -93.900192), "MS": (32.741646, -89.678696),
+    "MO": (38.456085, -92.288368), "MT": (46.921925, -110.454353), "NE": (41.125370, -98.268082),
+    "NV": (38.313515, -117.055374), "NH": (43.452492, -71.563896), "NJ": (40.298904, -74.521011),
+    "NM": (34.840515, -106.248482), "NY": (42.165726, -74.948051), "NC": (35.630066, -79.806419),
+    "ND": (47.528912, -99.784012), "OH": (40.388783, -82.764915), "OK": (35.565342, -96.928917),
+    "OR": (44.572021, -122.070938), "PA": (40.590752, -77.209755), "RI": (41.680893, -71.511780),
+    "SC": (33.856892, -80.945007), "SD": (44.299782, -99.438828), "TN": (35.747845, -86.692345),
+    "TX": (31.054487, -97.563461), "UT": (40.150032, -111.862434), "VT": (44.045876, -72.710686),
+    "VA": (37.769337, -78.169968), "WA": (47.400902, -121.490494), "WV": (38.491226, -80.954453),
+    "WI": (44.268543, -89.616508), "WY": (42.755966, -107.302490), "DC": (38.907192, -77.036873),
 }
 
 
@@ -340,6 +363,119 @@ def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         return pd.DataFrame(), str(e)
 
 
+def _open_meteo_daily_url(base_url: str, states: tuple[str, ...], **extra_params) -> str:
+    coords = [STATE_CENTROIDS[s] for s in states]
+    params = {
+        "latitude": ",".join(f"{lat:.4f}" for lat, _ in coords),
+        "longitude": ",".join(f"{lon:.4f}" for _, lon in coords),
+        "daily": "temperature_2m_max,precipitation_sum",
+        "temperature_unit": "fahrenheit",
+        "precipitation_unit": "inch",
+        "timezone": "America/Chicago",
+    }
+    params.update(extra_params)
+    return f"{base_url}?{urllib.parse.urlencode(params)}"
+
+
+def _fetch_json(url: str) -> dict | list:
+    req = urllib.request.Request(url, headers={"User-Agent": "funpop-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _weather_payload_to_frame(payload, states: tuple[str, ...], period: str) -> pd.DataFrame:
+    blocks = payload if isinstance(payload, list) else [payload]
+    rows = []
+    for state, block in zip(states, blocks):
+        daily = block.get("daily", {})
+        for date, temp, precip in zip(
+            daily.get("time", []),
+            daily.get("temperature_2m_max", []),
+            daily.get("precipitation_sum", []),
+        ):
+            lat, lon = STATE_CENTROIDS[state]
+            rows.append({
+                "state_or_province_code": state,
+                "date": pd.to_datetime(date),
+                "temperature_max_f": temp,
+                "precipitation_in": precip,
+                "lat": lat,
+                "lon": lon,
+                "period": period,
+            })
+    return pd.DataFrame(rows)
+
+
+def _add_weather_score(wx: pd.DataFrame) -> pd.DataFrame:
+    if wx.empty:
+        return wx
+    out = wx.copy()
+    temp = pd.to_numeric(out["temperature_max_f"], errors="coerce").fillna(0)
+    precip = pd.to_numeric(out["precipitation_in"], errors="coerce").fillna(0)
+    heat = ((temp - 70) / 25).clip(lower=0, upper=1.4)
+    dry = (1 - (precip / 0.50)).clip(lower=0, upper=1)
+    out["heat_dry_score"] = ((0.7 * heat + 0.3 * dry) * 100).round(0)
+    out["weather_label"] = np.select(
+        [out["heat_dry_score"] >= 90, out["heat_dry_score"] >= 65, out["heat_dry_score"] >= 40],
+        ["Prime", "Good", "Neutral"],
+        default="Soft",
+    )
+    return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_weather_data(
+    states: tuple[str, ...],
+    start_date: str,
+    end_date: str,
+    forecast_days: int = 14,
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
+    states = tuple(s for s in states if s in STATE_CENTROIDS)
+    if not states:
+        return pd.DataFrame(), pd.DataFrame(), "No selected states have weather coordinates."
+    try:
+        hist_url = _open_meteo_daily_url(
+            "https://archive-api.open-meteo.com/v1/archive",
+            states,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        forecast_url = _open_meteo_daily_url(
+            "https://api.open-meteo.com/v1/forecast",
+            states,
+            forecast_days=forecast_days,
+        )
+        hist = _add_weather_score(_weather_payload_to_frame(_fetch_json(hist_url), states, "Historical"))
+        forecast = _add_weather_score(_weather_payload_to_frame(_fetch_json(forecast_url), states, "Forecast"))
+        return hist, forecast, None
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), str(e)
+
+
+def _safe_corr(frame: pd.DataFrame, x: str, y: str) -> float:
+    clean = frame[[x, y]].dropna()
+    if len(clean) < 3 or clean[x].nunique() < 2 or clean[y].nunique() < 2:
+        return 0.0
+    return float(clean[x].corr(clean[y]))
+
+
+def _fit_weather_lift_model(wx_sales: pd.DataFrame) -> tuple[np.ndarray, pd.Series, pd.Series]:
+    model = wx_sales[["units_per_store", "temperature_max_f", "precipitation_in"]].dropna()
+    if len(model) < 10 or model["units_per_store"].mean() <= 0:
+        return np.array([0.0, 0.0, 0.0]), pd.Series(dtype=float), pd.Series(dtype=float)
+    means = model[["temperature_max_f", "precipitation_in"]].mean()
+    y = (model["units_per_store"] / model["units_per_store"].mean()) - 1
+    x = np.column_stack([
+        np.ones(len(model)),
+        model["temperature_max_f"] - means["temperature_max_f"],
+        model["precipitation_in"] - means["precipitation_in"],
+    ])
+    beta, *_ = np.linalg.lstsq(x, y, rcond=None)
+    beta[1] = max(0, beta[1])
+    beta[2] = min(0, beta[2])
+    return beta, means, model["units_per_store"].describe()
+
+
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
@@ -493,8 +629,9 @@ st.caption(
 
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
-tab_overview, tab_sales, tab_inv, tab_channels, tab_dist = st.tabs([
+tab_overview, tab_weather, tab_sales, tab_inv, tab_channels, tab_dist = st.tabs([
     "Overview",
+    "Weather",
     "Sales & Velocity",
     "Inventory & DC",
     "Channels",
@@ -656,7 +793,231 @@ with tab_overview:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 2 — SALES & VELOCITY
+#   TAB 2 — WEATHER
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_weather:
+    st.subheader("Weather impact")
+    st.caption(
+        "Direct API connection: Open-Meteo historical weather + 14-day forecast. "
+        "Weather is mapped at state-center level until exact store coordinates are available."
+    )
+
+    state_sales = df.groupby("state_or_province_code", as_index=False).agg(
+        units_ty=("pos_quantity_this_year", "sum"),
+        sales_ty=("pos_sales_this_year", "sum"),
+        stores=("store_number", "nunique"),
+    ).sort_values("units_ty", ascending=False)
+    weather_states = tuple(state_sales[
+        state_sales["state_or_province_code"].isin(STATE_CENTROIDS)
+    ]["state_or_province_code"].head(12))
+
+    if not weather_states:
+        st.info("No state codes in the sales data could be matched to weather coordinates.")
+    else:
+        weather_hist, weather_forecast, weather_err = load_weather_data(
+            weather_states,
+            df["business_date"].min().date().isoformat(),
+            most_recent.date().isoformat(),
+            forecast_days=14,
+        )
+
+        if weather_err:
+            st.warning(f"Weather API unavailable right now.\n\n`{weather_err}`")
+        elif weather_hist.empty or weather_forecast.empty:
+            st.info("Weather API returned no usable records for the selected states.")
+        else:
+            daily_state_sales = df.groupby(
+                ["business_date", "state_or_province_code"], as_index=False
+            ).agg(
+                units_ty=("pos_quantity_this_year", "sum"),
+                sales_ty=("pos_sales_this_year", "sum"),
+                stores_reporting=("store_number", "nunique"),
+            )
+            daily_state_sales["units_per_store"] = np.where(
+                daily_state_sales["stores_reporting"] > 0,
+                daily_state_sales["units_ty"] / daily_state_sales["stores_reporting"],
+                0,
+            )
+            wx_sales = daily_state_sales.merge(
+                weather_hist,
+                left_on=["state_or_province_code", "business_date"],
+                right_on=["state_or_province_code", "date"],
+                how="inner",
+            )
+
+            if wx_sales.empty:
+                st.info("Weather loaded, but there were no matching weather dates for the sales window.")
+            else:
+                temp_corr = _safe_corr(wx_sales, "temperature_max_f", "units_per_store")
+                precip_corr = _safe_corr(wx_sales, "precipitation_in", "units_per_store")
+                prime_days = int((wx_sales["heat_dry_score"] >= 90).sum())
+                dry_days = int((wx_sales["precipitation_in"] <= 0.05).sum())
+
+                w1, w2, w3, w4 = st.columns(4)
+                w1.metric("Temp correlation", f"{temp_corr:+.2f}", help="Correlation vs units/store/day")
+                w2.metric("Precip correlation", f"{precip_corr:+.2f}", help="Negative means wetter days sold less")
+                w3.metric("Prime heat/dry days", f"{prime_days:,}")
+                w4.metric("Dry state-days", f"{dry_days:,}", help="State-days with <= 0.05 inches precipitation")
+
+                hist_daily = wx_sales.groupby("business_date", as_index=False).agg(
+                    units_ty=("units_ty", "sum"),
+                    temperature_max_f=("temperature_max_f", "mean"),
+                    precipitation_in=("precipitation_in", "mean"),
+                    heat_dry_score=("heat_dry_score", "mean"),
+                ).sort_values("business_date")
+
+                h_l, h_r = st.columns([3, 2])
+                with h_l:
+                    st.markdown("**Historical sales vs heat/dry score**")
+                    hist_chart = alt.layer(
+                        alt.Chart(hist_daily).mark_bar(opacity=0.45, color="#185FA5").encode(
+                            x=alt.X("business_date:T", title="Date"),
+                            y=alt.Y("units_ty:Q", title="Units sold"),
+                            tooltip=[
+                                alt.Tooltip("business_date:T", title="Date"),
+                                alt.Tooltip("units_ty:Q", format=",", title="Units"),
+                                alt.Tooltip("temperature_max_f:Q", format=".1f", title="Avg high F"),
+                                alt.Tooltip("precipitation_in:Q", format=".2f", title="Avg precip in"),
+                                alt.Tooltip("heat_dry_score:Q", format=".0f", title="Heat/dry score"),
+                            ],
+                        ),
+                        alt.Chart(hist_daily).mark_line(color="#BA7517", strokeWidth=2).encode(
+                            x="business_date:T",
+                            y=alt.Y("heat_dry_score:Q", title="Heat/dry score"),
+                        ),
+                    ).resolve_scale(y="independent").properties(height=320)
+                    st.altair_chart(hist_chart, width='stretch')
+                with h_r:
+                    st.markdown("**Daily relationship**")
+                    scatter = alt.Chart(wx_sales).mark_circle(size=70, opacity=0.55).encode(
+                        x=alt.X("temperature_max_f:Q", title="Daily high (F)"),
+                        y=alt.Y("units_per_store:Q", title="Units / store / day"),
+                        color=alt.Color("precipitation_in:Q", scale=alt.Scale(scheme="blues"),
+                                        legend=alt.Legend(title="Precip in")),
+                        tooltip=[
+                            alt.Tooltip("state_or_province_code:N", title="State"),
+                            alt.Tooltip("business_date:T", title="Date"),
+                            alt.Tooltip("temperature_max_f:Q", format=".1f", title="High F"),
+                            alt.Tooltip("precipitation_in:Q", format=".2f", title="Precip in"),
+                            alt.Tooltip("units_per_store:Q", format=".2f", title="Units/store"),
+                        ],
+                    ).properties(height=320)
+                    st.altair_chart(scatter, width='stretch')
+
+                st.divider()
+                st.subheader("14-day weather-driven outlook")
+
+                beta, weather_means, _ = _fit_weather_lift_model(wx_sales)
+                recent_cutoff = most_recent - timedelta(days=13)
+                recent_state = df[df["business_date"] >= recent_cutoff].groupby(
+                    "state_or_province_code", as_index=False
+                ).agg(
+                    recent_units=("pos_quantity_this_year", "sum"),
+                    recent_days=("business_date", "nunique"),
+                    stores=("store_number", "nunique"),
+                )
+                recent_state["avg_daily_units"] = (
+                    recent_state["recent_units"] / recent_state["recent_days"].clip(lower=1)
+                )
+                fc = weather_forecast.merge(recent_state, on="state_or_province_code", how="inner")
+                if fc.empty:
+                    st.info("Forecast weather loaded, but no forecast states matched recent sales states.")
+                else:
+                    if len(weather_means):
+                        fc["weather_lift"] = (
+                            beta[0]
+                            + beta[1] * (fc["temperature_max_f"] - weather_means["temperature_max_f"])
+                            + beta[2] * (fc["precipitation_in"] - weather_means["precipitation_in"])
+                        )
+                    else:
+                        hist_score = max(1, wx_sales["heat_dry_score"].mean())
+                        fc["weather_lift"] = ((fc["heat_dry_score"] - hist_score) / 100) * 0.15
+                    fc["weather_lift"] = fc["weather_lift"].clip(lower=-0.35, upper=0.60)
+                    fc["predicted_units"] = (fc["avg_daily_units"] * (1 + fc["weather_lift"])).clip(lower=0)
+                    fc["date_label"] = fc["date"].dt.strftime("%a %b %d")
+
+                    fc_daily = fc.groupby("date", as_index=False).agg(
+                        predicted_units=("predicted_units", "sum"),
+                        avg_temp=("temperature_max_f", "mean"),
+                        avg_precip=("precipitation_in", "mean"),
+                        heat_dry_score=("heat_dry_score", "mean"),
+                    ).sort_values("date")
+                    fc_daily["date_label"] = fc_daily["date"].dt.strftime("%a %b %d")
+
+                    f_l, f_r = st.columns([3, 2])
+                    with f_l:
+                        outlook_chart = alt.layer(
+                            alt.Chart(fc_daily).mark_bar(color="#27500A", opacity=0.65).encode(
+                                x=alt.X("date_label:N", sort=list(fc_daily["date_label"]), title="Forecast date",
+                                        axis=alt.Axis(labelAngle=-30)),
+                                y=alt.Y("predicted_units:Q", title="Weather-adjusted units"),
+                                tooltip=[
+                                    "date_label:N",
+                                    alt.Tooltip("predicted_units:Q", format=",.0f", title="Predicted units"),
+                                    alt.Tooltip("avg_temp:Q", format=".1f", title="Avg high F"),
+                                    alt.Tooltip("avg_precip:Q", format=".2f", title="Avg precip in"),
+                                ],
+                            ),
+                            alt.Chart(fc_daily).mark_line(color="#BA7517", strokeWidth=2).encode(
+                                x=alt.X("date_label:N", sort=list(fc_daily["date_label"])),
+                                y=alt.Y("heat_dry_score:Q", title="Heat/dry score"),
+                            ),
+                        ).resolve_scale(y="independent").properties(height=340)
+                        st.altair_chart(outlook_chart, width='stretch')
+                    with f_r:
+                        total_base = float((fc["avg_daily_units"]).sum() / max(1, fc["date"].nunique()))
+                        total_pred = float(fc_daily["predicted_units"].mean())
+                        avg_lift = ((total_pred - total_base) / total_base * 100) if total_base else 0
+                        best_day = fc_daily.sort_values("predicted_units", ascending=False).iloc[0]
+                        st.metric("Avg daily outlook", f"{total_pred:,.0f} units", f"{avg_lift:+.1f}% vs recent")
+                        st.metric("Best weather day", best_day["date"].strftime("%b %d"),
+                                  f"{best_day['heat_dry_score']:.0f} score")
+                        show_fc = fc_daily[["date_label", "predicted_units", "avg_temp", "avg_precip"]].copy()
+                        show_fc.columns = ["Date", "Predicted Units", "Avg High F", "Avg Precip"]
+                        st.dataframe(show_fc, width='stretch', hide_index=True, height=300,
+                                     column_config={
+                                         "Predicted Units": st.column_config.NumberColumn(format="%.0f"),
+                                         "Avg High F": st.column_config.NumberColumn(format="%.1f"),
+                                         "Avg Precip": st.column_config.NumberColumn(format="%.2f in"),
+                                     })
+
+                st.divider()
+                st.subheader("Weather maps")
+                map_l, map_r = st.columns(2)
+                with map_l:
+                    st.markdown("**Historical state opportunity**")
+                    hist_map = wx_sales.groupby("state_or_province_code", as_index=False).agg(
+                        units_ty=("units_ty", "sum"),
+                        heat_dry_score=("heat_dry_score", "mean"),
+                        lat=("lat", "first"),
+                        lon=("lon", "first"),
+                    )
+                    hist_map["map_size"] = (
+                        hist_map["units_ty"] / max(1, hist_map["units_ty"].max()) * 45000 + 7000
+                    )
+                    st.map(hist_map, latitude="lat", longitude="lon", size="map_size")
+                    st.caption("Point size = historical units in the selected window.")
+                with map_r:
+                    st.markdown("**Next 7 days weather demand**")
+                    if "predicted_units" in fc.columns:
+                        fc7 = fc[fc["date"] <= fc["date"].min() + pd.Timedelta(days=6)]
+                        fc_map = fc7.groupby("state_or_province_code", as_index=False).agg(
+                            predicted_units=("predicted_units", "sum"),
+                            heat_dry_score=("heat_dry_score", "mean"),
+                            lat=("lat", "first"),
+                            lon=("lon", "first"),
+                        )
+                        fc_map["map_size"] = (
+                            fc_map["predicted_units"] / max(1, fc_map["predicted_units"].max()) * 45000 + 7000
+                        )
+                        st.map(fc_map, latitude="lat", longitude="lon", size="map_size")
+                        st.caption("Point size = weather-adjusted predicted units for the next 7 days.")
+                    else:
+                        st.info("Forecast map appears after a usable weather/sales prediction is built.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TAB 3 — SALES & VELOCITY
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_sales:
     # ── Weekly sales trend ───────────────────────────────────────────────────
@@ -900,7 +1261,7 @@ with tab_sales:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 3 — INVENTORY & DC
+#   TAB 4 — INVENTORY & DC
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_inv:
     # ── Weekly inventory trend ───────────────────────────────────────────────
@@ -1069,7 +1430,7 @@ with tab_inv:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 4 — CHANNELS (omni sales, ecom inventory, returns)
+#   TAB 5 — CHANNELS (omni sales, ecom inventory, returns)
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_channels:
     st.subheader("Omni-channel sales")
@@ -1218,7 +1579,7 @@ with tab_channels:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 5 — DISTRIBUTION
+#   TAB 6 — DISTRIBUTION
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_dist:
     # ── NEW: Modular coverage (distribution gap) ─────────────────────────────
