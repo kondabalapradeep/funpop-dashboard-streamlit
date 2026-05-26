@@ -9,15 +9,7 @@ from itertools import combinations as _combos
 import pandas as pd
 import numpy as np
 
-ACTIVE_ITEMS = [658442130, 666209064, 658442128]
-BIN_ITEMS    = [658442130, 658442128]
-SHELF_ITEMS  = [666209064]
-
-CONTAINER = {
-    658442128: {'units': 208, 'label': 'bins'},  # Full Bin
-    658442130: {'units': 126, 'label': 'bins'},  # Half Bin
-    666209064: {'units': 6,   'label': 'cases'},
-}
+from constants import ACTIVE_ITEMS, BIN_ITEMS, SHELF_ITEMS, CONTAINER
 
 REQUIRED = ['business_date','walmart_calendar_week','store_number','item_name',
             'walmart_item_number','state_or_province_code',

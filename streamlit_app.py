@@ -25,6 +25,7 @@ on one source produces a section-local warning rather than a page crash.
 """
 
 import json
+import logging
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -38,7 +39,13 @@ import altair as alt
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-import funpop_core as core
+from constants import (
+    ACTIVE_ITEMS,
+    BIN_ITEMS,
+    CASE_PACK_UNITS,
+    ITEM_LABELS,
+    SHELF_ITEMS,
+)
 
 # Walmart is in Bentonville (Central Time). Daily BI Link feeds typically
 # land around 7am Central, sometimes later.
@@ -136,18 +143,19 @@ st.markdown(
 
 SQL_DIR = Path(__file__).parent / "sql"
 
-ITEM_LABELS = {
-    658442130: "Half Bin",
-    658442128: "Full Bin",
-    666209064: "Shelf",
-}
+logger = logging.getLogger("funpop_dashboard")
 
-# DC inventory ships in case packs, not eaches. Multiplier converts to units.
-CASE_PACK_UNITS = {
-    658442128: 208,  # Full Bin
-    658442130: 126,  # Half Bin
-    666209064: 6,    # Shelf
-}
+
+def _section_error(label: str, err: object) -> None:
+    """Log the real error server-side and show viewers a generic note.
+    The dashboard is public, so raw BigQuery errors (which embed the project,
+    dataset, and table names) must never be rendered on the page."""
+    logger.warning("%s unavailable: %s", label, err)
+    st.warning(
+        f"{label} is temporarily unavailable. "
+        "Try the Refresh button in the sidebar, or check back shortly."
+    )
+
 
 STATE_CENTROIDS = {
     "AL": (32.806671, -86.791130), "AK": (61.370716, -152.404419), "AZ": (33.729759, -111.431221),
@@ -200,7 +208,7 @@ def _run_query(sql, params=None):
 @st.cache_data(ttl=86400, show_spinner="Loading store data...")
 def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     df = _run_query(_load_sql("store_query.sql"), [
-        bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+        bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
         bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
     ])
     # Record the wall-clock time of this BQ fetch. Only executes on cache miss,
@@ -233,7 +241,7 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
 def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     try:
         df = _run_query(_load_sql("dc_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
         if df.empty:
@@ -248,18 +256,25 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
             "out_of_stock_each_quantity_last_year",
         ]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        # Convert case packs → eaches for on_hand and on_order (OOS is already eaches)
-        multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+        # Convert warehouse packs → eaches for on_hand and on_order (OOS already
+        # eaches). Prefer the real per-row eaches-per-pack from BigQuery; fall back
+        # to the known constant only where the feed is missing or zero.
+        if "warehouse_pack_each_quantity" in df.columns:
+            pack_each = pd.to_numeric(df["warehouse_pack_each_quantity"], errors="coerce").fillna(0)
+            fallback = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+            multiplier = pack_each.where(pack_each > 0, fallback)
+        else:
+            multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
         for c in [
             "on_hand_warehouse_inventory_in_units_this_year",
             "on_hand_warehouse_inventory_in_units_last_year",
             "on_order_warehouse_quantity_in_units_this_year",
             "on_order_warehouse_quantity_in_units_last_year",
         ]:
-            df[c] = (df[c] * multiplier).astype("int64")
+            df[c] = (df[c] * multiplier).round().astype("int64")
         return df
     except Exception as e:
-        st.warning(f"DC query failed: {e}")
+        _section_error("DC data", e)
         return pd.DataFrame()
 
 
@@ -277,7 +292,7 @@ def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
 def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _run_query(_load_sql("forecast_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
         if not df.empty:
@@ -292,7 +307,7 @@ def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
 def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _run_query(_load_sql("omni_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
         if not df.empty:
@@ -308,7 +323,7 @@ def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataF
 def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _run_query(_load_sql("ecom_inv_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
         if not df.empty:
@@ -324,7 +339,7 @@ def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
 def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _run_query(_load_sql("returns_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
         if not df.empty:
@@ -340,7 +355,7 @@ def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.Da
 def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _run_query(_load_sql("modular_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
         ])
         return df, None
     except Exception as e:
@@ -351,7 +366,7 @@ def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
 def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _run_query(_load_sql("backroom_query.sql"), [
-            bigquery.ArrayQueryParameter("active_items", "INT64", core.ACTIVE_ITEMS),
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
         if not df.empty:
@@ -461,6 +476,28 @@ def _walmart_week_start(dates: pd.Series) -> pd.Series:
     return dates - pd.to_timedelta(days_since_sat, unit="D")
 
 
+def _yoy_pct(ty: pd.Series, ly: pd.Series) -> np.ndarray:
+    """Year-over-year percent change, rounded to 1 dp. Returns 0 where last
+    year is 0 (no meaningful base), and avoids divide-by-zero warnings."""
+    ly_safe = ly.replace(0, np.nan)
+    return np.where(ly > 0, ((ty - ly) / ly_safe * 100).round(1), 0)
+
+
+def _week_norm_factor(days_in_week: pd.Series) -> pd.Series:
+    """Scaling factor that extrapolates a partial Walmart week's totals to a
+    full 7-day equivalent, so in-progress weeks compare fairly to complete ones."""
+    return 7 / days_in_week.clip(lower=1)
+
+
+def _wm_week_label(weeks: pd.Series, is_partial=None):
+    """'WM Wk NN' label from a walmart_calendar_week column. When is_partial is
+    given, in-progress weeks get a ' *' suffix."""
+    base = "WM Wk " + weeks.astype(str).str[-2:]
+    if is_partial is None:
+        return base
+    return np.where(np.asarray(is_partial), base + " *", base)
+
+
 def _safe_corr(frame: pd.DataFrame, x: str, y: str) -> float:
     clean = frame[[x, y]].dropna()
     if len(clean) < 3 or clean[x].nunique() < 2 or clean[y].nunique() < 2:
@@ -501,19 +538,17 @@ with st.sidebar:
     st.divider()
     st.subheader("Filters")
 
-    BIN_ITEMS_SET = [658442128, 658442130]
-    SHELF_ITEMS_SET = [666209064]
     item_view = st.radio(
         "View",
         options=["Total (all items)", "Both Bins (full + half)", "Shelf only"],
         index=0,
     )
     if item_view == "Total (all items)":
-        item_filter = list(core.ACTIVE_ITEMS)
+        item_filter = list(ACTIVE_ITEMS)
     elif item_view == "Both Bins (full + half)":
-        item_filter = BIN_ITEMS_SET
+        item_filter = list(BIN_ITEMS)
     else:
-        item_filter = SHELF_ITEMS_SET
+        item_filter = list(SHELF_ITEMS)
 
     view_mode = st.radio(
         "Date range",
@@ -529,10 +564,16 @@ with st.sidebar:
         _today_central = datetime.now(CENTRAL_TZ).date()
         _days_since_sat = (_today_central.weekday() - 5) % 7  # 0 on a Saturday
         _days_into_current = _days_since_sat + 1               # +1 to include today
-        lookback = 28 + _days_into_current                      # 4 full wks + current
+        # Window must start on the Saturday 4 weeks before the current WM week.
+        # The BQ filter is `bus_dt >= today - lookback`, so:
+        #   lookback = 27 + days_into_current
+        #            = 28 full-week days + (days_into_current - 1) elapsed days.
+        # (Using 28 + days_into_current pulled one extra day, creating a stray
+        #  1-day partial week at the left edge of the weekly charts.)
+        lookback = 27 + _days_into_current
         st.caption(
-            f"📅 Showing **{lookback} days**: 4 full Walmart weeks + "
-            f"{_days_into_current} day(s) into current week"
+            f"📅 Showing **4 full Walmart weeks + {_days_into_current} day(s)** "
+            f"into the current week ({lookback + 1} calendar days)"
         )
     else:
         lookback = st.slider(
@@ -566,7 +607,7 @@ if not df_all.empty:
 if df_all.empty:
     st.error(
         f"No store data for the last {lookback} days. "
-        f"Items {list(core.ACTIVE_ITEMS)} may have no sales in this window."
+        f"Items {list(ACTIVE_ITEMS)} may have no sales in this window."
     )
     st.stop()
 
@@ -693,8 +734,7 @@ with tab_overview:
     )
     daily = daily.merge(stores_per_day, on="business_date", how="left").fillna({"stores_selling": 0})
     daily["yoy_units"] = daily["units_ty"] - daily["units_ly"]
-    daily["yoy_pct"] = np.where(daily["units_ly"] > 0,
-                                 (daily["yoy_units"] / daily["units_ly"] * 100).round(1), 0)
+    daily["yoy_pct"] = _yoy_pct(daily["units_ty"], daily["units_ly"])
     daily["weekday"] = daily["business_date"].dt.strftime("%a")
     daily["date_str"] = daily["business_date"].dt.strftime("%b %d")
 
@@ -736,12 +776,10 @@ with tab_overview:
         sales_ty=("pos_sales_this_year", "sum"),
         sales_ly=("pos_sales_last_year", "sum"),
     )
-    item_perf["sales_yoy_pct"] = np.where(item_perf["sales_ly"] > 0,
-        ((item_perf["sales_ty"] - item_perf["sales_ly"]) / item_perf["sales_ly"] * 100).round(1), 0)
+    item_perf["sales_yoy_pct"] = _yoy_pct(item_perf["sales_ty"], item_perf["sales_ly"])
     item_perf["on_hand"] = item_perf["walmart_item_number"].map(item_oh).fillna(0).astype(int)
     item_perf["item"] = item_perf["walmart_item_number"].map(ITEM_LABELS).fillna(item_perf["walmart_item_number"].astype(str))
-    item_perf["yoy_pct"] = np.where(item_perf["units_ly"] > 0,
-        ((item_perf["units_ty"] - item_perf["units_ly"]) / item_perf["units_ly"] * 100).round(1), 0)
+    item_perf["yoy_pct"] = _yoy_pct(item_perf["units_ty"], item_perf["units_ly"])
     full_units_per_item = df.groupby("walmart_item_number")["pos_quantity_this_year"].sum()
     item_perf["wos_units_ty"] = item_perf["walmart_item_number"].map(full_units_per_item).fillna(0)
     item_perf["wos"] = np.where(item_perf["wos_units_ty"] > 0,
@@ -776,16 +814,17 @@ with tab_overview:
     with sr_l:
         if len(oos_daily):
             latest_oos = oos_daily.iloc[-1]
-            week_ago = oos_daily.iloc[-8] if len(oos_daily) >= 8 else oos_daily.iloc[0]
+            # Compare against the most recent day on or before 7 calendar days
+            # ago — robust to missing feed days (positional iloc[-8] was not).
+            week_ago_target = latest_oos["business_date"] - pd.Timedelta(days=7)
+            prior = oos_daily[oos_daily["business_date"] <= week_ago_target]
+            week_ago = prior.iloc[-1] if not prior.empty else oos_daily.iloc[0]
             oos_delta = int(latest_oos["oos_stores"] - week_ago["oos_stores"])
             st.metric("Stores OOS today", f"{int(latest_oos['oos_stores']):,}",
                       delta=f"{oos_delta:+,} vs week ago", delta_color="inverse")
             st.metric("OOS rate today", f"{latest_oos['oos_pct']:.1f}%")
-        days_oos = (
-            df.groupby(["business_date", "store_number"])["store_on_hand_quantity_this_year"]
-            .sum().reset_index()
-        )
-        chronic = int((days_oos[days_oos["store_on_hand_quantity_this_year"] == 0]
+        # Chronic = OOS on 7+ distinct days in the window (reuses store_day_oh).
+        chronic = int((store_day_oh[store_day_oh["is_oos"] == 1]
                        .groupby("store_number").size() >= 7).sum())
         st.metric("Chronically OOS (≥7 days)", f"{chronic:,} stores")
     with sr_r:
@@ -839,7 +878,7 @@ with tab_weather:
         )
 
         if weather_err:
-            st.warning(f"Weather API unavailable right now.\n\n`{weather_err}`")
+            _section_error("Weather data", weather_err)
         elif weather_hist.empty or weather_forecast.empty:
             st.info("Weather API returned no usable records for the selected states.")
         else:
@@ -1075,20 +1114,17 @@ with tab_sales:
     ).sort_values("walmart_calendar_week").reset_index(drop=True)
     # Normalize each week to a 7-day equivalent based on days of data present.
     # This keeps the current (in-progress) week comparable to completed weeks.
-    norm = 7 / weekly_sales["days_in_week"].clip(lower=1)
+    norm = _week_norm_factor(weekly_sales["days_in_week"])
     weekly_sales["units_ty"] = (weekly_sales["units_ty_raw"] * norm).round().astype(int)
     weekly_sales["units_ly"] = (weekly_sales["units_ly_raw"] * norm).round().astype(int)
     weekly_sales["sales_ty"] = (weekly_sales["sales_ty_raw"] * norm).round(2)
     weekly_sales["sales_ly"] = (weekly_sales["sales_ly_raw"] * norm).round(2)
     weekly_sales["yoy_units"] = weekly_sales["units_ty"] - weekly_sales["units_ly"]
-    weekly_sales["yoy_pct"] = np.where(weekly_sales["units_ly"] > 0,
-        (weekly_sales["yoy_units"] / weekly_sales["units_ly"] * 100).round(1), 0)
+    weekly_sales["yoy_pct"] = _yoy_pct(weekly_sales["units_ty"], weekly_sales["units_ly"])
     # Flag in-progress weeks
     weekly_sales["is_partial"] = weekly_sales["days_in_week"] < 7
-    weekly_sales["week_label"] = np.where(
-        weekly_sales["is_partial"],
-        "WM Wk " + weekly_sales["walmart_calendar_week"].astype(str).str[-2:] + " *",
-        "WM Wk " + weekly_sales["walmart_calendar_week"].astype(str).str[-2:],
+    weekly_sales["week_label"] = _wm_week_label(
+        weekly_sales["walmart_calendar_week"], weekly_sales["is_partial"]
     )
 
     if not weekly_sales.empty:
@@ -1149,7 +1185,7 @@ with tab_sales:
     weekly_uspw["stores_ty"] = weekly_uspw["stores_ty"].fillna(0).astype(int)
     weekly_uspw["stores_ly"] = weekly_uspw["stores_ly"].fillna(0).astype(int)
     # Normalize partial-week units to 7-day equivalent for fair YoY comparison
-    norm = 7 / weekly_uspw["days_in_week"].clip(lower=1)
+    norm = _week_norm_factor(weekly_uspw["days_in_week"])
     weekly_uspw["units_ty"] = weekly_uspw["units_ty_raw"] * norm
     weekly_uspw["units_ly"] = weekly_uspw["units_ly_raw"] * norm
     weekly_uspw["uspw_ty"] = np.where(weekly_uspw["stores_ty"] > 0,
@@ -1157,10 +1193,8 @@ with tab_sales:
     weekly_uspw["uspw_ly"] = np.where(weekly_uspw["stores_ly"] > 0,
         (weekly_uspw["units_ly"] / weekly_uspw["stores_ly"]).round(2), 0)
     weekly_uspw["is_partial"] = weekly_uspw["days_in_week"] < 7
-    weekly_uspw["week_label"] = np.where(
-        weekly_uspw["is_partial"],
-        "WM Wk " + weekly_uspw["walmart_calendar_week"].astype(str).str[-2:] + " *",
-        "WM Wk " + weekly_uspw["walmart_calendar_week"].astype(str).str[-2:],
+    weekly_uspw["week_label"] = _wm_week_label(
+        weekly_uspw["walmart_calendar_week"], weekly_uspw["is_partial"]
     )
     weekly_uspw = weekly_uspw.sort_values("walmart_calendar_week").reset_index(drop=True)
 
@@ -1200,8 +1234,7 @@ with tab_sales:
         (item_uspw["units_ty"] / item_uspw["stores_ty"] / weeks_in_period).round(2), 0)
     item_uspw["uspw_ly"] = np.where(item_uspw["stores_ly"] > 0,
         (item_uspw["units_ly"] / item_uspw["stores_ly"] / weeks_in_period).round(2), 0)
-    item_uspw["uspw_yoy_pct"] = np.where(item_uspw["uspw_ly"] > 0,
-        ((item_uspw["uspw_ty"] - item_uspw["uspw_ly"]) / item_uspw["uspw_ly"] * 100).round(1), 0)
+    item_uspw["uspw_yoy_pct"] = _yoy_pct(item_uspw["uspw_ty"], item_uspw["uspw_ly"])
 
     if len(item_uspw) > 0:
         iu_cols = st.columns(len(item_uspw))
@@ -1255,7 +1288,7 @@ with tab_sales:
 
     fcst_df, fcst_err = load_forecast_data(lookback, slot)
     if fcst_err:
-        st.warning(f"Forecast data unavailable — schema mismatch or permission issue.\n\n`{fcst_err}`")
+        _section_error("Forecast data", fcst_err)
     elif fcst_df.empty:
         st.info("No forecast records returned for the selected items and lookback window.")
     else:
@@ -1328,7 +1361,7 @@ with tab_inv:
         in_transit=("store_in_transit_quantity_this_year", "sum"),
         snapshot_date=("snapshot_date", "max"),
     ).sort_values("walmart_calendar_week").reset_index(drop=True)
-    weekly_inv["week_label"] = "WM Wk " + weekly_inv["walmart_calendar_week"].astype(str).str[-2:]
+    weekly_inv["week_label"] = _wm_week_label(weekly_inv["walmart_calendar_week"])
 
     if not weekly_inv.empty:
         m = weekly_inv.melt(id_vars=["week_label", "walmart_calendar_week"],
@@ -1363,7 +1396,7 @@ with tab_inv:
 
     br_df, br_err = load_backroom_data(lookback, slot)
     if br_err:
-        st.warning(f"Backroom adjustment data unavailable.\n\n`{br_err}`")
+        _section_error("Backroom adjustment data", br_err)
     elif br_df.empty:
         st.info("No backroom adjustment records in window.")
     else:
@@ -1418,7 +1451,8 @@ with tab_inv:
         # Compute true per-DC demand if alignment is available
         if align_err or align_df.empty:
             if align_err:
-                st.caption(f"⚠️  Using approximate DC demand allocation (alignment table unavailable: {align_err})")
+                logger.warning("DC alignment unavailable: %s", align_err)
+                st.caption("⚠️  Using approximate DC demand allocation (store→DC alignment table unavailable).")
             total_per_day = df["pos_quantity_this_year"].sum() / period_days
             dc_summary = dc_latest.groupby(
                 ["distribution_center_number", "name_of_the_dc"], as_index=False
@@ -1493,7 +1527,7 @@ with tab_channels:
 
     omni_df, omni_err = load_omni_data(lookback, slot)
     if omni_err:
-        st.warning(f"Omni sales unavailable.\n\n`{omni_err}`")
+        _section_error("Omni sales data", omni_err)
     elif omni_df.empty:
         st.info("No omni sales records.")
     else:
@@ -1521,8 +1555,7 @@ with tab_channels:
             units_ly=("units_ly", "sum"),
             sales_ty=("sales_ty", "sum"),
         ).sort_values("units_ty", ascending=False)
-        by_chan["yoy_pct"] = np.where(by_chan["units_ly"] > 0,
-            ((by_chan["units_ty"] - by_chan["units_ly"]) / by_chan["units_ly"] * 100).round(1), 0)
+        by_chan["yoy_pct"] = _yoy_pct(by_chan["units_ty"], by_chan["units_ly"])
         if not by_chan.empty:
             st.altair_chart((alt.Chart(by_chan).mark_bar().encode(
                 x=alt.X("units_ty:Q", title="Units TY"),
@@ -1542,7 +1575,7 @@ with tab_channels:
 
     ecom_df, ecom_err = load_ecom_inv_data(lookback, slot)
     if ecom_err:
-        st.warning(f"eComm inventory unavailable.\n\n`{ecom_err}`")
+        _section_error("eComm inventory data", ecom_err)
     elif ecom_df.empty:
         st.info("No eComm inventory records.")
     else:
@@ -1584,7 +1617,7 @@ with tab_channels:
 
     ret_df, ret_err = load_returns_data(lookback, slot)
     if ret_err:
-        st.warning(f"Returns data unavailable.\n\n`{ret_err}`")
+        _section_error("Returns data", ret_err)
     elif ret_df.empty:
         st.info("No return records in window.")
     else:
@@ -1642,7 +1675,7 @@ with tab_dist:
 
     mod_df, mod_err = load_modular_data(slot)
     if mod_err:
-        st.warning(f"Modular plan data unavailable.\n\n`{mod_err}`")
+        _section_error("Modular plan data", mod_err)
     elif mod_df.empty:
         st.info("No modular plan records returned.")
     else:
@@ -1693,8 +1726,7 @@ with tab_dist:
         sales_ty=("pos_sales_this_year", "sum"),
         stores=("store_number", "nunique"),
     )
-    state_perf["yoy_pct"] = np.where(state_perf["units_ly"] > 0,
-        ((state_perf["units_ty"] - state_perf["units_ly"]) / state_perf["units_ly"] * 100).round(1), 0)
+    state_perf["yoy_pct"] = _yoy_pct(state_perf["units_ty"], state_perf["units_ly"])
     state_perf = state_perf.sort_values("units_ty", ascending=False).head(20)
 
     st.altair_chart((alt.Chart(state_perf).mark_bar().encode(
