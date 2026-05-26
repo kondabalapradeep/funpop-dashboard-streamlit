@@ -1098,18 +1098,16 @@ with tab_forecast:
         else:
             st.caption(
                 "Upcoming store demand forecast rolled up to each DC (via store→DC alignment) versus "
-                "that DC's on-hand + on-order supply. Supply is converted warehouse-packs → eaches."
+                "that DC's on-hand + on-order supply (in eaches)."
             )
             align_df, align_err = load_dc_alignment(slot)
             latest_dc_date = dc_df["inventory_date"].max()
             dc_latest = dc_df[dc_df["inventory_date"] == latest_dc_date].copy()
-            dc_latest["on_hand_e"] = (dc_latest["on_hand_warehouse_inventory_in_units_this_year"]
-                                      * dc_latest["warehouse_pack_each_quantity"])
-            dc_latest["on_order_e"] = (dc_latest["on_order_warehouse_quantity_in_units_this_year"]
-                                       * dc_latest["warehouse_pack_each_quantity"])
+            # load_dc_data already converts warehouse packs → eaches, so aggregate directly.
             dc_supply = dc_latest.groupby(
                 ["distribution_center_number", "name_of_the_dc"], as_index=False).agg(
-                    on_hand=("on_hand_e", "sum"), on_order=("on_order_e", "sum"))
+                    on_hand=("on_hand_warehouse_inventory_in_units_this_year", "sum"),
+                    on_order=("on_order_warehouse_quantity_in_units_this_year", "sum"))
             dc_supply["total_supply"] = dc_supply["on_hand"] + dc_supply["on_order"]
 
             end14 = most_recent + pd.Timedelta(days=14)
@@ -1153,15 +1151,64 @@ with tab_forecast:
                 "Total supply (ea)": st.column_config.NumberColumn(format="%.0f"),
                 "WOS (OH)": st.column_config.NumberColumn(format="%.1f wks"),
             })
-            st.caption(f"Snapshot {latest_dc_date.strftime('%b %d, %Y')} · supply converted to eaches "
-                       f"using each item's warehouse pack size.")
+            st.caption(f"Snapshot {latest_dc_date.strftime('%b %d, %Y')} · DC supply shown in eaches.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 4 — INVENTORY & DC
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_inv:
+    # ── Inventory health at a glance ─────────────────────────────────────────
+    st.subheader("Inventory health at a glance")
+
+    # Velocity basis = recent run-rate (last 14 data days), so weeks-of-supply
+    # reflects how fast we're selling *now*, not the whole lookback.
+    inv_recent = df[df["business_date"] >= most_recent - timedelta(days=13)]
+    inv_recent_days = max(1, inv_recent["business_date"].dt.normalize().nunique())
+    daily_units = float(inv_recent["pos_quantity_this_year"].sum() / inv_recent_days)
+    weekly_units = daily_units * 7
+
+    snap = df[df["business_date"] == most_recent]
+    store_oh = float(snap["store_on_hand_quantity_this_year"].sum())
+    store_oh_ly = float(snap["store_on_hand_quantity_last_year"].sum())
+    in_whse = float(snap["store_in_warehouse_quantity_this_year"].sum())
+    in_transit = float(snap["store_in_transit_quantity_this_year"].sum())
+    oh_yoy = ((store_oh - store_oh_ly) / store_oh_ly * 100) if store_oh_ly else 0.0
+
+    dc_oh_total = 0.0
+    if not dc_df.empty:
+        _dc_snap = dc_df[dc_df["inventory_date"] == dc_df["inventory_date"].max()]
+        dc_oh_total = float(_dc_snap["on_hand_warehouse_inventory_in_units_this_year"].sum())
+
+    store_wos = (store_oh / weekly_units) if weekly_units else float("inf")
+    # In-transit has left the DC; in-warehouse is DC stock earmarked for stores, so it
+    # would double-count DC on-hand — exclude it from the combined system total.
+    system_units = store_oh + in_transit + dc_oh_total
+    system_wos = (system_units / weekly_units) if weekly_units else float("inf")
+
+    store_day_oh = snap.groupby("store_number")["store_on_hand_quantity_this_year"].sum()
+    oos_now = int((store_day_oh == 0).sum())
+    tot_stores = int(store_day_oh.shape[0])
+    oos_pct = (oos_now / tot_stores * 100) if tot_stores else 0.0
+
+    _wks = lambda v: f"{v:.1f} wks" if np.isfinite(v) else "—"
+    iv1, iv2, iv3, iv4, iv5 = st.columns(5)
+    iv1.metric("Store on-hand", f"{store_oh:,.0f}", f"{oh_yoy:+.1f}% YoY")
+    iv2.metric("Store weeks of supply", _wks(store_wos),
+               help="Store on-hand ÷ recent weekly sell-through")
+    iv3.metric("Store pipeline", f"{in_whse + in_transit:,.0f}",
+               help="Units in-warehouse + in-transit heading to stores")
+    iv4.metric("DC on-hand", f"{dc_oh_total:,.0f}", help="Distribution-center on-hand (eaches)")
+    iv5.metric("Total system cover", _wks(system_wos),
+               help="Store on-hand + in-transit + DC on-hand ÷ recent weekly sell-through")
+    st.caption(
+        f"Snapshot **{most_recent.strftime('%b %d, %Y')}** · velocity basis: last {inv_recent_days} days "
+        f"(**{daily_units:,.0f}** units/day) · stores out of stock now: **{oos_now:,}/{tot_stores:,}** "
+        f"({oos_pct:.0f}%)."
+    )
+
     # ── Weekly inventory trend ───────────────────────────────────────────────
+    st.divider()
     st.subheader("Weekly inventory trend (network total)")
 
     last_day_per_week_item = (
@@ -1258,79 +1305,81 @@ with tab_inv:
     st.divider()
     st.subheader("DC pipeline health")
 
+    st.caption(
+        "Can the DCs keep stores replenished? Weeks-of-supply = DC on-hand ÷ the sell-through "
+        "of the stores that DC serves (recent run-rate). Sorted worst-first so risk is up top."
+    )
+
     if dc_df.empty:
         st.info("DC data unavailable for the current filter.")
     else:
-        # Load store→DC alignment
         align_df, align_err = load_dc_alignment(slot)
         latest_dc_date = dc_df["inventory_date"].max()
         dc_latest = dc_df[dc_df["inventory_date"] == latest_dc_date].copy()
+        # load_dc_data already converts packs → eaches; on-hand/on-order/OOS are eaches.
+        dc_summary = dc_latest.groupby(
+            ["distribution_center_number", "name_of_the_dc"], as_index=False
+        ).agg(
+            on_hand=("on_hand_warehouse_inventory_in_units_this_year", "sum"),
+            on_order=("on_order_warehouse_quantity_in_units_this_year", "sum"),
+            oos=("out_of_stock_each_quantity_this_year", "sum"),
+        )
+        dc_summary["total_supply"] = dc_summary["on_hand"] + dc_summary["on_order"]
 
-        # Compute true per-DC demand if alignment is available
+        # Per-DC demand from the stores it serves, at the recent run-rate.
         if align_err or align_df.empty:
             if align_err:
                 logger.warning("DC alignment unavailable: %s", align_err)
-                st.caption("⚠️  Using approximate DC demand allocation (store→DC alignment table unavailable).")
-            total_per_day = df["pos_quantity_this_year"].sum() / period_days
-            dc_summary = dc_latest.groupby(
-                ["distribution_center_number", "name_of_the_dc"], as_index=False
-            ).agg(
-                on_hand=("on_hand_warehouse_inventory_in_units_this_year", "sum"),
-                on_order=("on_order_warehouse_quantity_in_units_this_year", "sum"),
-                oos=("out_of_stock_each_quantity_this_year", "sum"),
-            )
-            dc_summary["total_supply"] = dc_summary["on_hand"] + dc_summary["on_order"]
-            network_oh = max(1, dc_summary["on_hand"].sum())
-            dc_summary["daily_demand_est"] = (dc_summary["on_hand"] / network_oh) * total_per_day
-            dc_summary["wos_oh"] = np.where(dc_summary["daily_demand_est"] > 0,
-                (dc_summary["on_hand"] / (dc_summary["daily_demand_est"] * 7)).round(1), 0)
+            st.caption("⚠ Store→DC alignment unavailable — demand allocated proportionally to on-hand "
+                       "(weeks-of-supply will look uniform across DCs).")
+            net_oh = max(1.0, float(dc_summary["on_hand"].sum()))
+            dc_summary["daily_demand"] = dc_summary["on_hand"] / net_oh * daily_units
         else:
-            # True allocation: sum store sales by their aligned DC
-            st.caption(f"✓ Using true store→DC demand allocation ({len(align_df):,} alignments)")
-            # Deterministic primary pick: lowest alignment_type code, then lowest
-            # DC number. Without this, "first" depended on BigQuery row order and
-            # could reassign a store's demand to a different DC between refreshes.
-            primary_align = (
-                align_df.sort_values(
-                    ["store_number", "alignment_type", "distribution_center_number"]
-                ).drop_duplicates(subset=["store_number"], keep="first")
-            )
-            store_demand = df.groupby("store_number", as_index=False)["pos_quantity_this_year"].sum()
+            # Deterministic primary pick: lowest alignment_type, then lowest DC number,
+            # so a store's demand can't hop DCs between refreshes on row-order alone.
+            primary_align = align_df.sort_values(
+                ["store_number", "alignment_type", "distribution_center_number"]
+            ).drop_duplicates(subset=["store_number"], keep="first")
+            store_demand = inv_recent.groupby("store_number", as_index=False)["pos_quantity_this_year"].sum()
             store_demand = store_demand.merge(primary_align, on="store_number", how="left")
             dc_demand = store_demand.groupby("distribution_center_number", as_index=False)[
-                "pos_quantity_this_year"].sum().rename(columns={"pos_quantity_this_year": "period_demand"})
-            dc_demand["daily_demand"] = dc_demand["period_demand"] / period_days
-
-            dc_summary = dc_latest.groupby(
-                ["distribution_center_number", "name_of_the_dc"], as_index=False
-            ).agg(
-                on_hand=("on_hand_warehouse_inventory_in_units_this_year", "sum"),
-                on_order=("on_order_warehouse_quantity_in_units_this_year", "sum"),
-                oos=("out_of_stock_each_quantity_this_year", "sum"),
-            )
-            dc_summary["total_supply"] = dc_summary["on_hand"] + dc_summary["on_order"]
+                "pos_quantity_this_year"].sum().rename(columns={"pos_quantity_this_year": "recent_units"})
+            dc_demand["daily_demand"] = dc_demand["recent_units"] / inv_recent_days
             dc_summary = dc_summary.merge(dc_demand[["distribution_center_number", "daily_demand"]],
                                           on="distribution_center_number", how="left")
-            dc_summary["daily_demand"] = dc_summary["daily_demand"].fillna(0)
-            dc_summary["wos_oh"] = np.where(dc_summary["daily_demand"] > 0,
-                (dc_summary["on_hand"] / (dc_summary["daily_demand"] * 7)).round(1), np.inf)
+            dc_summary["daily_demand"] = dc_summary["daily_demand"].fillna(0.0)
 
-        dc_summary = dc_summary.sort_values("on_hand", ascending=False)
+        wk_demand = dc_summary["daily_demand"] * 7
+        dc_summary["wos_oh"] = np.where(wk_demand > 0, dc_summary["on_hand"] / wk_demand, np.inf)
+        dc_summary["wos_total"] = np.where(wk_demand > 0, dc_summary["total_supply"] / wk_demand, np.inf)
+        dc_summary["status"] = np.select(
+            [dc_summary["wos_oh"] <= 1, dc_summary["wos_oh"] <= 2], ["Critical", "Low"], default="Healthy")
+        dc_summary = dc_summary.sort_values("wos_oh", ascending=True)
 
         dc_l, dc_r = st.columns([1, 2])
         with dc_l:
             st.metric("Network DC on-hand", f"{int(dc_summary['on_hand'].sum()):,}")
             st.metric("Network DC on-order", f"{int(dc_summary['on_order'].sum()):,}")
-            critical = int((dc_summary["wos_oh"].replace(np.inf, 999) <= 1).sum())
+            st.metric("DC out-of-stock (eaches)", f"{int(dc_summary['oos'].sum()):,}",
+                      delta_color="inverse", help="DC-level out-of-stock units — demand it couldn't fill")
+            critical = int((dc_summary["wos_oh"] <= 1).sum())
             st.metric("DCs ≤ 1 wk supply", f"{critical:,}", delta_color="inverse")
             st.caption(f"Snapshot: {latest_dc_date.strftime('%b %d, %Y')}")
         with dc_r:
-            show_dc = dc_summary[["distribution_center_number", "name_of_the_dc",
-                                  "on_hand", "on_order", "total_supply", "wos_oh"]].copy()
+            show_dc = dc_summary[["distribution_center_number", "name_of_the_dc", "status",
+                                  "on_hand", "on_order", "oos", "wos_oh", "wos_total"]].copy()
             show_dc["wos_oh"] = show_dc["wos_oh"].replace(np.inf, np.nan)
-            show_dc.columns = ["DC #", "DC Name", "On Hand", "On Order", "Total Supply", "WOS (OH)"]
+            show_dc["wos_total"] = show_dc["wos_total"].replace(np.inf, np.nan)
+            show_dc.columns = ["DC #", "DC Name", "Status", "On Hand", "On Order",
+                               "DC OOS", "WOS (OH)", "WOS (OH+OO)"]
             st.dataframe(show_dc, width='stretch', hide_index=True, height=420,
-                         column_config={"WOS (OH)": st.column_config.NumberColumn(format="%.1f wks")})
+                         column_config={
+                             "On Hand": st.column_config.NumberColumn(format="%d"),
+                             "On Order": st.column_config.NumberColumn(format="%d"),
+                             "DC OOS": st.column_config.NumberColumn(format="%d"),
+                             "WOS (OH)": st.column_config.NumberColumn(format="%.1f wks"),
+                             "WOS (OH+OO)": st.column_config.NumberColumn(format="%.1f wks"),
+                         })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
