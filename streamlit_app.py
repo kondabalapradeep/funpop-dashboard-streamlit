@@ -570,7 +570,8 @@ if df.empty:
     st.stop()
 
 most_recent = df["business_date"].max()
-weeks_in_period = max(1, lookback / 7)
+period_days = max(1, df["business_date"].dt.normalize().nunique())
+weeks_in_period = max(1 / 7, period_days / 7)
 
 # Compute the performance window slice
 if perf_window == "Most recent day":
@@ -584,7 +585,7 @@ elif perf_window == "Last 7 days":
     weeks_in_window = 1.0
 else:
     df_window = df
-    window_label = f"Full lookback ({df['business_date'].min().strftime('%b %d')}–{most_recent.strftime('%b %d')}, {lookback}d)"
+    window_label = f"Full lookback ({df['business_date'].min().strftime('%b %d')}–{most_recent.strftime('%b %d')}, {period_days} data days)"
     weeks_in_window = weeks_in_period
 
 
@@ -618,7 +619,7 @@ else:
 st.caption(
     f"**Last refreshed:** {last_refresh_str}  ·  "
     f"**Data range:** {df['business_date'].min().strftime('%b %d, %Y')} – "
-    f"{most_recent.strftime('%b %d, %Y')} ({lookback}d){freshness_note}  ·  "
+    f"{most_recent.strftime('%b %d, %Y')} ({period_days} data days){freshness_note}  ·  "
     f"{df['store_number'].nunique():,} stores  ·  {item_view}"
 )
 st.caption(
@@ -809,7 +810,14 @@ with tab_weather:
     ).sort_values("units_ty", ascending=False)
     weather_states = tuple(state_sales[
         state_sales["state_or_province_code"].isin(STATE_CENTROIDS)
-    ]["state_or_province_code"].head(12))
+    ]["state_or_province_code"])
+    weather_units = float(state_sales[
+        state_sales["state_or_province_code"].isin(weather_states)
+    ]["units_ty"].sum())
+    total_weather_scope_units = float(state_sales["units_ty"].sum())
+    weather_coverage_pct = (
+        weather_units / total_weather_scope_units * 100
+    ) if total_weather_scope_units else 0
 
     if not weather_states:
         st.info("No state codes in the sales data could be matched to weather coordinates.")
@@ -857,7 +865,12 @@ with tab_weather:
                 w1.metric("Temp correlation", f"{temp_corr:+.2f}", help="Correlation vs units/store/day")
                 w2.metric("Precip correlation", f"{precip_corr:+.2f}", help="Negative means wetter days sold less")
                 w3.metric("Prime heat/dry days", f"{prime_days:,}")
-                w4.metric("Dry state-days", f"{dry_days:,}", help="State-days with <= 0.05 inches precipitation")
+                w4.metric("Weather coverage", f"{weather_coverage_pct:.0f}%",
+                          help=f"{len(weather_states):,} states matched to weather coordinates")
+                st.caption(
+                    f"Weather model coverage: {weather_units:,.0f} of {total_weather_scope_units:,.0f} "
+                    f"units in the selected period. Dry state-days: {dry_days:,}."
+                )
 
                 hist_daily = wx_sales.groupby("business_date", as_index=False).agg(
                     units_ty=("units_ty", "sum"),
@@ -909,20 +922,27 @@ with tab_weather:
 
                 beta, weather_means, _ = _fit_weather_lift_model(wx_sales)
                 recent_cutoff = most_recent - timedelta(days=13)
-                recent_state = df[df["business_date"] >= recent_cutoff].groupby(
+                recent_source = df[df["business_date"] >= recent_cutoff].copy()
+                recent_days = max(1, recent_source["business_date"].dt.normalize().nunique())
+                network_avg_daily_units = float(
+                    recent_source["pos_quantity_this_year"].sum() / recent_days
+                )
+                recent_state = recent_source.groupby(
                     "state_or_province_code", as_index=False
                 ).agg(
                     recent_units=("pos_quantity_this_year", "sum"),
-                    recent_days=("business_date", "nunique"),
                     stores=("store_number", "nunique"),
                 )
-                recent_state["avg_daily_units"] = (
-                    recent_state["recent_units"] / recent_state["recent_days"].clip(lower=1)
-                )
+                # Use one common denominator so state averages add back to the total network average.
+                recent_state["avg_daily_units"] = recent_state["recent_units"] / recent_days
                 fc = weather_forecast.merge(recent_state, on="state_or_province_code", how="inner")
                 if fc.empty:
                     st.info("Forecast weather loaded, but no forecast states matched recent sales states.")
                 else:
+                    covered_avg_daily_units = float(recent_state[
+                        recent_state["state_or_province_code"].isin(fc["state_or_province_code"].unique())
+                    ]["avg_daily_units"].sum())
+                    unmodeled_avg_daily_units = max(0.0, network_avg_daily_units - covered_avg_daily_units)
                     if len(weather_means):
                         fc["weather_lift"] = (
                             beta[0]
@@ -933,15 +953,20 @@ with tab_weather:
                         hist_score = max(1, wx_sales["heat_dry_score"].mean())
                         fc["weather_lift"] = ((fc["heat_dry_score"] - hist_score) / 100) * 0.15
                     fc["weather_lift"] = fc["weather_lift"].clip(lower=-0.35, upper=0.60)
-                    fc["predicted_units"] = (fc["avg_daily_units"] * (1 + fc["weather_lift"])).clip(lower=0)
+                    fc["predicted_modeled_units"] = (fc["avg_daily_units"] * (1 + fc["weather_lift"])).clip(lower=0)
                     fc["date_label"] = fc["date"].dt.strftime("%a %b %d")
 
                     fc_daily = fc.groupby("date", as_index=False).agg(
-                        predicted_units=("predicted_units", "sum"),
+                        modeled_units=("predicted_modeled_units", "sum"),
                         avg_temp=("temperature_max_f", "mean"),
                         avg_precip=("precipitation_in", "mean"),
                         heat_dry_score=("heat_dry_score", "mean"),
                     ).sort_values("date")
+                    fc_daily["baseline_unmodeled_units"] = unmodeled_avg_daily_units
+                    fc_daily["predicted_units"] = (
+                        fc_daily["modeled_units"] + fc_daily["baseline_unmodeled_units"]
+                    )
+                    fc_daily["recent_baseline_units"] = network_avg_daily_units
                     fc_daily["date_label"] = fc_daily["date"].dt.strftime("%a %b %d")
 
                     f_l, f_r = st.columns([3, 2])
@@ -954,6 +979,7 @@ with tab_weather:
                                 tooltip=[
                                     "date_label:N",
                                     alt.Tooltip("predicted_units:Q", format=",.0f", title="Predicted units"),
+                                    alt.Tooltip("recent_baseline_units:Q", format=",.0f", title="Recent baseline"),
                                     alt.Tooltip("avg_temp:Q", format=".1f", title="Avg high F"),
                                     alt.Tooltip("avg_precip:Q", format=".2f", title="Avg precip in"),
                                 ],
@@ -965,18 +991,25 @@ with tab_weather:
                         ).resolve_scale(y="independent").properties(height=340)
                         st.altair_chart(outlook_chart, width='stretch')
                     with f_r:
-                        total_base = float((fc["avg_daily_units"]).sum() / max(1, fc["date"].nunique()))
+                        total_base = network_avg_daily_units
                         total_pred = float(fc_daily["predicted_units"].mean())
                         avg_lift = ((total_pred - total_base) / total_base * 100) if total_base else 0
                         best_day = fc_daily.sort_values("predicted_units", ascending=False).iloc[0]
                         st.metric("Avg daily outlook", f"{total_pred:,.0f} units", f"{avg_lift:+.1f}% vs recent")
                         st.metric("Best weather day", best_day["date"].strftime("%b %d"),
                                   f"{best_day['heat_dry_score']:.0f} score")
-                        show_fc = fc_daily[["date_label", "predicted_units", "avg_temp", "avg_precip"]].copy()
-                        show_fc.columns = ["Date", "Predicted Units", "Avg High F", "Avg Precip"]
+                        st.caption(
+                            f"Baseline reconciles to recent all-state average: {network_avg_daily_units:,.0f} "
+                            f"units/day over the last {recent_days} data days."
+                        )
+                        show_fc = fc_daily[[
+                            "date_label", "predicted_units", "recent_baseline_units", "avg_temp", "avg_precip"
+                        ]].copy()
+                        show_fc.columns = ["Date", "Predicted Units", "Recent Baseline", "Avg High F", "Avg Precip"]
                         st.dataframe(show_fc, width='stretch', hide_index=True, height=300,
                                      column_config={
                                          "Predicted Units": st.column_config.NumberColumn(format="%.0f"),
+                                         "Recent Baseline": st.column_config.NumberColumn(format="%.0f"),
                                          "Avg High F": st.column_config.NumberColumn(format="%.1f"),
                                          "Avg Precip": st.column_config.NumberColumn(format="%.2f in"),
                                      })
@@ -999,10 +1032,10 @@ with tab_weather:
                     st.caption("Point size = historical units in the selected window.")
                 with map_r:
                     st.markdown("**Next 7 days weather demand**")
-                    if "predicted_units" in fc.columns:
+                    if "predicted_modeled_units" in fc.columns:
                         fc7 = fc[fc["date"] <= fc["date"].min() + pd.Timedelta(days=6)]
                         fc_map = fc7.groupby("state_or_province_code", as_index=False).agg(
-                            predicted_units=("predicted_units", "sum"),
+                            predicted_units=("predicted_modeled_units", "sum"),
                             heat_dry_score=("heat_dry_score", "mean"),
                             lat=("lat", "first"),
                             lon=("lon", "first"),
