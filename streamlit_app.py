@@ -3,10 +3,9 @@ streamlit_app.py — FunPop Sales Dashboard
 
 Tab structure:
   Overview          — KPIs, last 10 days, item performance, stockout risk
-  Weather & Demand  — Why sales moved (weather attribution), the learned weather
-                      sensitivity model, recent actual-vs-expected, a 14-day demand
-                      forecast, YoY weather context, and a state tailwind map
-  Sales & Velocity  — Weekly sales, U/S/W, forecast attainment
+  Sales & Velocity  — Weekly sales, U/S/W
+  Forecast          — Upcoming demand forecast vs sales, attainment & bias, store
+                      replenishment watchlist, and DC demand coverage
   Inventory & DC    — Weekly inventory, phantom inventory, DC pipeline (true alignment)
   Channels          — Omni sales, eComm inventory, store returns
   Distribution      — Modular coverage, state performance
@@ -28,11 +27,7 @@ on one source produces a section-local warning rather than a page crash.
 
 import json
 import logging
-import re
-import time
-import urllib.parse
-import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -43,8 +38,6 @@ import altair as alt
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-import store_geo as geo
-import weather_model as wm
 from constants import (
     ACTIVE_ITEMS,
     BIN_ITEMS,
@@ -161,15 +154,6 @@ def _section_error(label: str, err: object) -> None:
         f"{label} is temporarily unavailable. "
         "Try the Refresh button in the sidebar, or check back shortly."
     )
-
-
-# Bundled US ZIP-code → centroid lookup (2013 government data, public domain).
-# Used to place each store on the map and snap it to a weather grid cell.
-ZIP_CENTROIDS_PATH = Path(__file__).parent / "data" / "zip_centroids.csv"
-
-# Set to a column name (e.g. "postal_cd") to force the store_dim postal column;
-# leave None to auto-detect it from the table schema.
-STORE_POSTAL_COLUMN = None
 
 
 # ─── Auth + BigQuery client ──────────────────────────────────────────────────
@@ -372,174 +356,6 @@ def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=604800, show_spinner=False)
-def load_zip_centroids() -> pd.DataFrame:
-    """Bundled US ZIP → centroid table (zip, lat, lng)."""
-    return pd.read_csv(ZIP_CENTROIDS_PATH, dtype={"zip": str})
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_store_dim_columns(refresh_slot: str = "") -> list:
-    """Column names present in store_dim, so we can locate the postal column
-    without hard-coding a schema that may differ across tenants."""
-    proj = _get_sa_info()["project_id"]
-    ds = st.secrets["bigquery"]["dataset"]
-    sql = (f"SELECT column_name FROM `{proj}.{ds}.INFORMATION_SCHEMA.COLUMNS` "
-           f"WHERE table_name = 'store_dim'")
-    df = _run_query(sql)
-    return list(df["column_name"]) if not df.empty else []
-
-
-@st.cache_data(ttl=86400, show_spinner="Loading store locations...")
-def load_store_geo(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None, str | None]:
-    """Return (store_geo, postal_column, error).
-
-    store_geo has one row per store: store_number, postal, zip5, lat, lon, cell_id.
-    Coordinates come from the store's ZIP code mapped to the bundled centroid
-    table; cell_id snaps the store onto a weather grid. Stores whose postal code
-    can't be matched to a US ZIP get NaN coordinates and drop out downstream."""
-    empty = pd.DataFrame()
-    try:
-        cols = load_store_dim_columns(refresh_slot)
-    except Exception as e:
-        return empty, None, str(e)
-    postal_col = STORE_POSTAL_COLUMN or geo.pick_postal_column(cols)
-    if not postal_col:
-        return empty, None, "no_postal_column"
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", postal_col):
-        return empty, None, "invalid_postal_column"
-    try:
-        proj = _get_sa_info()["project_id"]
-        ds = st.secrets["bigquery"]["dataset"]
-        sql = (f"SELECT store_nbr AS store_number, "
-               f"ANY_VALUE(CAST(`{postal_col}` AS STRING)) AS postal "
-               f"FROM `{proj}.{ds}.store_dim` GROUP BY store_nbr")
-        stores = _run_query(sql)
-        if stores.empty:
-            return empty, postal_col, "no_rows"
-        g = geo.assign_cells(geo.attach_coords(stores, load_zip_centroids(), "postal"))
-        g["store_number"] = pd.to_numeric(g["store_number"], errors="coerce")
-        return g, postal_col, None
-    except Exception as e:
-        return empty, postal_col, str(e)
-
-
-def _fetch_json(url: str, timeout: int = 12) -> dict | list:
-    req = urllib.request.Request(url, headers={"User-Agent": "funpop-dashboard/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _open_meteo_url(base_url: str, coords, **extra_params) -> str:
-    params = {
-        "latitude": ",".join(f"{lat:.4f}" for lat, _ in coords),
-        "longitude": ",".join(f"{lon:.4f}" for _, lon in coords),
-        "daily": "temperature_2m_max,precipitation_sum",
-        "temperature_unit": "fahrenheit",
-        "precipitation_unit": "inch",
-        "timezone": "America/Chicago",
-    }
-    params.update(extra_params)
-    return f"{base_url}?{urllib.parse.urlencode(params)}"
-
-
-def _fetch_open_meteo_blocks(base_url: str, coords, **params) -> list:
-    """Fetch daily weather for many coordinates, batched to stay within URL/
-    fair-use limits. Returns one daily block per coordinate, in input order.
-    Open-Meteo intermittently 502s / times out from shared hosts, so each batch
-    gets one quick retry before giving up."""
-    blocks = []
-    for batch in geo.chunk(range(len(coords)), 75):
-        sub = [coords[i] for i in batch]
-        url = _open_meteo_url(base_url, sub, **params)
-        for attempt in range(2):
-            try:
-                payload = _fetch_json(url)
-                break
-            except Exception:
-                if attempt == 0:
-                    time.sleep(1.5)
-                else:
-                    raise
-        blocks.extend(payload if isinstance(payload, list) else [payload])
-    return blocks
-
-
-def _blocks_to_frame(blocks, cell_ids, coords) -> pd.DataFrame:
-    rows = []
-    for cell_id, (lat, lon), block in zip(cell_ids, coords, blocks):
-        daily = (block or {}).get("daily", {})
-        for day, temp, precip in zip(
-            daily.get("time", []),
-            daily.get("temperature_2m_max", []),
-            daily.get("precipitation_sum", []),
-        ):
-            rows.append({
-                "cell_id": cell_id,
-                "date": pd.to_datetime(day),
-                "temperature_max_f": temp,
-                "precipitation_in": precip,
-                "lat": lat,
-                "lon": lon,
-            })
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(ttl=21600, show_spinner="Loading weather for store regions...")
-def load_weather_for_cells(
-    cells_tuple: tuple,
-    start_date: str,
-    end_date: str,
-    forecast_days: int = 16,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str | None]:
-    """Return (history, forecast, last_year_history, error), keyed by cell_id.
-
-    cells_tuple is a hashable tuple of (cell_id, lat, lon). Recent history and the
-    forward forecast come from one Open-Meteo forecast call (past_days +
-    forecast_days) so the most recent days are never blank — the archive endpoint
-    lags several days. Today appears in both history and forecast. Last-year
-    history is shifted 364 days (52 weeks) to keep weekdays aligned with Walmart's
-    LY comparison."""
-    empty = pd.DataFrame()
-    if not cells_tuple:
-        return empty, empty, empty, "No store regions to fetch weather for."
-    cell_ids = [c[0] for c in cells_tuple]
-    coords = [(float(c[1]), float(c[2])) for c in cells_tuple]
-    try:
-        today = datetime.now(CENTRAL_TZ).date()
-        start = date.fromisoformat(start_date)
-        end = date.fromisoformat(end_date)
-        past_days = min(92, max(1, (today - start).days + 1))
-
-        combo = _blocks_to_frame(
-            _fetch_open_meteo_blocks(
-                "https://api.open-meteo.com/v1/forecast", coords,
-                past_days=past_days, forecast_days=forecast_days),
-            cell_ids, coords)
-        if combo.empty:
-            return empty, empty, empty, "Weather API returned no records."
-        combo["date"] = pd.to_datetime(combo["date"])
-        today_ts = pd.Timestamp(today)
-        hist = wm.add_weather_features(combo[combo["date"] <= today_ts].copy())
-        forecast = wm.add_weather_features(combo[combo["date"] >= today_ts].copy())
-
-        # Last-year weather for the same window (best-effort; never fatal).
-        try:
-            hist_ly = wm.add_weather_features(_blocks_to_frame(
-                _fetch_open_meteo_blocks(
-                    "https://archive-api.open-meteo.com/v1/archive", coords,
-                    start_date=(start - timedelta(days=364)).isoformat(),
-                    end_date=(end - timedelta(days=364)).isoformat()),
-                cell_ids, coords))
-            if not hist_ly.empty:
-                hist_ly["date"] = pd.to_datetime(hist_ly["date"])
-        except Exception:
-            hist_ly = empty
-        return hist, forecast, hist_ly, None
-    except Exception as e:
-        return empty, empty, empty, str(e)
-
-
 def _walmart_week_start(dates: pd.Series) -> pd.Series:
     """Start date (the Saturday) of the Walmart fiscal week for each date.
     Walmart weeks run Saturday-Friday; pandas weekday() has Saturday=5. Used so
@@ -729,10 +545,10 @@ st.caption(
 
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
-tab_overview, tab_weather, tab_sales, tab_inv, tab_channels, tab_dist = st.tabs([
+tab_overview, tab_sales, tab_forecast, tab_inv, tab_channels, tab_dist = st.tabs([
     "Overview",
-    "Weather & Demand",
     "Sales & Velocity",
+    "Forecast",
     "Inventory & DC",
     "Channels",
     "Distribution",
@@ -891,593 +707,7 @@ with tab_overview:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 2 — WEATHER
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_weather:
-    st.subheader("Weather & Demand")
-    st.caption(
-        "Your sales move with the weather — hotter sells more, and **hot *and* dry** sells "
-        "most. Weather is read at each store's own location (mapped from its ZIP code) and "
-        "clustered into local grid cells, so a hot, dry Phoenix isn't averaged together with "
-        "a rainy Seattle. The tab learns that relationship from your daily sell-through, "
-        "explains why recent numbers moved, and turns the forecast into a demand outlook."
-    )
-
-    weather_ready = st.session_state.get("wx_loaded", False)
-    if not weather_ready and st.button("Load weather & demand analysis",
-                                       type="primary", key="load_weather_btn"):
-        st.session_state["wx_loaded"] = True
-        weather_ready = True
-
-    if not weather_ready:
-        st.info(
-            "Weather analysis loads on demand — it calls BigQuery for store locations "
-            "and an external weather API, so it is kept off the initial page load to keep "
-            "the dashboard fast. Click **Load weather & demand analysis** above to run it."
-        )
-    else:
-        store_geo, postal_col, geo_err = load_store_geo(slot)
-
-        if store_geo.empty or int(store_geo["cell_id"].notna().sum()) == 0:
-            reason = {
-                "no_postal_column": "No postal-code column was found in `store_dim`, so stores can't be located.",
-                "invalid_postal_column": "The configured postal column name is invalid.",
-                "no_rows": "`store_dim` returned no rows.",
-            }.get(geo_err, "Store coordinates could not be loaded.")
-            st.error(
-                "**Store-level weather is unavailable.** " + reason +
-                " This tab requires store locations. If your store table uses a non-standard postal "
-                "column, set `STORE_POSTAL_COLUMN` near the top of streamlit_app.py."
-            )
-            if geo_err and geo_err not in ("no_postal_column", "invalid_postal_column", "no_rows"):
-                _section_error("Store locations", geo_err)
-        else:
-            geo_small = store_geo.dropna(subset=["cell_id", "lat", "lon"]).copy()
-            geo_small["store_number"] = pd.to_numeric(geo_small["store_number"], errors="coerce").astype("Int64")
-            geo_small["cell_id"] = geo_small["cell_id"].astype(str)
-            geo_small = geo_small[["store_number", "lat", "lon", "cell_id"]]
-
-            dfx = df.copy()
-            dfx["store_number"] = pd.to_numeric(dfx["store_number"], errors="coerce").astype("Int64")
-            dfx = dfx.merge(geo_small, on="store_number", how="left")
-            mapped = dfx["cell_id"].notna()
-            total_units = float(df["pos_quantity_this_year"].sum())
-            mapped_units = float(dfx.loc[mapped, "pos_quantity_this_year"].sum())
-            coverage_pct = (mapped_units / total_units * 100) if total_units else 0.0
-            mapped_stores = int(dfx.loc[mapped, "store_number"].nunique())
-            total_stores = int(df["store_number"].nunique())
-
-            if coverage_pct < 50:
-                st.error(
-                    f"**Store-level weather is unavailable.** Only {mapped_stores:,} of {total_stores:,} "
-                    f"stores ({coverage_pct:.0f}% of units) could be mapped to a US ZIP location via "
-                    f"`store_dim.{postal_col}`. Check that the postal column is correct — set "
-                    f"`STORE_POSTAL_COLUMN` near the top of streamlit_app.py to override."
-                )
-            else:
-                dfx = dfx[mapped].copy()
-                dfx["cell_id"] = dfx["cell_id"].astype(str)
-                today_ts = pd.Timestamp(datetime.now(CENTRAL_TZ).date())
-
-                footprint_geo = store_geo[store_geo["store_number"].isin(
-                    dfx["store_number"].dropna().unique())]
-                cells = geo.cell_coords(footprint_geo)
-                cells["cell_id"] = cells["cell_id"].astype(str)
-                cells_tuple = tuple(
-                    (str(r.cell_id), round(float(r.lat), 4), round(float(r.lon), 4))
-                    for r in cells.itertuples())
-
-                weather_hist, weather_forecast, weather_hist_ly, weather_err = load_weather_for_cells(
-                    cells_tuple,
-                    df["business_date"].min().date().isoformat(),
-                    most_recent.date().isoformat(),
-                    forecast_days=16,
-                )
-
-                if weather_err:
-                    _section_error("Weather data", weather_err)
-                elif weather_hist.empty or weather_forecast.empty:
-                    st.info("Weather API returned no usable records for the store regions.")
-                else:
-                    # ── Daily cell-level sales×weather panel ────────────────────────
-                    # Velocity = units per *selling* store/day within each local cell,
-                    # so a store being out of stock counts as availability (store
-                    # effect), not as weak weather-driven demand.
-                    daily_units = dfx.groupby(["business_date", "cell_id"], as_index=False).agg(
-                        units_ty=("pos_quantity_this_year", "sum"))
-                    selling = (dfx[dfx["pos_quantity_this_year"] > 0]
-                               .groupby(["business_date", "cell_id"])["store_number"]
-                               .nunique().rename("stores_selling").reset_index())
-                    cell_day = daily_units.merge(selling, on=["business_date", "cell_id"], how="left")
-                    cell_day["stores_selling"] = cell_day["stores_selling"].fillna(0)
-                    cell_day = cell_day[cell_day["stores_selling"] > 0].copy()
-                    cell_day["units_per_store"] = cell_day["units_ty"] / cell_day["stores_selling"]
-
-                    wx_panel = cell_day.merge(
-                        weather_hist, left_on=["cell_id", "business_date"],
-                        right_on=["cell_id", "date"], how="inner")
-
-                    if wx_panel.empty:
-                        st.info("Weather loaded, but no weather dates lined up with the sales window.")
-                    else:
-                        # Weight weather by where we actually sell (units per cell).
-                        cell_units = dfx.groupby("cell_id")["pos_quantity_this_year"].sum()
-
-                        def _footprint_mean(frame, col):
-                            w = frame["cell_id"].map(cell_units).fillna(0.0)
-                            total = float(w.sum())
-                            return float((frame[col] * w).sum() / total) if total else float(frame[col].mean())
-
-                        model = wm.fit_velocity_model(
-                            wx_panel[["units_per_store", "heat", "rain", "hot_dry", "date", "cell_id"]]
-                            .rename(columns={"cell_id": "area"}))
-
-                        # Footprint daily series (store-weighted weather, national velocity).
-                        wcols = ["heat", "rain", "hot_dry", "temperature_max_f",
-                                 "precipitation_in", "heat_dry_score"]
-                        foot = wx_panel.copy()
-                        for c in wcols:
-                            foot[c + "_wsum"] = foot[c] * foot["stores_selling"]
-                        daily = foot.groupby("business_date", as_index=False).agg(
-                            units=("units_ty", "sum"), stores=("stores_selling", "sum"),
-                            **{c + "_wsum": (c + "_wsum", "sum") for c in wcols})
-                        for c in wcols:
-                            daily[c] = np.where(daily["stores"] > 0, daily[c + "_wsum"] / daily["stores"], np.nan)
-                        daily["vel"] = np.where(daily["stores"] > 0, daily["units"] / daily["stores"], 0.0)
-                        daily = daily.sort_values("business_date").reset_index(drop=True)
-                        all_dates = list(daily["business_date"])
-
-                        win = min(7, len(all_dates) // 2)
-                        recent_dates = all_dates[-win:] if win >= 1 else all_dates
-                        prior_dates = all_dates[-2 * win:-win] if win >= 2 else []
-
-                        # ── Today's conditions banner ───────────────────────────────
-                        today_wx = weather_forecast[weather_forecast["date"] == today_ts]
-                        if today_wx.empty:
-                            today_wx = weather_forecast[weather_forecast["date"] == weather_forecast["date"].min()]
-                        today_temp = _footprint_mean(today_wx, "temperature_max_f")
-                        today_precip = _footprint_mean(today_wx, "precipitation_in")
-                        st.info(
-                            f"**Today across your footprint:** about **{today_temp:.0f}°F** and "
-                            f"**{today_precip:.2f} in** of rain — {wm.verdict_phrase(today_temp, today_precip)}."
-                        )
-                        st.caption(
-                            f"Mapped **{mapped_stores:,}/{total_stores:,}** stores "
-                            f"({coverage_pct:.0f}% of units) via `store_dim.{postal_col}` to "
-                            f"**{len(cells):,}** local weather areas · {len(daily):,} sales days analysed."
-                        )
-
-                        # ════════════════════════════════════════════════════════════
-                        #  1 · WHY YOUR NUMBERS MOVED
-                        # ════════════════════════════════════════════════════════════
-                        st.divider()
-                        st.markdown("### Why your numbers moved")
-
-                        def _period_summary(dates_list):
-                            sub = daily[daily["business_date"].isin(dates_list)]
-                            if sub.empty:
-                                return None
-                            nd = len(sub)
-                            w = sub["stores"]
-                            wtot = float(w.sum())
-                            wm_ = lambda c: float((sub[c] * w).sum() / wtot) if wtot else float(sub[c].mean())
-                            stores = float(sub["stores"].mean())
-                            units_per_day = float(sub["units"].sum() / nd)
-                            return {
-                                "n": nd, "units_per_day": units_per_day, "stores": stores,
-                                "vel": (units_per_day / stores) if stores else 0.0,
-                                "heat": wm_("heat"), "rain": wm_("rain"), "hot_dry": wm_("hot_dry"),
-                                "temp": wm_("temperature_max_f"), "precip": wm_("precipitation_in"),
-                            }
-
-                        if win >= 2:
-                            rec = _period_summary(recent_dates)
-                            pri = _period_summary(prior_dates)
-                            dec = wm.decompose_change(rec, pri, model)
-
-                            delta = dec["total_delta"]
-                            pct = (delta / dec["daily_prior"] * 100) if dec["daily_prior"] else 0.0
-                            dword = "up" if delta >= 0 else "down"
-                            d_temp = rec["temp"] - pri["temp"]
-                            d_precip = rec["precip"] - pri["precip"]
-
-                            m1, m2, m3, m4 = st.columns(4)
-                            m1.metric(f"Daily units (last {win}d)", f"{rec['units_per_day']:,.0f}",
-                                      f"{pct:+.1f}% vs prior {win}d")
-                            m2.metric("Weather drove", f"{dec['weather_effect']:+,.0f}/day",
-                                      help="Estimated units/day from the weather change, per the model.")
-                            m3.metric("Stores selling drove", f"{dec['store_effect']:+,.0f}/day",
-                                      help="Change attributable to how many stores had product and sold.")
-                            m4.metric("Everything else", f"{dec['other_effect']:+,.0f}/day",
-                                      help="Demand, price, promo, execution — what weather and store count don't explain.")
-
-                            def _phrase(val, helped, hurt, flat="was roughly flat"):
-                                if abs(val) < max(1.0, 0.01 * abs(dec["daily_prior"])):
-                                    return flat
-                                return helped if val > 0 else hurt
-
-                            wx_tail = (
-                                f"a **tailwind** (+{dec['weather_effect']:,.0f}/day)" if dec["weather_effect"] > 0
-                                else f"a **headwind** ({dec['weather_effect']:,.0f}/day)"
-                            )
-                            st.markdown(
-                                f"Daily units are **{dword} {abs(delta):,.0f}/day** ({pct:+.1f}%) versus the prior "
-                                f"{win} days. It was **{d_temp:+.0f}°F** and **{d_precip:+.2f} in** of rain different, "
-                                f"so weather was {wx_tail}. Store availability {_phrase(dec['store_effect'], 'added', 'cost')} "
-                                f"~{abs(dec['store_effect']):,.0f}/day, and everything else "
-                                f"(demand, pricing, execution) {_phrase(dec['other_effect'], 'added', 'cost')} "
-                                f"~{abs(dec['other_effect']):,.0f}/day."
-                            )
-
-                            contrib = pd.DataFrame({
-                                "driver": ["Stores selling", "Weather", "Everything else"],
-                                "effect": [dec["store_effect"], dec["weather_effect"], dec["other_effect"]],
-                            })
-                            contrib["sign"] = np.where(contrib["effect"] >= 0, "Helped", "Hurt")
-                            contrib_chart = alt.Chart(contrib).mark_bar().encode(
-                                x=alt.X("effect:Q", title="Units/day impact vs prior period"),
-                                y=alt.Y("driver:N", sort=["Stores selling", "Weather", "Everything else"], title=None),
-                                color=alt.Color("sign:N", scale=alt.Scale(domain=["Helped", "Hurt"],
-                                                range=["#27500A", "#791F1F"]), legend=None),
-                                tooltip=[alt.Tooltip("driver:N", title="Driver"),
-                                         alt.Tooltip("effect:Q", format="+,.0f", title="Units/day")],
-                            ).properties(height=150)
-                            st.altair_chart(contrib_chart, width='stretch')
-                        else:
-                            st.caption("Need at least 4 sales days to break down a recent swing.")
-
-                        # ── Year-over-year weather context ──────────────────────────
-                        if not weather_hist_ly.empty:
-                            ty_cell = weather_hist.groupby("cell_id", as_index=False).agg(
-                                heat=("heat", "mean"), rain=("rain", "mean"), hot_dry=("hot_dry", "mean"),
-                                temperature_max_f=("temperature_max_f", "mean"),
-                                precipitation_in=("precipitation_in", "mean"))
-                            ly_cell = weather_hist_ly.groupby("cell_id", as_index=False).agg(
-                                heat=("heat", "mean"), rain=("rain", "mean"), hot_dry=("hot_dry", "mean"),
-                                temperature_max_f=("temperature_max_f", "mean"),
-                                precipitation_in=("precipitation_in", "mean"))
-                            ty_temp = _footprint_mean(ty_cell, "temperature_max_f")
-                            ly_temp = _footprint_mean(ly_cell, "temperature_max_f")
-                            ty_precip = _footprint_mean(ty_cell, "precipitation_in")
-                            ly_precip = _footprint_mean(ly_cell, "precipitation_in")
-                            yoy_units_txt = ""
-                            if model is not None and model.confidence != "Low":
-                                ty_f = pd.DataFrame([{k: _footprint_mean(ty_cell, k) for k in wm.WEATHER_FEATURES}])
-                                ly_f = pd.DataFrame([{k: _footprint_mean(ly_cell, k) for k in wm.WEATHER_FEATURES}])
-                                wc_diff = float(model.weather_component(ty_f).iloc[0]
-                                                - model.weather_component(ly_f).iloc[0])
-                                yoy_weather_units = wc_diff * float(daily["stores"].mean())
-                                easier = "easier" if yoy_weather_units < 0 else "tougher"
-                                yoy_units_txt = (
-                                    f" That makes this year's weather worth about **{yoy_weather_units:+,.0f} "
-                                    f"units/day** vs last year — so the YoY comparison is **{easier}** on weather alone."
-                                )
-                            st.markdown("**Versus last year (same dates):**")
-                            y1, y2, y3 = st.columns(3)
-                            y1.metric("Temp vs last year", f"{ty_temp - ly_temp:+.1f}°F",
-                                      help=f"This year {ty_temp:.0f}°F vs {ly_temp:.0f}°F last year")
-                            y2.metric("Rain vs last year", f"{ty_precip - ly_precip:+.2f} in",
-                                      help=f"This year {ty_precip:.2f} in/day vs {ly_precip:.2f} last year")
-                            warmer = "warmer" if ty_temp >= ly_temp else "cooler"
-                            drier = "drier" if ty_precip <= ly_precip else "wetter"
-                            y3.metric("Weather backdrop", f"{warmer}, {drier}")
-                            if yoy_units_txt:
-                                st.caption(
-                                    f"You're lapping weather that was {('hotter' if ly_temp > ty_temp else 'cooler')} "
-                                    f"last year.{yoy_units_txt}"
-                                )
-
-                        # ════════════════════════════════════════════════════════════
-                        #  2 · HOW WEATHER DRIVES YOUR SALES (THE MODEL)
-                        # ════════════════════════════════════════════════════════════
-                        st.divider()
-                        st.markdown("### How weather drives your sales")
-
-                        if model is not None:
-                            st.markdown(f"**Model confidence: {model.confidence}** — {model.confidence_note}")
-                            for note in model.notes:
-                                st.caption(f"Note: {note}")
-                            dl, dr = st.columns([2, 3])
-                            with dl:
-                                for bullet in model.driver_summary():
-                                    st.markdown(f"- {bullet}")
-                            with dr:
-                                band = wx_panel.copy()
-                                band["temp_band"] = pd.cut(
-                                    band["temperature_max_f"], bins=[-100, 60, 70, 80, 90, 200],
-                                    labels=["<60°", "60–70°", "70–80°", "80–90°", "90°+"])
-                                band["rain_cat"] = np.where(band["precipitation_in"] <= 0.05, "Dry day", "Wet day")
-                                band_g = band.groupby(["temp_band", "rain_cat"], observed=True, as_index=False).agg(
-                                    vel=("units_per_store", "mean"), days=("units_per_store", "size"))
-                                band_g = band_g[band_g["days"] >= 2]
-                                band_chart = alt.Chart(band_g).mark_bar().encode(
-                                    x=alt.X("temp_band:N", title="Daily high temperature",
-                                            sort=["<60°", "60–70°", "70–80°", "80–90°", "90°+"]),
-                                    xOffset="rain_cat:N",
-                                    y=alt.Y("vel:Q", title="Avg units / store / day"),
-                                    color=alt.Color("rain_cat:N", scale=alt.Scale(domain=["Dry day", "Wet day"],
-                                                    range=["#BA7517", "#185FA5"]), legend=alt.Legend(title=None)),
-                                    tooltip=[alt.Tooltip("temp_band:N", title="High temp"),
-                                             alt.Tooltip("rain_cat:N", title="Conditions"),
-                                             alt.Tooltip("vel:Q", format=".2f", title="Units/store/day"),
-                                             alt.Tooltip("days:Q", title="Cell-days")],
-                                ).properties(height=300, title="Velocity by heat — dry vs wet days")
-                                st.altair_chart(band_chart, width='stretch')
-                        else:
-                            st.info(
-                                "Not enough matched sales-and-weather days to fit a reliable model yet "
-                                "(need ~14+). The forecast below falls back to a simple heat/dry-score rule."
-                            )
-
-                        # ════════════════════════════════════════════════════════════
-                        #  3 · RECENT PERFORMANCE vs WEATHER EXPECTATION
-                        # ════════════════════════════════════════════════════════════
-                        st.divider()
-                        st.markdown("### Recent sales vs what the weather predicted")
-                        st.caption(
-                            "The gold line is what the weather + day-of-week say each day *should* have done, "
-                            "anchored to your average velocity. Bars above the line = you beat the weather "
-                            "(strong execution / demand); below = you left sales on the table."
-                        )
-
-                        if model is not None:
-                            daily["wc"] = model.weather_component(daily[["heat", "rain", "hot_dry"]])
-                            daily["wknd_eff"] = (model.coef["weekend"]
-                                                 * daily["business_date"].dt.weekday.isin([5, 6]).astype(float))
-                        else:
-                            daily["wc"] = 0.0
-                            daily["wknd_eff"] = 0.0
-                        tot_stores = float(daily["stores"].sum())
-                        base_vel_nat = (daily["units"].sum() / tot_stores) if tot_stores else 0.0
-                        mean_wc = float((daily["wc"] * daily["stores"]).sum() / tot_stores) if tot_stores else 0.0
-                        mean_wknd = float((daily["wknd_eff"] * daily["stores"]).sum() / tot_stores) if tot_stores else 0.0
-                        daily["exp_vel"] = (base_vel_nat + (daily["wc"] - mean_wc)
-                                            + (daily["wknd_eff"] - mean_wknd)).clip(lower=0)
-                        daily["expected_units"] = daily["exp_vel"] * daily["stores"]
-                        daily["residual"] = daily["units"] - daily["expected_units"]
-
-                        last30 = daily.tail(30).copy()
-                        exp_chart = alt.layer(
-                            alt.Chart(last30).mark_bar(opacity=0.5, color="#185FA5").encode(
-                                x=alt.X("business_date:T", title="Date"),
-                                y=alt.Y("units:Q", title="Units sold"),
-                                tooltip=[alt.Tooltip("business_date:T", title="Date"),
-                                         alt.Tooltip("units:Q", format=",.0f", title="Actual units"),
-                                         alt.Tooltip("expected_units:Q", format=",.0f", title="Weather-expected"),
-                                         alt.Tooltip("residual:Q", format="+,.0f", title="Beat/missed by"),
-                                         alt.Tooltip("temperature_max_f:Q", format=".0f", title="High F"),
-                                         alt.Tooltip("precipitation_in:Q", format=".2f", title="Precip in")],
-                            ),
-                            alt.Chart(last30).mark_line(color="#BA7517", strokeWidth=2.5, point=True).encode(
-                                x="business_date:T", y="expected_units:Q"),
-                        ).properties(height=320)
-                        st.altair_chart(exp_chart, width='stretch')
-
-                        beat = daily.sort_values("residual", ascending=False).iloc[0]
-                        miss = daily.sort_values("residual").iloc[0]
-                        b1, b2 = st.columns(2)
-                        b1.metric("Best vs weather", beat["business_date"].strftime("%b %d"),
-                                  f"{beat['residual']:+,.0f} units", help="Day you most beat what weather predicted.")
-                        b2.metric("Softest vs weather", miss["business_date"].strftime("%b %d"),
-                                  f"{miss['residual']:+,.0f} units", delta_color="inverse",
-                                  help="Day you most underperformed the weather — worth a look (stock, promo, execution).")
-
-                        # ════════════════════════════════════════════════════════════
-                        #  4 · DEMAND FORECAST
-                        # ════════════════════════════════════════════════════════════
-                        st.divider()
-                        st.markdown("### Demand forecast from the weather")
-
-                        fc = pd.DataFrame()
-                        cell_lift = pd.Series(dtype=float)
-                        if win >= 2:
-                            recent_panel = wx_panel[wx_panel["business_date"].isin(recent_dates)]
-                            base_cell = recent_panel.groupby("cell_id", as_index=False).agg(
-                                base_vel=("units_per_store", "mean"),
-                                base_stores=("stores_selling", "mean"),
-                                base_heat=("heat", "mean"), base_rain=("rain", "mean"),
-                                base_hot_dry=("hot_dry", "mean"))
-                            if model is not None:
-                                base_cell["base_wc"] = (model.coef["heat"] * base_cell["base_heat"]
-                                                        + model.coef["rain"] * base_cell["base_rain"]
-                                                        + model.coef["hot_dry"] * base_cell["base_hot_dry"])
-                            else:
-                                base_cell["base_wc"] = 0.0
-                            recent_wknd_share = float(
-                                pd.to_datetime(pd.Series(recent_dates)).dt.weekday.isin([5, 6]).mean())
-                            base_wknd = (model.coef["weekend"] * recent_wknd_share) if model is not None else 0.0
-
-                            fc = weather_forecast[weather_forecast["date"] >= today_ts].merge(
-                                base_cell, on="cell_id", how="inner")
-
-                        if fc.empty:
-                            st.info("Forecast weather loaded, but no forecast cells matched recent sales.")
-                        else:
-                            if model is not None and model.confidence != "Low":
-                                fc["wc"] = model.weather_component(fc)
-                                fc["wknd"] = (model.coef["weekend"]
-                                              * pd.to_datetime(fc["date"]).dt.weekday.isin([5, 6]).astype(float))
-                                fc["vel_pred"] = (fc["base_vel"] + (fc["wc"] - fc["base_wc"])
-                                                  + (fc["wknd"] - base_wknd)).clip(lower=0)
-                            else:
-                                hist_score = float((wx_panel["heat_dry_score"] * wx_panel["stores_selling"]).sum()
-                                                   / max(1.0, wx_panel["stores_selling"].sum()))
-                                lift = (((fc["heat_dry_score"] - hist_score) / 100) * 0.15).clip(-0.35, 0.60)
-                                fc["vel_pred"] = (fc["base_vel"] * (1 + lift)).clip(lower=0)
-                            fc["units_pred"] = fc["vel_pred"] * fc["base_stores"]
-                            fc["units_base"] = fc["base_vel"] * fc["base_stores"]
-
-                            fw = fc.copy()
-                            for c in ["temperature_max_f", "precipitation_in", "heat_dry_score"]:
-                                fw[c + "_wsum"] = fw[c] * fw["base_stores"]
-                            fc_daily = fw.groupby("date", as_index=False).agg(
-                                units_pred=("units_pred", "sum"),
-                                wstore=("base_stores", "sum"),
-                                **{c + "_wsum": (c + "_wsum", "sum") for c in
-                                   ["temperature_max_f", "precipitation_in", "heat_dry_score"]})
-                            for c in ["temperature_max_f", "precipitation_in", "heat_dry_score"]:
-                                fc_daily[c] = fc_daily[c + "_wsum"] / fc_daily["wstore"]
-                            fc_daily = fc_daily.sort_values("date").reset_index(drop=True)
-
-                            recent_network_day = float(daily[daily["business_date"].isin(recent_dates)]["units"].mean())
-                            covered_base_day = float((fc.drop_duplicates("cell_id")
-                                                      .eval("base_vel * base_stores")).sum())
-                            uncovered_day = max(0.0, recent_network_day - covered_base_day)
-                            fc_daily["units_pred"] = fc_daily["units_pred"] + uncovered_day
-                            fc_daily["baseline"] = recent_network_day
-                            fc_daily["date_label"] = fc_daily["date"].dt.strftime("%a %b %d")
-
-                            cov = (min(0.40, model.resid_std / max(0.1, model.units_per_store_mean))
-                                   if model is not None else 0.25)
-                            fc_daily["lo"] = fc_daily["units_pred"] * (1 - cov)
-                            fc_daily["hi"] = fc_daily["units_pred"] * (1 + cov)
-
-                            order = list(fc_daily["date_label"])
-                            fl, fr = st.columns([3, 2])
-                            with fl:
-                                outlook = alt.layer(
-                                    alt.Chart(fc_daily).mark_area(opacity=0.18, color="#27500A").encode(
-                                        x=alt.X("date_label:N", sort=order, title="Forecast date",
-                                                axis=alt.Axis(labelAngle=-35)),
-                                        y=alt.Y("lo:Q", title="Predicted units/day"), y2="hi:Q"),
-                                    alt.Chart(fc_daily).mark_line(color="#27500A", strokeWidth=2.5, point=True).encode(
-                                        x=alt.X("date_label:N", sort=order), y="units_pred:Q",
-                                        tooltip=["date_label:N",
-                                                 alt.Tooltip("units_pred:Q", format=",.0f", title="Predicted"),
-                                                 alt.Tooltip("baseline:Q", format=",.0f", title="Recent run-rate"),
-                                                 alt.Tooltip("temperature_max_f:Q", format=".0f", title="High F"),
-                                                 alt.Tooltip("precipitation_in:Q", format=".2f", title="Precip in"),
-                                                 alt.Tooltip("heat_dry_score:Q", format=".0f", title="Heat/dry score")]),
-                                    alt.Chart(fc_daily).mark_rule(color="#A0A09A", strokeDash=[5, 4]).encode(
-                                        y="baseline:Q"),
-                                ).properties(height=340)
-                                st.altair_chart(outlook, width='stretch')
-                                st.caption(
-                                    "Solid line = weather-adjusted prediction · dashed grey = your recent run-rate · "
-                                    "shaded band = typical day-to-day variation."
-                                )
-                            with fr:
-                                horizon = fc_daily.head(14)
-                                pred_total = float(horizon["units_pred"].sum())
-                                base_total = recent_network_day * len(horizon)
-                                lift_pct = ((pred_total - base_total) / base_total * 100) if base_total else 0.0
-                                best = fc_daily.sort_values("units_pred", ascending=False).iloc[0]
-                                worst = fc_daily.sort_values("units_pred").iloc[0]
-                                st.metric(f"Next {len(horizon)} days predicted", f"{pred_total:,.0f} units",
-                                          f"{lift_pct:+.1f}% vs run-rate")
-                                st.metric("Best day", best["date"].strftime("%a %b %d"),
-                                          f"{best['units_pred'] / recent_network_day - 1:+.0%} vs run-rate"
-                                          if recent_network_day else "")
-                                st.metric("Softest day", worst["date"].strftime("%a %b %d"),
-                                          f"{worst['units_pred'] / recent_network_day - 1:+.0%} vs run-rate"
-                                          if recent_network_day else "", delta_color="inverse")
-                                if lift_pct >= 8:
-                                    st.success(
-                                        "**Hot/dry stretch ahead.** Expect demand above your recent run-rate — "
-                                        "pull inventory forward and keep your top-volume stores stocked.")
-                                elif lift_pct <= -8:
-                                    st.warning(
-                                        "**Cooler/wetter stretch ahead.** Expect softer sell-through — ease off "
-                                        "reorders and watch for overstock building in stores.")
-                                else:
-                                    st.info(
-                                        "**Weather looks neutral** vs your recent run-rate — no big weather swing "
-                                        "to plan around in the next two weeks.")
-
-                            show_fc = fc_daily[["date_label", "units_pred", "baseline",
-                                                "temperature_max_f", "precipitation_in"]].copy()
-                            show_fc.columns = ["Date", "Predicted", "Run-rate", "High F", "Precip"]
-                            st.dataframe(show_fc, width='stretch', hide_index=True, height=300,
-                                         column_config={
-                                             "Predicted": st.column_config.NumberColumn(format="%.0f"),
-                                             "Run-rate": st.column_config.NumberColumn(format="%.0f"),
-                                             "High F": st.column_config.NumberColumn(format="%.0f"),
-                                             "Precip": st.column_config.NumberColumn(format="%.2f in"),
-                                         })
-
-                            # Per-cell next-7-day lift factor, for store/state roll-ups below.
-                            fc7 = fc[fc["date"] <= today_ts + pd.Timedelta(days=6)]
-                            cl = fc7.groupby("cell_id", as_index=False).agg(
-                                vp=("vel_pred", "sum"), bv=("base_vel", "sum"))
-                            cl["lift"] = np.where(cl["bv"] > 0, (cl["vp"] / cl["bv"]).clip(0.5, 2.0), 1.0)
-                            cell_lift = cl.set_index("cell_id")["lift"]
-
-                        # ════════════════════════════════════════════════════════════
-                        #  5 · WHERE WEATHER MATTERS (MAP + STATE ROLL-UP)
-                        # ════════════════════════════════════════════════════════════
-                        st.divider()
-                        st.markdown("### Where the weather matters")
-
-                        store_recent = (dfx[dfx["business_date"].isin(recent_dates)]
-                                        .groupby("store_number")["pos_quantity_this_year"].sum()
-                                        / max(1, len(recent_dates)))
-                        store_pts = geo_small[geo_small["store_number"].isin(
-                            dfx["store_number"].dropna().unique())].copy()
-                        store_pts["recent_units"] = store_pts["store_number"].map(store_recent).fillna(0.0)
-                        store_pts["lift"] = store_pts["cell_id"].map(cell_lift).fillna(1.0) if len(cell_lift) else 1.0
-                        store_pts["pred_units"] = store_pts["recent_units"] * store_pts["lift"]
-
-                        map_l, map_r = st.columns(2)
-                        with map_l:
-                            st.markdown("**Recent volume by store**")
-                            mx = max(1.0, store_pts["recent_units"].max())
-                            rmap = store_pts[store_pts["recent_units"] > 0].copy()
-                            rmap["sz"] = rmap["recent_units"] / mx * 9000 + 1200
-                            st.map(rmap, latitude="lat", longitude="lon", size="sz")
-                            st.caption("Each dot is a store; size = recent units/day.")
-                        with map_r:
-                            st.markdown("**Next 7 days predicted demand**")
-                            if len(cell_lift):
-                                mxp = max(1.0, store_pts["pred_units"].max())
-                                pmap = store_pts[store_pts["pred_units"] > 0].copy()
-                                pmap["sz"] = pmap["pred_units"] / mxp * 9000 + 1200
-                                st.map(pmap, latitude="lat", longitude="lon", size="sz")
-                                st.caption("Size = weather-adjusted predicted units/day for the next 7 days.")
-                            else:
-                                st.info("Forecast map appears once a usable prediction is built.")
-
-                        if len(cell_lift):
-                            store_state = dfx.groupby("store_number")["state_or_province_code"].first()
-                            cell_wx7 = fc7.groupby("cell_id", as_index=False).agg(
-                                temp=("temperature_max_f", "mean"), precip=("precipitation_in", "mean"))
-                            stbl = pd.DataFrame({"store_number": store_recent.index,
-                                                 "recent_per_day": store_recent.values})
-                            stbl["cell_id"] = stbl["store_number"].map(geo_small.set_index("store_number")["cell_id"])
-                            stbl["state"] = stbl["store_number"].map(store_state)
-                            stbl["lift"] = stbl["cell_id"].map(cell_lift).fillna(1.0)
-                            stbl = stbl.merge(cell_wx7, on="cell_id", how="left")
-                            stbl["base7"] = stbl["recent_per_day"] * 7
-                            stbl["pred7"] = stbl["base7"] * stbl["lift"]
-                            stbl["temp_w"] = stbl["temp"] * stbl["base7"]
-                            stbl["precip_w"] = stbl["precip"] * stbl["base7"]
-                            state_tw = stbl.dropna(subset=["state"]).groupby("state", as_index=False).agg(
-                                base7=("base7", "sum"), pred7=("pred7", "sum"),
-                                stores=("store_number", "nunique"),
-                                temp_w=("temp_w", "sum"), precip_w=("precip_w", "sum"))
-                            state_tw = state_tw[state_tw["base7"] > 0].copy()
-                            state_tw["temp"] = state_tw["temp_w"] / state_tw["base7"]
-                            state_tw["precip"] = state_tw["precip_w"] / state_tw["base7"]
-                            state_tw["tailwind_pct"] = (state_tw["pred7"] / state_tw["base7"] - 1) * 100
-                            state_tw = state_tw.sort_values("tailwind_pct", ascending=False)
-                            show_tw = state_tw[["state", "tailwind_pct", "pred7", "stores", "temp", "precip"]].copy()
-                            show_tw.columns = ["State", "Weather tailwind %", "Predicted (7d)",
-                                               "Stores", "Avg High F", "Avg Precip"]
-                            st.markdown("**State weather tailwind / headwind — next 7 days**")
-                            st.dataframe(show_tw, width='stretch', hide_index=True, height=320,
-                                         column_config={
-                                             "Weather tailwind %": st.column_config.NumberColumn(format="%+.1f%%"),
-                                             "Predicted (7d)": st.column_config.NumberColumn(format="%.0f"),
-                                             "Avg High F": st.column_config.NumberColumn(format="%.0f"),
-                                             "Avg Precip": st.column_config.NumberColumn(format="%.2f in"),
-                                         })
-                            st.caption(
-                                "Tailwind % = predicted next-7-day demand vs each state's recent run-rate, from the "
-                                "weather model. Positive = weather is helping that state; negative = hurting."
-                            )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#   TAB 3 — SALES & VELOCITY
+#   TAB 2 — SALES & VELOCITY
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_sales:
     # ── Weekly sales trend ───────────────────────────────────────────────────
@@ -1657,12 +887,14 @@ with tab_sales:
         tooltip=["bucket", "Period", alt.Tooltip("stores:Q", format=",")],
     ).properties(height=300)), width='stretch')
 
-    # ── NEW: Forecast attainment ────────────────────────────────────────────
-    st.divider()
-    st.subheader("Forecast attainment")
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TAB 3 — FORECAST
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_forecast:
     st.caption(
-        "Actual sales as a percent of forecasted demand. Tells you whether the YoY decline "
-        "is hitting forecast (demand issue) or missing forecast (supply/distribution issue)."
+        "Walmart's daily demand forecast for your items — what's coming, how well actual "
+        "sales have tracked it, and whether store shelves and DCs are positioned to cover it."
     )
 
     fcst_df, fcst_err = load_forecast_data(lookback, slot)
@@ -1671,51 +903,258 @@ with tab_sales:
     elif fcst_df.empty:
         st.info("No forecast records returned for the selected items and lookback window.")
     else:
-        fcst_df_filt = fcst_df[fcst_df["walmart_item_number"].isin(item_filter)].copy()
-        # Attainment only makes sense where actuals can exist. The forecast table
-        # carries future-dated rows; including them would left-join to absent
-        # actuals (filled with 0) and understate the current week's attainment.
-        fcst_df_filt = fcst_df_filt[fcst_df_filt["forecast_date"] <= most_recent]
+        fc = fcst_df[fcst_df["walmart_item_number"].isin(item_filter)].copy()
+        # Actuals lag ~1 day, so "upcoming" = forecast dated after the latest actual.
+        future = fc[fc["forecast_date"] > most_recent].copy()
+        horizon_days = int((future["forecast_date"].max() - most_recent).days) if not future.empty else 0
+
+        # Recent run-rate from actuals (last 7 data days) — the baseline we compare against.
+        recent_cut = most_recent - timedelta(days=6)
+        recent_actual = df[df["business_date"] >= recent_cut]
+        recent_days = max(1, recent_actual["business_date"].dt.normalize().nunique())
+        run_rate_day = float(recent_actual["pos_quantity_this_year"].sum() / recent_days)
+
+        # ── A · Upcoming demand outlook ─────────────────────────────────────
+        st.subheader("Upcoming demand outlook")
+        if future.empty:
+            st.info(
+                "The forecast feed has no forward-dated rows right now, so there's no upcoming "
+                "outlook to show. Attainment vs past forecast is below."
+            )
+        else:
+            def _fcst_window(days):
+                end = most_recent + pd.Timedelta(days=days)
+                return float(future[future["forecast_date"] <= end]["forecast_quantity"].sum())
+
+            next7, next14 = _fcst_window(7), _fcst_window(14)
+            rr7 = run_rate_day * 7
+            d7 = ((next7 - rr7) / rr7 * 100) if rr7 else 0.0
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Next 7 days forecast", f"{next7:,.0f}", f"{d7:+.1f}% vs run-rate")
+            k2.metric("Next 14 days forecast", f"{next14:,.0f}")
+            k3.metric("Recent run-rate", f"{run_rate_day:,.0f}/day",
+                      help=f"Avg actual units/day over the last {recent_days} data days")
+            k4.metric("Forecast horizon", f"{horizon_days} days",
+                      help="How far the forecast feed currently extends past the latest actual")
+            trend = "above" if d7 > 2 else ("below" if d7 < -2 else "in line with")
+            tail = ("Demand is expected to **rise** — make sure stores and DCs are positioned for it."
+                    if d7 > 2 else
+                    ("Demand is expected to **soften** — watch for overstock and ease replenishment."
+                     if d7 < -2 else "Demand looks **steady** versus recent weeks."))
+            st.markdown(
+                f"Walmart forecasts **{next7:,.0f} units over the next 7 days** — **{d7:+.1f}%** "
+                f"{trend} your recent run-rate of {rr7:,.0f}/week. {tail}"
+            )
+
+        # ── B · Forecast vs actual timeline ─────────────────────────────────
+        st.divider()
+        st.subheader("Forecast vs actual")
+        st.caption(
+            "Bars = actual units sold (through the latest feed day). Line = Walmart's forecast, "
+            "continuing past the dashed marker into the upcoming window."
+        )
+        actual_daily = df.groupby("business_date", as_index=False)["pos_quantity_this_year"].sum().rename(
+            columns={"business_date": "date", "pos_quantity_this_year": "actual"})
+        fc_daily = fc.groupby("forecast_date", as_index=False)["forecast_quantity"].sum().rename(
+            columns={"forecast_date": "date", "forecast_quantity": "forecast"})
+        timeline = fc_daily.merge(actual_daily, on="date", how="outer").sort_values("date")
+        timeline = timeline[timeline["date"] >= most_recent - pd.Timedelta(days=21)]
+        tl_base = alt.Chart(timeline)
+        tl_bars = tl_base.mark_bar(opacity=0.5, color="#185FA5").encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("actual:Q", title="Units"),
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("actual:Q", format=",.0f", title="Actual"),
+                     alt.Tooltip("forecast:Q", format=",.0f", title="Forecast")])
+        tl_line = tl_base.mark_line(color="#BA7517", strokeWidth=2.5, point=True).encode(
+            x="date:T", y=alt.Y("forecast:Q"))
+        tl_rule = alt.Chart(pd.DataFrame({"d": [most_recent]})).mark_rule(
+            color="#A0A09A", strokeDash=[5, 4]).encode(x="d:T")
+        st.altair_chart((tl_bars + tl_line + tl_rule).properties(height=340), width='stretch')
+
+        # ── C · Forecast attainment & bias (past) ───────────────────────────
+        st.divider()
+        st.subheader("Forecast attainment & bias")
+        st.caption(
+            "How actual sales tracked the forecast on past dates. Below 100% = selling under "
+            "forecast (supply/distribution gap or soft demand); above = beating it (forecast set low)."
+        )
+        past_fc = fc[fc["forecast_date"] <= most_recent]
         actuals = df.groupby(["business_date", "walmart_item_number"], as_index=False)[
             "pos_quantity_this_year"].sum().rename(columns={
-                "business_date": "forecast_date",
-                "pos_quantity_this_year": "actual_quantity",
-            })
-        attn = fcst_df_filt.groupby(["forecast_date", "walmart_item_number"], as_index=False)[
+                "business_date": "forecast_date", "pos_quantity_this_year": "actual_quantity"})
+        attn = past_fc.groupby(["forecast_date", "walmart_item_number"], as_index=False)[
             "forecast_quantity"].sum().merge(actuals, on=["forecast_date", "walmart_item_number"], how="left")
         attn["actual_quantity"] = attn["actual_quantity"].fillna(0)
-        weekly = attn.copy()
-        weekly["week_start"] = _walmart_week_start(weekly["forecast_date"])
-        weekly_attn = weekly.groupby("week_start", as_index=False).agg(
-            forecast=("forecast_quantity", "sum"),
-            actual=("actual_quantity", "sum"),
-        ).sort_values("week_start")
-        weekly_attn["attainment_pct"] = np.where(weekly_attn["forecast"] > 0,
-            (weekly_attn["actual"] / weekly_attn["forecast"] * 100).round(1), 0)
-        weekly_attn["week_label"] = weekly_attn["week_start"].dt.strftime("Wk %b %d")
+        if attn.empty:
+            st.info("No overlapping forecast and actual dates to measure attainment.")
+        else:
+            wk = attn.copy()
+            wk["week_start"] = _walmart_week_start(wk["forecast_date"])
+            wkly = wk.groupby("week_start", as_index=False).agg(
+                forecast=("forecast_quantity", "sum"), actual=("actual_quantity", "sum")).sort_values("week_start")
+            wkly["attainment_pct"] = np.where(wkly["forecast"] > 0,
+                                              (wkly["actual"] / wkly["forecast"] * 100).round(1), 0)
+            wkly["week_label"] = wkly["week_start"].dt.strftime("Wk %b %d")
+            tot_f, tot_a = float(wkly["forecast"].sum()), float(wkly["actual"].sum())
+            bias = ((tot_a - tot_f) / tot_f * 100) if tot_f else 0.0
 
-        fa_l, fa_r = st.columns([3, 2])
-        with fa_l:
-            chart_m = weekly_attn.melt(id_vars=["week_label"], value_vars=["forecast", "actual"],
-                                       var_name="Series", value_name="Units")
-            chart_m["Series"] = chart_m["Series"].map({"forecast": "Forecast", "actual": "Actual"})
-            st.altair_chart((alt.Chart(chart_m).mark_bar().encode(
-                x=alt.X("week_label:N", sort=list(weekly_attn["week_label"]), title="Week",
-                        axis=alt.Axis(labelAngle=-30)),
-                y=alt.Y("Units:Q", title="Units"),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=["Forecast", "Actual"],
-                                range=["#A0A09A", "#185FA5"])),
-                xOffset="Series:N",
-                tooltip=["week_label", "Series", alt.Tooltip("Units:Q", format=",")],
-            ).properties(height=320)), width='stretch')
-        with fa_r:
-            show = weekly_attn[["week_label", "actual", "forecast", "attainment_pct"]].iloc[::-1].copy()
-            show.columns = ["Week", "Actual", "Forecast", "Attainment %"]
-            st.dataframe(show, width='stretch', hide_index=True,
-                         column_config={"Attainment %": st.column_config.NumberColumn(format="%.1f%%")})
+            at_l, at_r = st.columns([3, 2])
+            with at_l:
+                m = wkly.melt(id_vars=["week_label"], value_vars=["forecast", "actual"],
+                              var_name="Series", value_name="Units")
+                m["Series"] = m["Series"].map({"forecast": "Forecast", "actual": "Actual"})
+                st.altair_chart((alt.Chart(m).mark_bar().encode(
+                    x=alt.X("week_label:N", sort=list(wkly["week_label"]), title="Week",
+                            axis=alt.Axis(labelAngle=-30)),
+                    y=alt.Y("Units:Q", title="Units"),
+                    color=alt.Color("Series:N", scale=alt.Scale(domain=["Forecast", "Actual"],
+                                    range=["#A0A09A", "#185FA5"])),
+                    xOffset="Series:N",
+                    tooltip=["week_label", "Series", alt.Tooltip("Units:Q", format=",")],
+                ).properties(height=300)), width='stretch')
+            with at_r:
+                st.metric("Period attainment", f"{(tot_a / tot_f * 100) if tot_f else 0:.0f}%",
+                          f"{bias:+.0f}% vs forecast")
+                item_at = attn.groupby("walmart_item_number", as_index=False).agg(
+                    forecast=("forecast_quantity", "sum"), actual=("actual_quantity", "sum"))
+                item_at["Item"] = item_at["walmart_item_number"].map(ITEM_LABELS).fillna(
+                    item_at["walmart_item_number"].astype(str))
+                item_at["Attainment %"] = np.where(item_at["forecast"] > 0,
+                                                   (item_at["actual"] / item_at["forecast"] * 100).round(0), 0)
+                st.dataframe(item_at[["Item", "Attainment %"]], width='stretch', hide_index=True,
+                             column_config={"Attainment %": st.column_config.NumberColumn(format="%.0f%%")})
+            verdict = ("running **under** forecast — likely availability/supply or softer demand" if bias < -5
+                       else ("**beating** forecast — the forecast may be set conservatively" if bias > 5
+                             else "tracking forecast closely"))
+            st.caption(f"Net, you're {verdict} ({bias:+.0f}% vs forecast over the window).")
 
-        avg_attn = weekly_attn["attainment_pct"].mean() if not weekly_attn.empty else 0.0
-        st.caption(f"**Average period attainment: {avg_attn:.1f}%** — values below 100% mean actuals lagged forecast.")
+        # ── D · Store replenishment watchlist ───────────────────────────────
+        if not future.empty:
+            st.divider()
+            st.subheader("Store replenishment watchlist")
+            st.caption(
+                "Upcoming forecast vs each store's latest on-hand and recent sell-through — surfacing "
+                "stores most likely to stock out (or sit overstocked) against the forecast."
+            )
+            end7 = most_recent + pd.Timedelta(days=7)
+            store_fc = future[future["forecast_date"] <= end7].groupby(
+                "store_number", as_index=False)["forecast_quantity"].sum().rename(
+                    columns={"forecast_quantity": "fcst_7d"})
+            store_recent = recent_actual.groupby("store_number", as_index=False)["pos_quantity_this_year"].sum()
+            store_recent["recent_day"] = store_recent["pos_quantity_this_year"] / recent_days
+            latest_mask = df.groupby("store_number")["business_date"].transform("max") == df["business_date"]
+            latest_oh = df[latest_mask].groupby("store_number", as_index=False)[
+                "store_on_hand_quantity_this_year"].sum().rename(
+                    columns={"store_on_hand_quantity_this_year": "on_hand"})
+            watch = (store_fc
+                     .merge(store_recent[["store_number", "recent_day"]], on="store_number", how="left")
+                     .merge(latest_oh, on="store_number", how="left"))
+            watch["recent_day"] = watch["recent_day"].fillna(0.0)
+            watch["on_hand"] = watch["on_hand"].fillna(0.0)
+            watch["fcst_day"] = watch["fcst_7d"] / 7
+            watch["days_cover"] = np.where(watch["fcst_day"] > 0, watch["on_hand"] / watch["fcst_day"], np.inf)
+            watch["surge_x"] = np.where(watch["recent_day"] > 0, watch["fcst_day"] / watch["recent_day"], np.nan)
+
+            def _flag(r):
+                if r["fcst_day"] > 0 and r["days_cover"] < 7:
+                    return "Stockout risk"
+                if pd.notna(r["surge_x"]) and r["surge_x"] >= 1.5 and r["fcst_7d"] >= 5:
+                    return "Demand surge"
+                if r["fcst_7d"] > 0 and r["on_hand"] > r["fcst_7d"] * 4:
+                    return "Overstocked"
+                return "OK"
+
+            watch["flag"] = watch.apply(_flag, axis=1)
+            risk_n = int((watch["flag"] == "Stockout risk").sum())
+            surge_n = int((watch["flag"] == "Demand surge").sum())
+            w1, w2, w3 = st.columns(3)
+            w1.metric("Stores at stockout risk", f"{risk_n:,}", delta_color="inverse",
+                      help="Less than 1 week of on-hand vs the next-7-day forecast")
+            w2.metric("Stores with demand surge", f"{surge_n:,}",
+                      help="Next-7-day forecast ≥ 1.5× recent sell-through")
+            w3.metric("Upcoming 7-day forecast", f"{watch['fcst_7d'].sum():,.0f} units")
+            order_map = {"Stockout risk": 0, "Demand surge": 1, "Overstocked": 2, "OK": 3}
+            watch["_o"] = watch["flag"].map(order_map)
+            show_w = watch.sort_values(["_o", "fcst_7d"], ascending=[True, False]).head(25)
+            show_w = show_w[["store_number", "flag", "fcst_7d", "recent_day", "on_hand", "days_cover"]].copy()
+            show_w["days_cover"] = show_w["days_cover"].replace(np.inf, np.nan)
+            show_w.columns = ["Store", "Flag", "Forecast 7d", "Recent units/day", "On hand", "Days cover"]
+            st.dataframe(show_w, width='stretch', hide_index=True, height=380, column_config={
+                "Forecast 7d": st.column_config.NumberColumn(format="%.0f"),
+                "Recent units/day": st.column_config.NumberColumn(format="%.1f"),
+                "On hand": st.column_config.NumberColumn(format="%.0f"),
+                "Days cover": st.column_config.NumberColumn(format="%.1f"),
+            })
+            st.caption("Showing the 25 highest-priority stores (stockout risk first, then surge, by forecast size).")
+
+        # ── E · DC demand coverage ──────────────────────────────────────────
+        st.divider()
+        st.subheader("DC demand coverage")
+        if dc_df.empty:
+            st.info("DC data unavailable for the current filter.")
+        elif future.empty:
+            st.info("No forward-dated forecast to roll up to DCs.")
+        else:
+            st.caption(
+                "Upcoming store demand forecast rolled up to each DC (via store→DC alignment) versus "
+                "that DC's on-hand + on-order supply. Supply is converted warehouse-packs → eaches."
+            )
+            align_df, align_err = load_dc_alignment(slot)
+            latest_dc_date = dc_df["inventory_date"].max()
+            dc_latest = dc_df[dc_df["inventory_date"] == latest_dc_date].copy()
+            dc_latest["on_hand_e"] = (dc_latest["on_hand_warehouse_inventory_in_units_this_year"]
+                                      * dc_latest["warehouse_pack_each_quantity"])
+            dc_latest["on_order_e"] = (dc_latest["on_order_warehouse_quantity_in_units_this_year"]
+                                       * dc_latest["warehouse_pack_each_quantity"])
+            dc_supply = dc_latest.groupby(
+                ["distribution_center_number", "name_of_the_dc"], as_index=False).agg(
+                    on_hand=("on_hand_e", "sum"), on_order=("on_order_e", "sum"))
+            dc_supply["total_supply"] = dc_supply["on_hand"] + dc_supply["on_order"]
+
+            end14 = most_recent + pd.Timedelta(days=14)
+            store_fc14 = future[future["forecast_date"] <= end14].groupby(
+                "store_number", as_index=False)["forecast_quantity"].sum()
+            if align_err or align_df.empty:
+                st.caption("⚠ Store→DC alignment unavailable — forecast allocated to DCs proportionally to on-hand.")
+                total_fc14 = float(store_fc14["forecast_quantity"].sum())
+                net_oh = max(1.0, float(dc_supply["on_hand"].sum()))
+                dc_supply["fcst_14d"] = dc_supply["on_hand"] / net_oh * total_fc14
+            else:
+                primary = (align_df
+                           .sort_values(["store_number", "alignment_type", "distribution_center_number"])
+                           .drop_duplicates("store_number", keep="first"))
+                sd = store_fc14.merge(primary, on="store_number", how="left")
+                dcd = sd.groupby("distribution_center_number", as_index=False)["forecast_quantity"].sum().rename(
+                    columns={"forecast_quantity": "fcst_14d"})
+                dc_supply = dc_supply.merge(dcd, on="distribution_center_number", how="left")
+                dc_supply["fcst_14d"] = dc_supply["fcst_14d"].fillna(0.0)
+
+            dc_supply["fcst_day"] = dc_supply["fcst_14d"] / 14
+            dc_supply["wos_oh"] = np.where(dc_supply["fcst_day"] > 0,
+                                           dc_supply["on_hand"] / (dc_supply["fcst_day"] * 7), np.inf)
+            under = int(((~(dc_supply["total_supply"] >= dc_supply["fcst_14d"]))
+                         & (dc_supply["fcst_14d"] > 0)).sum())
+            dd1, dd2, dd3 = st.columns(3)
+            dd1.metric("Network DC on-hand", f"{dc_supply['on_hand'].sum():,.0f} ea")
+            dd2.metric("Upcoming 14-day forecast", f"{dc_supply['fcst_14d'].sum():,.0f}")
+            dd3.metric("DCs short of forecast", f"{under:,}", delta_color="inverse",
+                       help="On-hand + on-order below the next-14-day forecast demand")
+            dc_show = dc_supply.sort_values("fcst_14d", ascending=False).copy()
+            dc_show["wos_oh"] = dc_show["wos_oh"].replace(np.inf, np.nan)
+            dc_show = dc_show[["distribution_center_number", "name_of_the_dc", "fcst_14d",
+                               "on_hand", "on_order", "total_supply", "wos_oh"]]
+            dc_show.columns = ["DC #", "DC Name", "Forecast 14d", "On hand (ea)",
+                               "On order (ea)", "Total supply (ea)", "WOS (OH)"]
+            st.dataframe(dc_show, width='stretch', hide_index=True, height=380, column_config={
+                "Forecast 14d": st.column_config.NumberColumn(format="%.0f"),
+                "On hand (ea)": st.column_config.NumberColumn(format="%.0f"),
+                "On order (ea)": st.column_config.NumberColumn(format="%.0f"),
+                "Total supply (ea)": st.column_config.NumberColumn(format="%.0f"),
+                "WOS (OH)": st.column_config.NumberColumn(format="%.1f wks"),
+            })
+            st.caption(f"Snapshot {latest_dc_date.strftime('%b %d, %Y')} · supply converted to eaches "
+                       f"using each item's warehouse pack size.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

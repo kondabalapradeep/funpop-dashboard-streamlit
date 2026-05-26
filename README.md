@@ -9,12 +9,11 @@ A Streamlit app that pulls live data from BigQuery using your service-account JS
 | File | What it is |
 |---|---|
 | `streamlit_app.py` | The Streamlit app — auth, BQ queries, UI rendering. |
-| `weather_model.py` | Weather→sales engine for the Weather & Demand tab (pure, unit-tested functions: heat/rain/hot-dry velocity model, sales-change attribution, forecast projection). Run `python weather_model.py` for its self-test. |
-| `store_geo.py` | Pure, unit-tested helpers that turn store postal codes into coordinates and cluster stores onto a weather grid. Run `python store_geo.py` for its self-test. |
-| `data/zip_centroids.csv` | Bundled US ZIP → lat/long lookup (2013 government data, public domain) used to place each store on the weather grid. |
 | `funpop_core.py` | Original data-prep logic, reused unchanged (HTML template is in here too but unused). |
 | `sql/store_query.sql` | The store JOIN query. |
 | `sql/dc_query.sql` | The DC query. |
+| `sql/forecast_query.sql` | Daily demand-forecast query (powers the Forecast tab). |
+| `sql/dc_alignment_query.sql` | Store→DC alignment (rolls store forecast up to DCs). |
 | `requirements.txt` | Python deps. |
 | `.streamlit/secrets.toml.example` | Template — copy locally to `secrets.toml`, paste into Streamlit Cloud's UI for production. |
 | `.gitignore` | Keeps `secrets.toml` and `*.json` out of git. |
