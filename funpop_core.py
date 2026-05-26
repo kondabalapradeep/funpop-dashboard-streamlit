@@ -14,8 +14,8 @@ BIN_ITEMS    = [658442130, 658442128]
 SHELF_ITEMS  = [666209064]
 
 CONTAINER = {
-    658442130: {'units': 208, 'label': 'bins'},
-    658442128: {'units': 126, 'label': 'bins'},
+    658442128: {'units': 208, 'label': 'bins'},  # Full Bin
+    658442130: {'units': 126, 'label': 'bins'},  # Half Bin
     666209064: {'units': 6,   'label': 'cases'},
 }
 

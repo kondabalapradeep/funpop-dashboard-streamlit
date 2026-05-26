@@ -452,6 +452,15 @@ def load_weather_data(
         return pd.DataFrame(), pd.DataFrame(), str(e)
 
 
+def _walmart_week_start(dates: pd.Series) -> pd.Series:
+    """Start date (the Saturday) of the Walmart fiscal week for each date.
+    Walmart weeks run Saturday-Friday; pandas weekday() has Saturday=5. Used so
+    forecast and returns bucket into the same weeks as the rest of the dashboard,
+    which groups on walmart_calendar_week (also Saturday-Friday)."""
+    days_since_sat = (dates.dt.weekday - 5) % 7
+    return dates - pd.to_timedelta(days_since_sat, unit="D")
+
+
 def _safe_corr(frame: pd.DataFrame, x: str, y: str) -> float:
     clean = frame[[x, y]].dropna()
     if len(clean) < 3 or clean[x].nunique() < 2 or clean[y].nunique() < 2:
@@ -1251,6 +1260,10 @@ with tab_sales:
         st.info("No forecast records returned for the selected items and lookback window.")
     else:
         fcst_df_filt = fcst_df[fcst_df["walmart_item_number"].isin(item_filter)].copy()
+        # Attainment only makes sense where actuals can exist. The forecast table
+        # carries future-dated rows; including them would left-join to absent
+        # actuals (filled with 0) and understate the current week's attainment.
+        fcst_df_filt = fcst_df_filt[fcst_df_filt["forecast_date"] <= most_recent]
         actuals = df.groupby(["business_date", "walmart_item_number"], as_index=False)[
             "pos_quantity_this_year"].sum().rename(columns={
                 "business_date": "forecast_date",
@@ -1260,7 +1273,7 @@ with tab_sales:
             "forecast_quantity"].sum().merge(actuals, on=["forecast_date", "walmart_item_number"], how="left")
         attn["actual_quantity"] = attn["actual_quantity"].fillna(0)
         weekly = attn.copy()
-        weekly["week_start"] = weekly["forecast_date"] - pd.to_timedelta(weekly["forecast_date"].dt.weekday, unit="D")
+        weekly["week_start"] = _walmart_week_start(weekly["forecast_date"])
         weekly_attn = weekly.groupby("week_start", as_index=False).agg(
             forecast=("forecast_quantity", "sum"),
             actual=("actual_quantity", "sum"),
@@ -1289,7 +1302,7 @@ with tab_sales:
             st.dataframe(show, width='stretch', hide_index=True,
                          column_config={"Attainment %": st.column_config.NumberColumn(format="%.1f%%")})
 
-        avg_attn = weekly_attn["attainment_pct"].mean()
+        avg_attn = weekly_attn["attainment_pct"].mean() if not weekly_attn.empty else 0.0
         st.caption(f"**Average period attainment: {avg_attn:.1f}%** — values below 100% mean actuals lagged forecast.")
 
 
@@ -1406,7 +1419,7 @@ with tab_inv:
         if align_err or align_df.empty:
             if align_err:
                 st.caption(f"⚠️  Using approximate DC demand allocation (alignment table unavailable: {align_err})")
-            total_per_day = df["pos_quantity_this_year"].sum() / max(1, lookback)
+            total_per_day = df["pos_quantity_this_year"].sum() / period_days
             dc_summary = dc_latest.groupby(
                 ["distribution_center_number", "name_of_the_dc"], as_index=False
             ).agg(
@@ -1422,13 +1435,19 @@ with tab_inv:
         else:
             # True allocation: sum store sales by their aligned DC
             st.caption(f"✓ Using true store→DC demand allocation ({len(align_df):,} alignments)")
-            # If multiple alignments per store, use first (typically primary)
-            primary_align = align_df.drop_duplicates(subset=["store_number"], keep="first")
+            # Deterministic primary pick: lowest alignment_type code, then lowest
+            # DC number. Without this, "first" depended on BigQuery row order and
+            # could reassign a store's demand to a different DC between refreshes.
+            primary_align = (
+                align_df.sort_values(
+                    ["store_number", "alignment_type", "distribution_center_number"]
+                ).drop_duplicates(subset=["store_number"], keep="first")
+            )
             store_demand = df.groupby("store_number", as_index=False)["pos_quantity_this_year"].sum()
             store_demand = store_demand.merge(primary_align, on="store_number", how="left")
             dc_demand = store_demand.groupby("distribution_center_number", as_index=False)[
                 "pos_quantity_this_year"].sum().rename(columns={"pos_quantity_this_year": "period_demand"})
-            dc_demand["daily_demand"] = dc_demand["period_demand"] / max(1, lookback)
+            dc_demand["daily_demand"] = dc_demand["period_demand"] / period_days
 
             dc_summary = dc_latest.groupby(
                 ["distribution_center_number", "name_of_the_dc"], as_index=False
@@ -1588,8 +1607,7 @@ with tab_channels:
             r_k3.metric("Return $ (TY)", f"${ret_filt['return_sales_ty'].sum():,.0f}")
 
             # Weekly trend
-            ret_filt["week_start"] = ret_filt["return_date"] - pd.to_timedelta(
-                ret_filt["return_date"].dt.weekday, unit="D")
+            ret_filt["week_start"] = _walmart_week_start(ret_filt["return_date"])
             weekly_ret = ret_filt.groupby("week_start", as_index=False).agg(
                 returns_ty=("returns_ty", "sum"),
                 returns_ly=("returns_ly", "sum"),
