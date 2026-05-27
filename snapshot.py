@@ -1,46 +1,44 @@
-"""Durable BigQuery-backed snapshot of dashboard query results.
+"""Durable snapshot of dashboard query results, stored in the repo.
 
 The dashboard's expensive work is the BigQuery pulls. Streamlit Community Cloud
 discards in-memory ``@st.cache_data`` whenever the app process restarts (sleep,
 redeploy, recycle), so a visitor who lands after a restart pays the full query
 cost again — which is why the dashboard wasn't already loaded at 8am.
 
-To make cold loads fast, a scheduled GitHub Actions job (``snapshot_build.py``)
-runs the same queries and stores each raw result in a single BigQuery table.
-The live app reads from that table on a cache miss instead of re-querying the
-source tables. Any miss/staleness/error degrades to a live query, so behaviour
-is never worse than a direct pull.
+The service-account key the dashboard uses is **read-only**, so we cannot write
+a snapshot back into BigQuery. Instead a scheduled GitHub Actions job
+(``snapshot_build.py``) runs the same read-only queries and commits each result
+as a parquet file under ``snapshot_data/``. The deployed app reads those files
+on a cache miss instead of re-querying. Any miss/staleness/error degrades to a
+live query, so behaviour is never worse than a direct pull.
 
-This module is import-safe outside Streamlit (no ``streamlit`` import), so both
-the app and the builder can share key derivation and (de)serialization.
+This module is import-safe outside Streamlit (no ``streamlit`` import) so both
+the app and the builder can share it.
 """
-import base64
 import hashlib
 import io
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
-from google.cloud import bigquery
 
 logger = logging.getLogger("funpop_dashboard.snapshot")
 
-# Name of the table (in the same dataset as the source data) that holds the
-# serialized query results, one row per (query, params) pair.
-SNAPSHOT_TABLE = "_dashboard_snapshot"
+# Committed snapshot lives alongside the code so the deployed app has it on disk.
+SNAPSHOT_DIR = Path(__file__).resolve().parent / "snapshot_data"
+# Single timestamp for the whole snapshot; the freshness anchor (see below).
+MANIFEST_PATH = SNAPSHOT_DIR / "built_at.txt"
 
-# Ignore snapshots older than this. If the builder stops running we must fall
-# back to a live query rather than serve stale data forever. 30h tolerates one
-# fully-missed daily build cycle.
+# Ignore a snapshot older than this. If the builder stops running we fall back
+# to a live query (which the read-only key can still do) rather than serve stale
+# data forever. 30h tolerates one fully-missed daily build.
 MAX_AGE_SECONDS = 30 * 3600
 
 
 def snapshot_key(sql_filename: str, params=None) -> str:
-    """Stable key for a (query, params) pair.
-
-    Must match between the builder and the app, so it depends only on the SQL
-    filename and the parameter *values* — never object identity or the fully
-    substituted SQL text (which embeds the project/dataset and so differs by
-    environment)."""
+    """Stable key for a (query, params) pair. Must match between the builder and
+    the app, so it depends only on the filename and the parameter *values*."""
     parts = [sql_filename]
     for p in params or []:
         if hasattr(p, "values"):          # ArrayQueryParameter
@@ -51,80 +49,53 @@ def snapshot_key(sql_filename: str, params=None) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def serialize(df: pd.DataFrame) -> str:
-    """DataFrame -> base64 string of parquet bytes.
+def _parquet_path(key: str) -> Path:
+    return SNAPSHOT_DIR / f"{key}.parquet"
 
-    base64 text (not raw BYTES) is used so the value round-trips cleanly through
-    ``load_table_from_dataframe`` and ordinary query reads with no dependence on
-    BYTES-column handling."""
+
+def parquet_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
 
 
-def deserialize(payload: str) -> pd.DataFrame:
-    return pd.read_parquet(io.BytesIO(base64.b64decode(payload)))
+# ── Builder side ─────────────────────────────────────────────────────────────
+def write_if_changed(key: str, df: pd.DataFrame) -> bool:
+    """Write the parquet for ``key`` only if its bytes differ from what's on
+    disk. Returns True if the file changed. Skipping unchanged files keeps the
+    builder from creating a needless commit (and redeploy) every hour."""
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    data = parquet_bytes(df)
+    path = _parquet_path(key)
+    if path.exists() and path.read_bytes() == data:
+        return False
+    path.write_bytes(data)
+    return True
 
 
-def _table_id(project: str, dataset: str) -> str:
-    return f"{project}.{dataset}.{SNAPSHOT_TABLE}"
+def write_manifest(built_at: datetime | None = None) -> None:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = (built_at or datetime.now(timezone.utc)).isoformat()
+    MANIFEST_PATH.write_text(ts + "\n")
 
 
-def read_snapshot(client, project, dataset, key, max_age_seconds=MAX_AGE_SECONDS):
+# ── App side ─────────────────────────────────────────────────────────────────
+def read_snapshot(key: str, max_age_seconds: int = MAX_AGE_SECONDS):
     """Return the snapshotted DataFrame for ``key``, or ``None`` if it is
-    missing, stale, or unreadable.
-
-    Never raises: a snapshot problem must degrade to a live query, not break
-    the page."""
+    missing, stale, or unreadable. Never raises — a snapshot problem must
+    degrade to a live query, not break the page."""
     try:
-        sql = f"""
-            SELECT payload, UNIX_SECONDS(built_at) AS built_unix
-            FROM `{_table_id(project, dataset)}`
-            WHERE snapshot_key = @key
-            LIMIT 1
-        """
-        job = client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("key", "STRING", key)]
-            ),
-        )
-        rows = list(job.result())
-        if not rows:
+        path = _parquet_path(key)
+        if not path.exists() or not MANIFEST_PATH.exists():
             return None
-        import time
-        age = time.time() - rows[0]["built_unix"]
+        built = datetime.fromisoformat(MANIFEST_PATH.read_text().strip())
+        if built.tzinfo is None:
+            built = built.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - built).total_seconds()
         if age > max_age_seconds:
-            logger.info("snapshot %s is %.0fs old (> %ss) — ignoring", key, age, max_age_seconds)
+            logger.info("snapshot stale (built %s, %.0fs ago) — ignoring", built, age)
             return None
-        return deserialize(rows[0]["payload"])
+        return pd.read_parquet(path)
     except Exception as e:  # noqa: BLE001 - any failure must fall back to live
         logger.warning("snapshot read failed for %s: %s", key, e)
         return None
-
-
-def _schema():
-    return [
-        bigquery.SchemaField("snapshot_key", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("built_at", "TIMESTAMP", mode="REQUIRED"),
-        bigquery.SchemaField("row_count", "INTEGER"),
-        bigquery.SchemaField("payload", "STRING", mode="REQUIRED"),
-    ]
-
-
-def write_snapshots(client, project, dataset, rows) -> None:
-    """Overwrite the snapshot table with ``rows``.
-
-    ``rows`` is a list of dicts with keys snapshot_key, built_at, row_count,
-    payload. WRITE_TRUNCATE keeps the table to exactly the current set of
-    queries and makes each build atomic (one load job)."""
-    df = pd.DataFrame(rows, columns=["snapshot_key", "built_at", "row_count", "payload"])
-    job = client.load_table_from_dataframe(
-        df,
-        _table_id(project, dataset),
-        job_config=bigquery.LoadJobConfig(
-            schema=_schema(),
-            write_disposition="WRITE_TRUNCATE",
-        ),
-    )
-    job.result()

@@ -1,21 +1,22 @@
-# Builds the durable dashboard data snapshot.
+# Builds the durable dashboard data snapshot and commits it to the repo.
 #
 # Why: Streamlit Community Cloud discards the app's in-memory @st.cache_data
 # whenever the process restarts (sleep, redeploy, recycle). Without a durable
 # copy, a visitor who lands after a restart re-runs every BigQuery pull — which
-# is why the dashboard wasn't already loaded at 8am. This job runs the same
-# queries against BigQuery and writes the results to a `_dashboard_snapshot`
-# table; the live app reads that on a cold start instead of re-querying.
+# is why the dashboard wasn't already loaded at 8am.
 #
-# Pair with refresh.yml (keep-awake pings) so the Community Cloud container is
-# also awake and warmed from the snapshot right before the morning visit.
+# The dashboard's service-account key is read-only, so we can't write a snapshot
+# back into BigQuery. Instead this job runs the same read-only queries and
+# commits the results as parquet files under snapshot_data/. The committed push
+# also triggers a fresh Streamlit redeploy, so by the morning the app is serving
+# from the snapshot on disk. Pair with refresh.yml (keep-awake pings).
 #
 # Required repo secrets (Settings -> Secrets and variables -> Actions):
-#   GCP_SERVICE_ACCOUNT_JSON  the full service-account JSON (same key the app
-#                             uses); the account needs BigQuery read + write
-#                             (role: BigQuery Data Editor) on the dataset.
+#   GCP_SERVICE_ACCOUNT_JSON  the full service-account JSON (the same read-only
+#                             key pasted into Streamlit Cloud's secrets).
 #   BQ_DATASET                the dataset name holding the source tables
 #                             (the value of st.secrets["bigquery"]["dataset"]).
+# No BigQuery write access is needed.
 #
 # DST: GitHub cron is UTC only. We schedule both Central offsets; the off-season
 # triggers run an hour off but just rebuild from the same source, so harmless.
@@ -34,6 +35,10 @@ on:
     - cron: '47 11-13 * * *'   # 6:47-8:47am CDT
     - cron: '47 12-14 * * *'   # 6:47-8:47am CST
   workflow_dispatch:           # manual trigger from the Actions tab
+
+# Needed so the job can commit the refreshed snapshot back to the repo.
+permissions:
+  contents: write
 
 concurrency:
   group: dashboard-snapshot
@@ -58,3 +63,17 @@ jobs:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
         run: python snapshot_build.py
+
+      - name: Commit snapshot if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snapshot_data
+          if git diff --cached --quiet; then
+            echo "No snapshot changes; nothing to commit."
+          else
+            git commit -m "Update dashboard snapshot"
+            # Rebase on any concurrent change before pushing, then retry once.
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

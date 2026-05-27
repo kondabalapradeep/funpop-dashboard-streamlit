@@ -76,24 +76,22 @@ You get a URL like `https://funpop-dashboard.streamlit.app` — that's what you 
 Several layers, mostly automatic:
 
 1. **In-app cache + hourly auto-refresh** — the BQ loaders are wrapped in `@st.cache_data` keyed by a time slot that advances every hour from 6am Central. Each new hour triggers a fresh pull until the day's data lands; once confirmed fresh, the slot locks to `today_done` and no more pulls happen that day.
-2. **Durable snapshot (so cold loads are instant)** — Streamlit Community Cloud throws away the in-memory cache whenever the app process restarts (sleep, redeploy, recycle). A scheduled GitHub Actions job (`.github/workflows/snapshot.yml` → `snapshot_build.py`) runs every dashboard query and stores the results in a `_dashboard_snapshot` BigQuery table. On a cold start the app reads that table (fast) instead of re-running the heavy joins. Any snapshot miss/staleness/error silently falls back to a live query, so the app is never *worse* than a direct pull.
+2. **Durable snapshot (so cold loads are instant)** — Streamlit Community Cloud throws away the in-memory cache whenever the app process restarts (sleep, redeploy, recycle). A scheduled GitHub Actions job (`.github/workflows/snapshot.yml` → `snapshot_build.py`) runs every dashboard query and commits the results as parquet files under `snapshot_data/`. On a cold start the app reads those files (fast) instead of re-running the heavy joins. Any snapshot miss/staleness/error silently falls back to a live query, so the app is never *worse* than a direct pull. The service-account key only needs **read** access — nothing is written back to BigQuery.
 3. **Keep-awake pings** — `.github/workflows/refresh.yml` loads the app in a headless browser in a tight cluster around 8am Central, so the container is awake and warmed from the snapshot when you open it in the morning.
 4. **Manual button** — the sidebar "Refresh data" button clears the cache and bypasses the snapshot to force a live pull. Use it to confirm the very latest data.
 
 ### Required setup for the snapshot (one-time)
 
-The snapshot builder runs in GitHub Actions, so it needs its own credentials. In the repo: **Settings → Secrets and variables → Actions → New repository secret**:
+The snapshot builder runs in GitHub Actions, so it needs its own copy of the read-only credentials. In the repo: **Settings → Secrets and variables → Actions → New repository secret**:
 
 | Secret | Value |
 |---|---|
-| `GCP_SERVICE_ACCOUNT_JSON` | The full service-account JSON (the same key pasted into Streamlit Cloud's secrets). |
+| `GCP_SERVICE_ACCOUNT_JSON` | The full service-account JSON (the same read-only key pasted into Streamlit Cloud's secrets). |
 | `BQ_DATASET` | The dataset name that holds the source tables (the value of `st.secrets["bigquery"]["dataset"]`, e.g. `dv_supplier`). |
 
-The service account also needs **write** access so it can create/update the snapshot table — grant it **BigQuery Data Editor** on the project/dataset (it already has Data Viewer + Job User for reads).
+That's it — no BigQuery write access or GCP console changes are required. After adding the secrets, open the **Actions** tab → **Build dashboard snapshot** → **Run workflow** to build the first snapshot and confirm it succeeds.
 
-After adding those, open the **Actions** tab → **Build dashboard snapshot** → **Run workflow** to build the first snapshot and confirm it succeeds.
-
-> If the source data ever grows too large to fit a snapshot row (BigQuery STRING cells cap at ~10 MiB), move the payload to a GCS bucket — `snapshot.py` is the only file that would change. Until then a too-large query just fails to snapshot and the app falls back to a live pull for it.
+> The job commits a small `snapshot_data/` folder to the repo each time the data changes (≈ once a day, when the feed lands). That commit also redeploys the app with the fresh snapshot baked in. If you ever want to stop it, disable the **Build dashboard snapshot** workflow.
 
 ---
 

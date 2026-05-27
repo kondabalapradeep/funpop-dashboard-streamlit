@@ -204,12 +204,7 @@ def _cached_query(sql_filename: str, params=None) -> pd.DataFrame:
     params = params or []
     if not _FORCE_LIVE_REFRESH:
         try:
-            df = snapshot.read_snapshot(
-                get_bq_client(),
-                _get_sa_info()["project_id"],
-                st.secrets["bigquery"]["dataset"],
-                snapshot.snapshot_key(sql_filename, params),
-            )
+            df = snapshot.read_snapshot(snapshot.snapshot_key(sql_filename, params))
             if df is not None:
                 return df
         except Exception as e:  # noqa: BLE001 - snapshot is best-effort

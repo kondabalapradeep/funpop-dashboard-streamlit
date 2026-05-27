@@ -1,12 +1,13 @@
 """Build the dashboard data snapshot.
 
-Runs every dashboard query once and stores the raw results in BigQuery so the
+Runs every dashboard query once (read-only) and writes the results to parquet
+files under snapshot_data/, which the workflow then commits to the repo so the
 live Streamlit app can serve cold loads instantly (see snapshot.py for why).
 Invoked by .github/workflows/snapshot.yml on a schedule.
 
 Environment:
-  GCP_SERVICE_ACCOUNT_JSON  full service-account JSON (same key the app uses);
-                            the account needs BigQuery read + write (Data Editor)
+  GCP_SERVICE_ACCOUNT_JSON  the service-account JSON (the same read-only key the
+                            app uses — no write access to BigQuery is needed)
   BQ_DATASET                the dataset that holds the source tables, e.g. dv_supplier
 
 The query/param list below MUST stay in sync with the loaders in
@@ -16,11 +17,10 @@ so a mismatch just means the app silently falls back to a live query.
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -71,38 +71,35 @@ def main() -> int:
     client = bigquery.Client(credentials=creds, project=project)
 
     lookback = lookback_for_today()
-    built_at = datetime.now(timezone.utc)
     print(f"Building snapshot for {project}.{dataset} (lookback={lookback})")
 
-    rows = []
+    succeeded = 0
+    changed = False
     for filename, params in query_jobs(lookback):
         try:
             df = client.query(
                 load_sql(filename, project, dataset),
                 job_config=bigquery.QueryJobConfig(query_parameters=params),
             ).to_dataframe(create_bqstorage_client=False)
-            # Serialize inside the try: if one query produces a frame parquet
-            # can't handle, skip just that query — the app falls back to a live
-            # pull for it while the rest of the snapshot still gets written.
-            payload = snapshot.serialize(df)
+            key = snapshot.snapshot_key(filename, params)
+            updated = snapshot.write_if_changed(key, df)
         except Exception as e:  # noqa: BLE001 - one bad query shouldn't sink the rest
             print(f"  WARN: {filename} failed: {e}", file=sys.stderr)
             continue
-        key = snapshot.snapshot_key(filename, params)
-        rows.append({
-            "snapshot_key": key,
-            "built_at": built_at,
-            "row_count": len(df),
-            "payload": payload,
-        })
-        print(f"  {filename}: {len(df):,} rows -> {key}")
+        succeeded += 1
+        changed = changed or updated
+        state = "updated" if updated else "unchanged"
+        print(f"  {filename}: {len(df):,} rows -> {key} ({state})")
 
-    if not rows:
-        print("ERROR: every query failed; not overwriting the snapshot", file=sys.stderr)
+    if succeeded == 0:
+        print("ERROR: every query failed; leaving the snapshot untouched", file=sys.stderr)
         return 1
 
-    snapshot.write_snapshots(client, project, dataset, rows)
-    print(f"Wrote {len(rows)} snapshot rows to {project}.{dataset}.{snapshot.SNAPSHOT_TABLE}")
+    if changed:
+        snapshot.write_manifest()
+        print("Snapshot data changed; manifest timestamp updated.")
+    else:
+        print("No data changes; snapshot left as-is (no commit expected).")
     return 0
 
 
