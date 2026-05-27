@@ -45,6 +45,7 @@ from constants import (
     ITEM_LABELS,
     SHELF_ITEMS,
 )
+import snapshot
 
 # Walmart is in Bentonville (Central Time). Daily BI Link feeds typically
 # land around 7am Central, sometimes later.
@@ -144,6 +145,11 @@ SQL_DIR = Path(__file__).parent / "sql"
 
 logger = logging.getLogger("funpop_dashboard")
 
+# Set from session_state at top level each run (reading session_state inside a
+# cached function is unreliable). When True, _cached_query skips the snapshot
+# and pulls live — used by the sidebar "Refresh data" button.
+_FORCE_LIVE_REFRESH = False
+
 
 def _section_error(label: str, err: object) -> None:
     """Log the real error server-side and show viewers a generic note.
@@ -182,10 +188,39 @@ def _run_query(sql, params=None):
     return client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=False)
 
 
+def _cached_query(sql_filename: str, params=None) -> pd.DataFrame:
+    """Fetch a query result, preferring the durable BigQuery snapshot written
+    by snapshot_build.py (run on a schedule by GitHub Actions) over a live pull.
+
+    Community Cloud drops in-memory @st.cache_data whenever the app process
+    restarts, so without this a visitor arriving after a restart pays the full
+    multi-query cost — that's why the page wasn't already loaded at 8am. The
+    snapshot makes a cold load fast and survives restarts. Any snapshot
+    miss/staleness/error falls through to a live query, so behaviour is never
+    worse than a direct pull.
+
+    The sidebar "Refresh data" button sets _force_live_refresh so it bypasses
+    the snapshot and still confirms the very latest data."""
+    params = params or []
+    if not _FORCE_LIVE_REFRESH:
+        try:
+            df = snapshot.read_snapshot(
+                get_bq_client(),
+                _get_sa_info()["project_id"],
+                st.secrets["bigquery"]["dataset"],
+                snapshot.snapshot_key(sql_filename, params),
+            )
+            if df is not None:
+                return df
+        except Exception as e:  # noqa: BLE001 - snapshot is best-effort
+            logger.warning("snapshot lookup skipped for %s: %s", sql_filename, e)
+    return _run_query(_load_sql(sql_filename), params)
+
+
 # ─── Primary data loaders ────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner="Loading store data...")
 def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
-    df = _run_query(_load_sql("store_query.sql"), [
+    df = _cached_query("store_query.sql", [
         bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
         bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
     ])
@@ -218,7 +253,7 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
 @st.cache_data(ttl=86400, show_spinner="Loading DC data...")
 def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     try:
-        df = _run_query(_load_sql("dc_query.sql"), [
+        df = _cached_query("dc_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
@@ -260,7 +295,7 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("dc_alignment_query.sql"))
+        df = _cached_query("dc_alignment_query.sql")
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -269,7 +304,7 @@ def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("forecast_query.sql"), [
+        df = _cached_query("forecast_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
@@ -284,7 +319,7 @@ def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("omni_query.sql"), [
+        df = _cached_query("omni_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
@@ -300,7 +335,7 @@ def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataF
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("ecom_inv_query.sql"), [
+        df = _cached_query("ecom_inv_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
@@ -316,7 +351,7 @@ def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("returns_query.sql"), [
+        df = _cached_query("returns_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
@@ -332,7 +367,7 @@ def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.Da
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("modular_query.sql"), [
+        df = _cached_query("modular_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
         ])
         return df, None
@@ -343,7 +378,7 @@ def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
-        df = _run_query(_load_sql("backroom_query.sql"), [
+        df = _cached_query("backroom_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
@@ -392,6 +427,9 @@ with st.sidebar:
     st.header("Controls")
     if st.button("🔄 Refresh data", help="Clear cache, re-pull from BigQuery"):
         st.cache_data.clear()
+        # Bypass the snapshot on the next run so Refresh confirms the very
+        # latest data with a live pull (the flag is cleared at end of script).
+        st.session_state["_force_live_refresh"] = True
         # Reset the freshness state so the manual refresh actually re-fetches
         try:
             _freshness_state()["confirmed_date"] = None
@@ -457,6 +495,10 @@ with st.sidebar:
 
 
 # ─── Primary data load ───────────────────────────────────────────────────────
+# Read the force-live flag at top level (safe) so the cached loaders' helper
+# can consult it without touching session_state from inside a cached function.
+_FORCE_LIVE_REFRESH = bool(st.session_state.get("_force_live_refresh"))
+
 # Time-aware cache key. Changes at 7am/7:30am/8am Central → auto-refresh.
 slot = _refresh_slot()
 
@@ -1615,3 +1657,8 @@ st.caption(
     f"BigQuery rows: {len(df):,} store · {len(dc_df):,} DC · "
     f"Auto-refresh: hourly from 6am Central until data arrives · Manual refresh in sidebar · Current slot: {slot}"
 )
+
+# A forced live refresh applies only to the rerun it triggered; clear it now
+# (after every loader has run) so the next rerun uses the fast snapshot again.
+if st.session_state.get("_force_live_refresh"):
+    st.session_state["_force_live_refresh"] = False

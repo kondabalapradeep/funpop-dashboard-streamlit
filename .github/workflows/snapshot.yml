@@ -1,0 +1,60 @@
+# Builds the durable dashboard data snapshot.
+#
+# Why: Streamlit Community Cloud discards the app's in-memory @st.cache_data
+# whenever the process restarts (sleep, redeploy, recycle). Without a durable
+# copy, a visitor who lands after a restart re-runs every BigQuery pull — which
+# is why the dashboard wasn't already loaded at 8am. This job runs the same
+# queries against BigQuery and writes the results to a `_dashboard_snapshot`
+# table; the live app reads that on a cold start instead of re-querying.
+#
+# Pair with refresh.yml (keep-awake pings) so the Community Cloud container is
+# also awake and warmed from the snapshot right before the morning visit.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   GCP_SERVICE_ACCOUNT_JSON  the full service-account JSON (same key the app
+#                             uses); the account needs BigQuery read + write
+#                             (role: BigQuery Data Editor) on the dataset.
+#   BQ_DATASET                the dataset name holding the source tables
+#                             (the value of st.secrets["bigquery"]["dataset"]).
+#
+# DST: GitHub cron is UTC only. We schedule both Central offsets; the off-season
+# triggers run an hour off but just rebuild from the same source, so harmless.
+
+name: Build dashboard snapshot
+
+on:
+  schedule:
+    # :17 past the hour (GitHub drops top-of-hour runs). Covers 6am-11pm Central.
+    - cron: '17 11-23 * * *'   # 6am-6pm CDT (UTC-5)
+    - cron: '17 0-4 * * *'     # 7pm-11pm CDT
+    - cron: '17 12-23 * * *'   # 6am-5pm CST (UTC-6)
+    - cron: '17 0-5 * * *'     # 6pm-11pm CST
+    # Extra :47 builds across the morning feed-landing window so a feed that
+    # lands just after a :17 build is captured before the ~8am visit.
+    - cron: '47 11-13 * * *'   # 6:47-8:47am CDT
+    - cron: '47 12-14 * * *'   # 6:47-8:47am CST
+  workflow_dispatch:           # manual trigger from the Actions tab
+
+concurrency:
+  group: dashboard-snapshot
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        # Same pins as the app so the snapshot serializes/deserializes identically.
+        run: pip install -r requirements.txt
+
+      - name: Build snapshot
+        env:
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+        run: python snapshot_build.py
