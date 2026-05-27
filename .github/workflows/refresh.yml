@@ -1,50 +1,41 @@
-# Hourly auto-refresh for the FunPop Sales Dashboard.
+# Keep-awake pings for the FunPop Sales Dashboard.
 #
-# Strategy:
-#   * Cron fires once per hour from 6am Central, daily.
-#   * Each run loads the dashboard in a real headless browser (Playwright).
-#     A plain `curl` only fetches Streamlit's static page shell and does NOT
-#     run the Python script — Streamlit executes the script (and warms the
-#     @st.cache_data BigQuery cache) only inside a real browser/WebSocket
-#     session. The browser load is what actually triggers the fresh BQ pull.
-#   * Inside the app, once the previous day's data is confirmed fresh, the
-#     cache slot locks to a "today_done" marker, so later loads hit cache only.
+# The heavy BigQuery work now happens in snapshot.yml, which writes results to
+# a durable table. This workflow's only job is to keep the Streamlit Community
+# Cloud container awake (and warm its in-memory cache from the fast snapshot)
+# so the morning visit doesn't hit a ~30s cold-boot. A plain curl only fetches
+# the static shell; Streamlit runs the script only inside a real browser
+# session, so we use a headless browser (Playwright).
 #
-# DST handling:
-#   GitHub Actions cron is UTC only. Central time is UTC-6 (CST, Nov-Mar) and
-#   UTC-5 (CDT, Mar-Nov). We schedule for BOTH UTC offsets — the off-season
-#   triggers run an hour "off" but just hit cache, so they're harmless.
+# Schedule is clustered tightly around the ~8am Central visit. After that we
+# stop — the app is allowed to sleep during the day and will wake on demand.
 #
-# Hours covered: 6am-11pm Central. After 11pm we stop trying for the day
-# (data didn't land = something's broken; tomorrow's first ping at 6am will
-# re-attempt).
+# DST: GitHub cron is UTC only; both Central offsets are scheduled. The
+# off-season triggers fire an hour off but harmlessly just load the page.
 #
 # Note: GitHub Actions cron is best-effort and can be delayed or skipped under
-# load, so timing is approximate. To disable: delete this file or comment out
-# the `schedule:` section.
+# load, so timing is approximate.
 
-name: Dashboard hourly refresh
+name: Dashboard keep-awake
 
 on:
   schedule:
-    # Offset to :17 past the hour, not :00. GitHub heavily throttles/drops
-    # scheduled runs at the top of the hour (highest contention), which caused
-    # overnight runs to be skipped. A non-zero minute is far more reliable.
-    # CDT (Mar-Nov, UTC-5): 6am Central = 11:00 UTC, 7am = 12:00 UTC, etc.
-    - cron: '17 11-23 * * *'   # 6am-6pm CDT
-    - cron: '17 0-4 * * *'     # 7pm-11pm CDT (UTC next-day hours)
-    # CST (Nov-Mar, UTC-6): 6am Central = 12:00 UTC, 7am = 13:00 UTC, etc.
-    - cron: '17 12-23 * * *'   # 6am-5pm CST
-    - cron: '17 0-5 * * *'     # 6pm-11pm CST (UTC next-day hours)
+    # Tight cluster ~7:15-8:15am Central so the app is awake and warmed when
+    # the dashboard is opened around 8am.
+    # CDT (UTC-5): 7am=12:00, 8am=13:00 UTC.
+    - cron: '15,45 12 * * *'   # 7:15 & 7:45am CDT
+    - cron: '15 13 * * *'      # 8:15am CDT
+    # CST (UTC-6): 7am=13:00, 8am=14:00 UTC.
+    - cron: '15,45 13 * * *'   # 7:15 & 7:45am CST
+    - cron: '15 14 * * *'      # 8:15am CST
   workflow_dispatch:           # manual trigger from the Actions tab
 
-# Don't let a slow run overlap the next scheduled one.
 concurrency:
-  group: dashboard-warm
+  group: dashboard-keepawake
   cancel-in-progress: false
 
 jobs:
-  warm:
+  ping:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-node@v4
@@ -57,11 +48,11 @@ jobs:
           npm install playwright@1.48.0
           npx playwright install --with-deps chromium
 
-      - name: Warm dashboard (real browser session runs the app + BQ pull)
+      - name: Ping dashboard (wake the container, warm cache from snapshot)
         env:
           DASHBOARD_URL: https://funpop-dashboard.streamlit.app/
         run: |
-          cat > warm.mjs <<'EOF'
+          cat > ping.mjs <<'EOF'
           import { chromium } from 'playwright';
 
           const url = process.env.DASHBOARD_URL;
@@ -78,14 +69,14 @@ jobs:
               console.log('Clicked wake button.');
             } catch { /* app was already awake */ }
 
-            // Let Streamlit open its WebSocket and finish a full script run
-            // (the BigQuery pull) so st.cache_data is warmed for real visitors.
+            // Reading from the snapshot is fast, so a short settle is enough to
+            // finish a script run and leave the container awake + warmed.
             await page.waitForLoadState('networkidle', { timeout: 120000 }).catch(() => {});
-            await page.waitForTimeout(60000);
+            await page.waitForTimeout(20000);
 
-            console.log('Warmed. Title:', await page.title());
+            console.log('Pinged. Title:', await page.title());
           } finally {
             await browser.close();
           }
           EOF
-          node warm.mjs
+          node ping.mjs
