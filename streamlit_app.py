@@ -44,6 +44,7 @@ from constants import (
     CASE_PACK_UNITS,
     ITEM_LABELS,
     SHELF_ITEMS,
+    item_group_label,
 )
 import snapshot
 
@@ -515,6 +516,9 @@ if df_all.empty:
 
 # Apply item filter
 df = df_all[df_all["walmart_item_number"].isin(item_filter)].copy()
+# Coarse display group (Bins = Full + Half) for the per-item breakouts that
+# shouldn't split the two bin packs. Carried into df_window via its slices.
+df["item_group"] = df["walmart_item_number"].map(item_group_label)
 dc_df = dc_df_all[dc_df_all["walmart_item_number"].isin(item_filter)].copy() if not dc_df_all.empty else dc_df_all
 
 if df.empty:
@@ -664,26 +668,32 @@ with tab_overview:
                      column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
 
     # ── Item performance ─────────────────────────────────────────────────────
+    # Full + Half bins are rolled into one "Bins" line; the half/full split
+    # isn't actionable here. Shelf stays on its own.
     st.subheader(f"Item performance — {window_label}")
 
+    # On-hand uses each item's own latest snapshot date, then rolls up to the
+    # display group (Bins = Full on-hand + Half on-hand).
     latest_per_item = df.groupby("walmart_item_number")["business_date"].max().to_dict()
-    item_oh = {}
+    group_oh = {}
+    group_items = {}
     for item, item_max in latest_per_item.items():
         snap = df[(df["walmart_item_number"] == item) & (df["business_date"] == item_max)]
-        item_oh[item] = int(snap["store_on_hand_quantity_this_year"].sum())
+        g = item_group_label(item)
+        group_oh[g] = group_oh.get(g, 0) + int(snap["store_on_hand_quantity_this_year"].sum())
+        group_items.setdefault(g, []).append(int(item))
 
-    item_perf = df_window.groupby("walmart_item_number", as_index=False).agg(
+    item_perf = df_window.groupby("item_group", as_index=False).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
         sales_ty=("pos_sales_this_year", "sum"),
         sales_ly=("pos_sales_last_year", "sum"),
-    )
+    ).rename(columns={"item_group": "item"})
     item_perf["sales_yoy_pct"] = _yoy_pct(item_perf["sales_ty"], item_perf["sales_ly"])
-    item_perf["on_hand"] = item_perf["walmart_item_number"].map(item_oh).fillna(0).astype(int)
-    item_perf["item"] = item_perf["walmart_item_number"].map(ITEM_LABELS).fillna(item_perf["walmart_item_number"].astype(str))
+    item_perf["on_hand"] = item_perf["item"].map(group_oh).fillna(0).astype(int)
     item_perf["yoy_pct"] = _yoy_pct(item_perf["units_ty"], item_perf["units_ly"])
-    full_units_per_item = df.groupby("walmart_item_number")["pos_quantity_this_year"].sum()
-    item_perf["wos_units_ty"] = item_perf["walmart_item_number"].map(full_units_per_item).fillna(0)
+    full_units_per_group = df.groupby("item_group")["pos_quantity_this_year"].sum()
+    item_perf["wos_units_ty"] = item_perf["item"].map(full_units_per_group).fillna(0)
     item_perf["wos"] = np.where(item_perf["wos_units_ty"] > 0,
         (item_perf["on_hand"] / (item_perf["wos_units_ty"] / weeks_in_period)).round(1), np.inf)
 
@@ -692,7 +702,8 @@ with tab_overview:
         for col, (_, row) in zip(ip_cols, item_perf.iterrows()):
             with col:
                 st.markdown(f"### {row['item']}")
-                st.caption(f"Item {int(row['walmart_item_number'])}")
+                nums = sorted(group_items.get(row["item"], []))
+                st.caption(("Items " if len(nums) > 1 else "Item ") + ", ".join(str(n) for n in nums))
                 st.metric("Units sold", f"{int(row['units_ty']):,}", f"{row['yoy_pct']:+.1f}% YoY")
                 st.metric("Sales", f"${row['sales_ty']:,.0f}", f"{row['sales_yoy_pct']:+.1f}% YoY")
                 st.metric("On hand (latest)", f"{int(row['on_hand']):,}")
@@ -859,23 +870,25 @@ with tab_sales:
         ).properties(height=300)), width='stretch')
 
     # ── U/S/W by item ────────────────────────────────────────────────────────
+    # Full + Half bins are combined into a single "Bins" line; Shelf stays
+    # separate. Active stores for "Bins" counts distinct stores that moved
+    # either pack (not the sum of the per-pack store counts, which would
+    # double-count stores selling both).
     st.markdown("**U/S/W by item (period total)**")
-    item_uspw = df.groupby("walmart_item_number", as_index=False).agg(
+    item_uspw = df.groupby("item_group", as_index=False).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
-    )
+    ).rename(columns={"item_group": "item"})
     ty_active_item = (df[df["pos_quantity_this_year"] > 0]
-                      .groupby("walmart_item_number")["store_number"].nunique()
-                      .rename("stores_ty").reset_index())
+                      .groupby("item_group")["store_number"].nunique()
+                      .rename("stores_ty").reset_index().rename(columns={"item_group": "item"}))
     ly_active_item = (df[df["pos_quantity_last_year"] > 0]
-                      .groupby("walmart_item_number")["store_number"].nunique()
-                      .rename("stores_ly").reset_index())
-    item_uspw = item_uspw.merge(ty_active_item, on="walmart_item_number", how="left")
-    item_uspw = item_uspw.merge(ly_active_item, on="walmart_item_number", how="left")
+                      .groupby("item_group")["store_number"].nunique()
+                      .rename("stores_ly").reset_index().rename(columns={"item_group": "item"}))
+    item_uspw = item_uspw.merge(ty_active_item, on="item", how="left")
+    item_uspw = item_uspw.merge(ly_active_item, on="item", how="left")
     item_uspw["stores_ty"] = item_uspw["stores_ty"].fillna(0).astype(int)
     item_uspw["stores_ly"] = item_uspw["stores_ly"].fillna(0).astype(int)
-    item_uspw["item"] = item_uspw["walmart_item_number"].map(ITEM_LABELS).fillna(
-        item_uspw["walmart_item_number"].astype(str))
     item_uspw["uspw_ty"] = np.where(item_uspw["stores_ty"] > 0,
         (item_uspw["units_ty"] / item_uspw["stores_ty"] / weeks_in_period).round(2), 0)
     item_uspw["uspw_ly"] = np.where(item_uspw["stores_ly"] > 0,

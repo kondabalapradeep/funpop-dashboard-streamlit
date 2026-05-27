@@ -18,6 +18,21 @@ ITEM_LABELS = {
     666209064: "Shelf",
 }
 
+# Coarser display grouping that rolls the Full + Half bins into a single "Bins"
+# line. Used by the per-item breakouts on the Overview and Sales & Velocity tabs,
+# where splitting the two bin packs is noise rather than signal. Shelf stays on
+# its own.
+BINS_GROUP_LABEL = "Bins"
+
+
+def item_group_label(item):
+    """Display group for an item: Full/Half bins collapse to 'Bins'; Shelf and
+    anything else fall back to their per-item label."""
+    if item in BIN_ITEMS:
+        return BINS_GROUP_LABEL
+    return ITEM_LABELS.get(item, str(item))
+
+
 # Eaches per warehouse case-pack. Used to convert DC pack quantities to units.
 CASE_PACK_UNITS = {
     658442128: 208,  # Full Bin
