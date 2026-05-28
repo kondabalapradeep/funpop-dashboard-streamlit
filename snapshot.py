@@ -22,6 +22,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+# Registers the dbdate/dbtime extension types with pandas so pd.read_parquet
+# can decode the BigQuery DATE/TIME columns the builder writes into the snapshot.
+# Without this import, every snapshot read silently raises and falls back to a
+# live query — making the snapshot worthless. The module is already a
+# requirements.txt dep (used by google-cloud-bigquery's to_dataframe).
+import db_dtypes  # noqa: F401
 
 logger = logging.getLogger("funpop_dashboard.snapshot")
 

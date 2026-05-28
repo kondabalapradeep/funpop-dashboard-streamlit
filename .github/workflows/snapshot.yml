@@ -25,15 +25,13 @@ name: Build dashboard snapshot
 
 on:
   schedule:
-    # :17 past the hour (GitHub drops top-of-hour runs). Covers 6am-11pm Central.
-    - cron: '17 11-23 * * *'   # 6am-6pm CDT (UTC-5)
-    - cron: '17 0-4 * * *'     # 7pm-11pm CDT
-    - cron: '17 12-23 * * *'   # 6am-5pm CST (UTC-6)
-    - cron: '17 0-5 * * *'     # 6pm-11pm CST
-    # Extra :47 builds across the morning feed-landing window so a feed that
-    # lands just after a :17 build is captured before the ~8am visit.
-    - cron: '47 11-13 * * *'   # 6:47-8:47am CDT
-    - cron: '47 12-14 * * *'   # 6:47-8:47am CST
+    # Morning-only schedule. The store feed lands once a day around 7am Central;
+    # builds outside that window can only produce intraday churn (which the
+    # business_date gate would skip anyway), so they'd just waste runs. The
+    # build runs at :17 and :47 across 6-9am Central to catch the feed
+    # whenever it lands. DST: GitHub cron is UTC only, so both offsets listed.
+    - cron: '17,47 11-14 * * *'   # 6:17/6:47..9:17/9:47am CDT (UTC-5)
+    - cron: '17,47 12-15 * * *'   # 6:17/6:47..9:17/9:47am CST (UTC-6)
   workflow_dispatch:           # manual trigger from the Actions tab
 
 # Needed so the job can commit the refreshed snapshot back to the repo.
