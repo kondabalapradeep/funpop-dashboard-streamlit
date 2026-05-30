@@ -248,15 +248,18 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     if "state_or_province_code" in df.columns:
         df["state_or_province_code"] = df["state_or_province_code"].astype("category")
     df["business_date"] = pd.to_datetime(df["business_date"])
-    for c in [
+    int_cols = [
         "pos_quantity_this_year", "pos_quantity_last_year",
         "store_on_hand_quantity_this_year", "store_on_hand_quantity_last_year",
         "store_in_warehouse_quantity_this_year", "store_in_transit_quantity_this_year",
+    ]
+    money_cols = [
         "store_specific_retail_amount_this_year",
         "pos_sales_this_year", "pos_sales_last_year",
-    ]:
+    ]
+    for c in int_cols + money_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    # Unit-price correction
+    # Unit-price correction (float division — must run before we shrink dtypes).
     sold = df[df["pos_quantity_this_year"] > 0]
     if len(sold) and sold["store_specific_retail_amount_this_year"].median() > 10:
         unit_price = np.where(
@@ -265,6 +268,18 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
             0,
         )
         df["store_specific_retail_amount_this_year"] = np.where(np.isnan(unit_price), 0, unit_price)
+    # Shrink dtypes — this is the app's heaviest frame and @st.cache_data holds a
+    # copy per key, so wide dtypes are what tip Community Cloud over its RAM cap.
+    # Counts are whole numbers (pandas sums int32 in an int64 accumulator, so no
+    # overflow); money fits float32 to the dollar at network scale and the UI
+    # rounds to whole dollars anyway. Roughly halves the numeric footprint.
+    for c in int_cols:
+        df[c] = df[c].round().astype("int32")
+    for c in money_cols:
+        df[c] = df[c].astype("float32")
+    for c in ["walmart_item_number", "store_number", "walmart_calendar_week"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int32")
     return df
 
 
@@ -302,7 +317,18 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
             "on_order_warehouse_quantity_in_units_this_year",
             "on_order_warehouse_quantity_in_units_last_year",
         ]:
-            df[c] = (df[c] * multiplier).round().astype("int64")
+            df[c] = (df[c] * multiplier).round().astype("int32")
+        # OOS columns are already eaches; shrink to int32 and drop the pack-size
+        # helper column now that the multiplier has been applied (memory hygiene).
+        for c in ["out_of_stock_each_quantity_this_year", "out_of_stock_each_quantity_last_year"]:
+            df[c] = df[c].round().astype("int32")
+        df = df.drop(columns=["warehouse_pack_each_quantity"], errors="ignore")
+        for c in ["walmart_item_number", "distribution_center_number"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int32")
+        # name_of_the_dc is deliberately left as object, not category: it's a
+        # groupby key alongside the (non-category) DC number in two sections, and
+        # a categorical key there would fan out into phantom name×number combos.
         return df
     except Exception as e:
         _section_error("DC data", e)
@@ -310,10 +336,31 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
 
 
 # ─── Secondary loaders (fault-tolerant) ──────────────────────────────────────
+def _shrink_frame(df: pd.DataFrame, int_cols=(), float_cols=(), cat_cols=()) -> pd.DataFrame:
+    """Shrink a cached frame's dtypes in place: counts → int32 (pandas still sums
+    them in an int64 accumulator, so no overflow), money/rates → float32, and
+    repeated codes/strings → category. @st.cache_data keeps a copy per key, so
+    trimming dtypes is what keeps the app under Community Cloud's RAM cap."""
+    for c in int_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype("int32")
+    for c in float_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("float32")
+    for c in cat_cols:
+        if c in df.columns:
+            df[c] = df[c].astype("category")
+    return df
+
+
 @st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("dc_alignment_query.sql")
+        # alignment_type is left as-is (not categoricalized): it drives the
+        # deterministic primary-DC sort, and the frame is small anyway.
+        if not df.empty:
+            _shrink_frame(df, int_cols=["store_number", "distribution_center_number"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -328,7 +375,8 @@ def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         ])
         if not df.empty:
             df["forecast_date"] = pd.to_datetime(df["forecast_date"])
-            df["forecast_quantity"] = pd.to_numeric(df["forecast_quantity"], errors="coerce").fillna(0)
+            _shrink_frame(df, int_cols=["store_number", "walmart_item_number"],
+                          float_cols=["forecast_quantity"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -343,8 +391,10 @@ def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataF
         ])
         if not df.empty:
             df["business_date"] = pd.to_datetime(df["business_date"])
-            for c in ["units_ty", "units_ly", "sales_ty", "sales_ly"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            _shrink_frame(df,
+                int_cols=["walmart_item_number", "walmart_calendar_week", "units_ty", "units_ly"],
+                float_cols=["sales_ty", "sales_ly"],
+                cat_cols=["order_channel", "service_channel"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -359,8 +409,9 @@ def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         ])
         if not df.empty:
             df["report_date"] = pd.to_datetime(df["report_date"])
-            for c in ["on_hand_units", "available_to_sell", "on_hand_units_ly"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            _shrink_frame(df,
+                int_cols=["walmart_item_number", "on_hand_units", "available_to_sell", "on_hand_units_ly"],
+                cat_cols=["ship_node"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -375,8 +426,10 @@ def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.Da
         ])
         if not df.empty:
             df["return_date"] = pd.to_datetime(df["return_date"])
-            for c in ["returns_ty", "returns_ly", "return_sales_ty", "return_sales_ly"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            _shrink_frame(df,
+                int_cols=["store_number", "walmart_item_number", "returns_ty", "returns_ly"],
+                float_cols=["return_sales_ty", "return_sales_ly"],
+                cat_cols=["return_reason"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -388,6 +441,9 @@ def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
         df = _cached_query("modular_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
         ])
+        if not df.empty:
+            _shrink_frame(df, int_cols=["store_number", "walmart_item_number"],
+                          cat_cols=["item_valid_flag"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -402,8 +458,9 @@ def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         ])
         if not df.empty:
             df["adjustment_date"] = pd.to_datetime(df["adjustment_date"])
-            for c in ["adjustment_qty_ty", "adjustment_qty_ly"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            _shrink_frame(df,
+                int_cols=["store_number", "walmart_item_number", "adjustment_qty_ty", "adjustment_qty_ly"],
+                cat_cols=["adjustment_type", "adjustment_description"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -675,6 +732,63 @@ tab_overview, tab_sales, tab_forecast, tab_inv, tab_channels, tab_dist = st.tabs
 #   TAB 1 — OVERVIEW
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_overview:
+    # ── Executive alert strip ────────────────────────────────────────────────
+    # Auto-generated "what changed" headlines so a GM gets the signal before the
+    # detail. Everything here is derived from the store frame already in memory —
+    # no extra queries. Alerts are prioritised by severity; the top few render.
+    _alerts = []  # (priority, kind, message); lower priority = more urgent
+
+    _sa_ty = float(df_window["pos_sales_this_year"].sum())
+    _sa_ly = float(df_window["pos_sales_last_year"].sum())
+    _sa_yoy = ((_sa_ty - _sa_ly) / _sa_ly * 100) if _sa_ly else 0.0
+    if _sa_ly:
+        if _sa_yoy <= -10:
+            _alerts.append((0, "error", f"**Sales down {_sa_yoy:.0f}% YoY** this period (${_sa_ty:,.0f} vs ${_sa_ly:,.0f})."))
+        elif _sa_yoy < -2:
+            _alerts.append((2, "warning", f"Sales softening — **{_sa_yoy:.0f}% YoY** (${_sa_ty:,.0f})."))
+        elif _sa_yoy >= 10:
+            _alerts.append((5, "success", f"**Sales up {_sa_yoy:.0f}% YoY** this period (${_sa_ty:,.0f})."))
+
+    _snap0 = df[df["business_date"] == most_recent]
+    _soh0 = _snap0.groupby("store_number")["store_on_hand_quantity_this_year"].sum()
+    _tot0 = int(_soh0.shape[0]); _oos0 = int((_soh0 == 0).sum())
+    _instock0 = (100 * (1 - _oos0 / _tot0)) if _tot0 else 100.0
+    if _tot0:
+        if _instock0 < 90:
+            _alerts.append((1, "error", f"**In-stock {_instock0:.0f}%** — {_oos0:,} of {_tot0:,} stores out of stock today."))
+        elif _instock0 < 95:
+            _alerts.append((3, "warning", f"In-stock {_instock0:.0f}% — {_oos0:,} stores OOS today (below the 95% target)."))
+        else:
+            _alerts.append((6, "success", f"In-stock {_instock0:.0f}% — service level healthy."))
+
+    _vu_ty = float(df["pos_quantity_this_year"].sum()); _vu_ly = float(df["pos_quantity_last_year"].sum())
+    _vs_ty = df[df["pos_quantity_this_year"] > 0]["store_number"].nunique()
+    _vs_ly = df[df["pos_quantity_last_year"] > 0]["store_number"].nunique()
+    _vr_ty = (_vu_ty / _vs_ty) if _vs_ty else 0.0
+    _vr_ly = (_vu_ly / _vs_ly) if _vs_ly else 0.0
+    _vr_yoy = ((_vr_ty - _vr_ly) / _vr_ly * 100) if _vr_ly else 0.0
+    if _vr_ly and _vr_yoy <= -10:
+        _alerts.append((2, "warning", f"Per-store velocity **{_vr_yoy:.0f}% YoY** — sell-through weakening, not just distribution."))
+    if _vs_ly and (_vs_ty - _vs_ly) <= -0.05 * _vs_ly:
+        _alerts.append((2, "warning", f"**{_vs_ly - _vs_ty:,} fewer stores selling** vs LY ({_vs_ty:,} vs {_vs_ly:,}) — distribution slipping."))
+
+    _stp = df.groupby("state_or_province_code", observed=True).agg(
+        ty=("pos_quantity_this_year", "sum"), ly=("pos_quantity_last_year", "sum")).reset_index()
+    _stp = _stp[_stp["ly"] > 50]
+    if not _stp.empty:
+        _stp["d"] = _stp["ty"] - _stp["ly"]
+        _w = _stp.sort_values("d").iloc[0]
+        if _w["d"] < 0 and _w["ly"]:
+            _alerts.append((4, "warning", f"**{_w['state_or_province_code']}** is the weakest state — units {((_w['ty'] - _w['ly']) / _w['ly'] * 100):.0f}% YoY."))
+
+    if _alerts:
+        _kindfn = {"error": st.error, "warning": st.warning, "success": st.success, "info": st.info}
+        _icon = {"error": "🔴", "warning": "🟡", "success": "🟢", "info": "ℹ️"}
+        st.markdown("#### 📌 What needs attention")
+        for _p, _k, _m in sorted(_alerts, key=lambda a: a[0])[:4]:
+            _kindfn[_k](_m, icon=_icon[_k])
+        st.divider()
+
     # ── Headline KPIs ────────────────────────────────────────────────────────
     st.subheader(f"Period at a glance — {window_label}")
 
@@ -1361,6 +1475,41 @@ with tab_forecast:
                              else "tracking forecast closely"))
             st.caption(f"Net, you're {verdict} ({bias:+.0f}% vs forecast over the window).")
 
+            # Forecast accuracy (WMAPE). Bias above tells you direction; this tells
+            # you magnitude — how far off the forecast was day-to-day, volume-weighted
+            # so a couple of tiny-volume days can't blow up the error.
+            st.markdown("**Forecast accuracy**")
+            st.caption(
+                "WMAPE = total absolute error ÷ total forecast (volume-weighted). "
+                "Accuracy = 100 − WMAPE. Complements bias: you can be net-on-target "
+                "(low bias) yet still inaccurate day-to-day (high WMAPE)."
+            )
+            acc_abs = attn.assign(ae=(attn["actual_quantity"] - attn["forecast_quantity"]).abs())
+            ae_item = acc_abs.groupby("walmart_item_number")["ae"].sum()
+            acc_item = attn.groupby("walmart_item_number", as_index=False).agg(
+                forecast=("forecast_quantity", "sum"), actual=("actual_quantity", "sum"))
+            acc_item["abs_err"] = acc_item["walmart_item_number"].map(ae_item).fillna(0.0)
+            acc_item["wmape"] = np.where(acc_item["forecast"] > 0,
+                                         acc_item["abs_err"] / acc_item["forecast"] * 100, np.nan)
+            acc_item["accuracy"] = (100 - acc_item["wmape"]).clip(lower=0)
+            acc_item["Item"] = acc_item["walmart_item_number"].map(ITEM_LABELS).fillna(
+                acc_item["walmart_item_number"].astype(str))
+            tot_ae = float(acc_abs["ae"].sum())
+            tot_fc = float(attn["forecast_quantity"].sum())
+            overall_wmape = (tot_ae / tot_fc * 100) if tot_fc else float("nan")
+            overall_acc = max(0.0, 100 - overall_wmape) if np.isfinite(overall_wmape) else float("nan")
+            ac_l, ac_r = st.columns([2, 3])
+            with ac_l:
+                st.metric("Overall forecast accuracy",
+                          f"{overall_acc:.0f}%" if np.isfinite(overall_acc) else "—",
+                          help="100 − volume-weighted MAPE over the overlapping forecast/actual window")
+            with ac_r:
+                acc_show = acc_item[["Item", "accuracy", "wmape"]].copy()
+                acc_show.columns = ["Item", "Accuracy %", "WMAPE %"]
+                st.dataframe(acc_show, width='stretch', hide_index=True, column_config={
+                    "Accuracy %": st.column_config.NumberColumn(format="%.0f%%"),
+                    "WMAPE %": st.column_config.NumberColumn(format="%.0f%%")})
+
         # ── D · Store replenishment watchlist ───────────────────────────────
         if not future.empty:
             st.divider()
@@ -1538,6 +1687,19 @@ with tab_inv:
         f"(**{daily_units:,.0f}** units/day) · stores out of stock now: **{oos_now:,}/{tot_stores:,}** "
         f"({oos_pct:.0f}%)."
     )
+
+    # Inventory productivity — is the stock actually working?
+    period_units = float(df["pos_quantity_this_year"].sum())
+    sell_through = (period_units / (period_units + store_oh) * 100) if (period_units + store_oh) else 0.0
+    inv_turn_wk = (weekly_units / store_oh) if store_oh else 0.0
+    pr1, pr2, pr3 = st.columns(3)
+    pr1.metric("Sell-through % (period)", f"{sell_through:.1f}%",
+               help="Units sold ÷ (units sold + current store on-hand). Higher = inventory turning, "
+                    "not piling up on shelves.")
+    pr2.metric("Weekly inventory turn", f"{inv_turn_wk:.2f}×",
+               help="Recent weekly sell-through ÷ store on-hand. ~0.25× ≈ 4 weeks of supply.")
+    pr3.metric("In-stock % (today)", f"{100 - oos_pct:.1f}%",
+               help="Share of stores with on-hand > 0 — retail service-level standard.")
 
     # ── Weekly inventory trend ───────────────────────────────────────────────
     st.divider()
@@ -1749,7 +1911,7 @@ with tab_channels:
 
         # Channel mix
         st.markdown("**Sales by service channel**")
-        by_chan = omni_filt.groupby("service_channel", as_index=False).agg(
+        by_chan = omni_filt.groupby("service_channel", as_index=False, observed=True).agg(
             units_ty=("units_ty", "sum"),
             units_ly=("units_ly", "sum"),
             sales_ty=("sales_ty", "sum"),
@@ -1776,7 +1938,8 @@ with tab_channels:
         )
         chan_tl = omni_filt.copy()
         chan_tl["week_start"] = _walmart_week_start(chan_tl["business_date"])
-        chan_wk = chan_tl.groupby(["week_start", "service_channel"], as_index=False)["units_ty"].sum()
+        chan_wk = chan_tl.groupby(["week_start", "service_channel"], as_index=False,
+                                  observed=True)["units_ty"].sum()
         if not chan_wk.empty:
             mix_mode = st.radio("Show as", ["Units", "% mix"], index=0, horizontal=True,
                                 key="chan_mix_mode")
@@ -1892,13 +2055,15 @@ with tab_channels:
                 "one reason (damage, quality, wrong item) points at a fixable root cause rather "
                 "than general softness."
             )
-            by_reason = ret_filt.groupby("return_reason", as_index=False).agg(
+            by_reason = ret_filt.groupby("return_reason", as_index=False, observed=True).agg(
                 returns_ty=("returns_ty", "sum"),
                 return_sales_ty=("return_sales_ty", "sum"),
             )
             by_reason = by_reason[by_reason["returns_ty"] != 0].sort_values(
                 "returns_ty", ascending=False).head(12)
-            by_reason["return_reason"] = by_reason["return_reason"].fillna("(blank)").astype(str)
+            # return_reason is categorical; go through object so fillna can add a
+            # label that isn't an existing category without raising.
+            by_reason["return_reason"] = by_reason["return_reason"].astype("object").fillna("(blank)").astype(str)
             if not by_reason.empty:
                 st.altair_chart((alt.Chart(by_reason).mark_bar(color="#791F1F").encode(
                     x=alt.X("returns_ty:Q", title="Returns (units)"),
