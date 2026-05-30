@@ -214,7 +214,13 @@ def _cached_query(sql_filename: str, params=None) -> pd.DataFrame:
 
 
 # ─── Primary data loaders ────────────────────────────────────────────────────
-@st.cache_data(ttl=86400, show_spinner="Loading store data...")
+# max_entries caps how many cached frames each loader keeps. The cache key
+# includes refresh_slot (advances hourly until the feed lands) and the custom
+# lookback slider, so without a cap @st.cache_data would retain a full copy of
+# every slot/lookback combination for the whole 24h TTL — several hundred MB of
+# stale frames that Community Cloud's RAM limit can't absorb. A small cap keeps
+# the current view (plus a couple of recent ones) and evicts the rest.
+@st.cache_data(ttl=86400, max_entries=3, show_spinner="Loading store data...")
 def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     df = _cached_query("store_query.sql", [
         bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
@@ -225,6 +231,19 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     _freshness_state()["last_refresh_at"] = datetime.now(CENTRAL_TZ).isoformat()
     if df.empty:
         return df
+    # Memory hygiene — this is the dashboard's heaviest frame (~4,500 stores ×
+    # ~35 days × 3 items ≈ 550k rows) and Community Cloud caps app RAM, so an
+    # un-trimmed frame (with @st.cache_data holding a copy per cache key) is what
+    # pushes the app over the limit. Two cheap wins, both safe with older
+    # snapshots thanks to the guards:
+    #   • Drop columns the query fetches but the dashboard never reads
+    #     (store_name / city_name / item_name). These are repeated Python strings
+    #     across every row — together ~120 MB in memory for nothing.
+    #   • Store the low-cardinality state code (~50 distinct) as a category
+    #     instead of a repeated string — another ~30 MB.
+    df = df.drop(columns=["store_name", "city_name", "item_name"], errors="ignore")
+    if "state_or_province_code" in df.columns:
+        df["state_or_province_code"] = df["state_or_province_code"].astype("category")
     df["business_date"] = pd.to_datetime(df["business_date"])
     for c in [
         "pos_quantity_this_year", "pos_quantity_last_year",
@@ -246,7 +265,7 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=86400, show_spinner="Loading DC data...")
+@st.cache_data(ttl=86400, max_entries=3, show_spinner="Loading DC data...")
 def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     try:
         df = _cached_query("dc_query.sql", [
@@ -288,7 +307,7 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
 
 
 # ─── Secondary loaders (fault-tolerant) ──────────────────────────────────────
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("dc_alignment_query.sql")
@@ -297,7 +316,7 @@ def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("forecast_query.sql", [
@@ -312,7 +331,7 @@ def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("omni_query.sql", [
@@ -328,7 +347,7 @@ def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataF
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("ecom_inv_query.sql", [
@@ -344,7 +363,7 @@ def load_ecom_inv_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("returns_query.sql", [
@@ -360,7 +379,7 @@ def load_returns_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.Da
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("modular_query.sql", [
@@ -371,7 +390,7 @@ def load_modular_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
         df = _cached_query("backroom_query.sql", [
@@ -1637,7 +1656,7 @@ with tab_dist:
     st.divider()
     st.subheader("Performance by state (top 20)")
 
-    state_perf = df.groupby("state_or_province_code", as_index=False).agg(
+    state_perf = df.groupby("state_or_province_code", as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
         sales_ty=("pos_sales_this_year", "sum"),
