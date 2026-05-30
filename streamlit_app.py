@@ -2232,12 +2232,13 @@ with tab_dist:
 #   TAB 7 — STORE ACTIONS (field-intervention list + vendor export)
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_actions:
-    st.subheader("Stores flagged for an in-person visit — last 7 days")
+    st.subheader("Stores flagged for an in-person visit")
     st.caption(
         "Surfaces stores with a **physically fixable** problem — product that should be "
-        "selling but isn't — so you can dispatch a rep. Export the ranked list (with mailing "
-        "address) to hand to the field-service company. This tab has its own item scope below, "
-        "so it works independently of the sidebar filter."
+        "selling but isn't — so you can dispatch a rep. Compares each store's **recent 3-day** rate "
+        "against its own **trailing run-rate**, so it reacts within 1–3 days without chasing daily "
+        "noise. Export the ranked list (with mailing address) to hand to the field-service company. "
+        "This tab has its own item scope below, so it works independently of the sidebar filter."
     )
 
     # This tab carries its own item scope (independent of the sidebar View) so a
@@ -2260,123 +2261,155 @@ with tab_actions:
     else:
         mr = dfa["business_date"].max()    # most recent day within this scope
 
-        # ── Analysis windows: the explicit "past 7 days" the request asks for,
-        # compared against the prior 7 days to detect a collapse. ──────────────
-        win_start = mr - timedelta(days=6)            # last 7 days, inclusive
-        prior_start = mr - timedelta(days=13)         # the 7 days before that
-        prior_end = mr - timedelta(days=7)
-        cur = dfa[dfa["business_date"] >= win_start]
-        prior = dfa[(dfa["business_date"] >= prior_start) & (dfa["business_date"] <= prior_end)]
+        # ── Analysis windows ──────────────────────────────────────────────────
+        # A short recent window reacts fast; a long, stable trailing run-rate as
+        # the baseline keeps low daily volume from whipsawing the comparison (a
+        # 3-day-vs-3-day check would fire constantly on lumpy single-SKU sales).
+        recent_start = mr - timedelta(days=2)         # last 3 days (incl. mr)
+        base_end = mr - timedelta(days=3)             # baseline ends before the recent window
+        base_start = mr - timedelta(days=23)          # ~21-day trailing run-rate
+        last7_start = mr - timedelta(days=6)          # for the OOS-of-7 check
+
+        recent = dfa[dfa["business_date"] >= recent_start]
+        baseline = dfa[(dfa["business_date"] >= base_start) & (dfa["business_date"] <= base_end)]
+        last7 = dfa[dfa["business_date"] >= last7_start]
+        recent_days = max(1, recent["business_date"].nunique())
+        baseline_days = max(1, baseline["business_date"].nunique())
+
+        # Per-store recent & baseline volumes.
+        rec = recent.groupby("store_number", as_index=False).agg(
+            recent_units=("pos_quantity_this_year", "sum"))
+        bas = baseline.groupby("store_number", as_index=False).agg(
+            baseline_units=("pos_quantity_this_year", "sum"))
+        # OOS days and LY volume over the last 7 days (chronic-OOS supply check).
+        sday7 = last7.groupby(["store_number", "business_date"], as_index=False).agg(
+            day_oh=("store_on_hand_quantity_this_year", "sum"))
+        oos_days = (sday7[sday7["day_oh"] == 0].groupby("store_number").size()
+                    .rename("oos_days").reset_index())
+        ly7 = last7.groupby("store_number", as_index=False).agg(
+            units_7d_ly=("pos_quantity_last_year", "sum"))
+        # Latest on-hand / in-warehouse / in-transit at each store's most recent day.
+        latest_mask = dfa.groupby("store_number")["business_date"].transform("max") == dfa["business_date"]
+        latest = dfa[latest_mask].groupby("store_number", as_index=False).agg(
+            on_hand=("store_on_hand_quantity_this_year", "sum"),
+            in_warehouse=("store_in_warehouse_quantity_this_year", "sum"),
+            in_transit=("store_in_transit_quantity_this_year", "sum"),
+        )
+        # Dark streak = consecutive most-recent data-days with zero sales (the run
+        # after each store's last sale). Drives the velocity-scaled "went dark" flag.
+        sd_all = dfa.groupby(["store_number", "business_date"], as_index=False).agg(
+            day_units=("pos_quantity_this_year", "sum"))
+        last_sell = (sd_all[sd_all["day_units"] > 0].groupby("store_number")["business_date"]
+                     .max().rename("last_sell").reset_index())
+        sd_all = sd_all.merge(last_sell, on="store_number", how="left")
+        sd_all["after_last_sell"] = sd_all["business_date"] > sd_all["last_sell"].fillna(pd.Timestamp.min)
+        dark = (sd_all.groupby("store_number")["after_last_sell"].sum()
+                .rename("dark_streak").reset_index())
+        state_map = (dfa.groupby("store_number", observed=True)["state_or_province_code"]
+                     .agg(lambda s: s.iloc[0]).astype(str).rename("state_code").reset_index())
+
+        s = pd.DataFrame({"store_number": dfa["store_number"].unique()})
+        for part in [rec, bas, oos_days, ly7, latest, dark, state_map]:
+            s = s.merge(part, on="store_number", how="left")
+        for col in ["recent_units", "baseline_units", "oos_days", "units_7d_ly",
+                    "on_hand", "in_warehouse", "in_transit", "dark_streak"]:
+            s[col] = s[col].fillna(0)
+        s["recent_daily"] = s["recent_units"] / recent_days
+        s["baseline_daily"] = s["baseline_units"] / baseline_days
 
         st.caption(
-            f"Current window: **{win_start.strftime('%b %d')} – {mr.strftime('%b %d, %Y')}** "
-            f"· baseline: prior 7 days ({prior_start.strftime('%b %d')} – {prior_end.strftime('%b %d')})."
+            f"Recent window: **last 3 days** ({recent_start.strftime('%b %d')} – {mr.strftime('%b %d, %Y')}) "
+            f"· baseline run-rate: trailing {baseline_days} days "
+            f"({base_start.strftime('%b %d')} – {base_end.strftime('%b %d')})."
         )
 
         # ── Tuning controls ───────────────────────────────────────────────────
-        c1, c2, c3 = st.columns([1, 1, 2])
+        c1, c2, c3 = st.columns(3)
         with c1:
             min_oh = st.slider(
                 "Min. on-hand to count as 'has stock'", 1, 50, 4,
                 help="A store needs at least this many units on hand before zero sales "
                      "counts as a problem (filters out stores that simply don't carry it).")
         with c2:
-            collapse_drop = st.slider(
-                "Sales-collapse threshold", 10, 95, 20, step=5, format="%d%%",
-                help="Flag a store whose sales fell at least this much vs the prior week "
-                     "while it still held on-hand stock. Lower = more sensitive (flags more stores).")
-
-        # ── Per-store rollups over the current 7-day window ──────────────────
-        cur_store = cur.groupby("store_number", as_index=False).agg(
-            units_7d=("pos_quantity_this_year", "sum"),
-            units_7d_ly=("pos_quantity_last_year", "sum"),
-            sales_7d=("pos_sales_this_year", "sum"),
-        )
-        # Store-day grain → selling days, OOS days, data days.
-        sday = cur.groupby(["store_number", "business_date"], as_index=False).agg(
-            day_units=("pos_quantity_this_year", "sum"),
-            day_oh=("store_on_hand_quantity_this_year", "sum"),
-        )
-        selling_days = (sday[sday["day_units"] > 0].groupby("store_number").size()
-                        .rename("selling_days").reset_index())
-        oos_days = (sday[sday["day_oh"] == 0].groupby("store_number").size()
-                    .rename("oos_days").reset_index())
-        # Latest on-hand / in-warehouse / in-transit at each store's most recent day.
-        latest_mask = cur.groupby("store_number")["business_date"].transform("max") == cur["business_date"]
-        latest = cur[latest_mask].groupby("store_number", as_index=False).agg(
-            on_hand=("store_on_hand_quantity_this_year", "sum"),
-            in_warehouse=("store_in_warehouse_quantity_this_year", "sum"),
-            in_transit=("store_in_transit_quantity_this_year", "sum"),
-        )
-        prior_units = (prior.groupby("store_number")["pos_quantity_this_year"].sum()
-                       .rename("units_prior7").reset_index())
-        state_map = (dfa.groupby("store_number", observed=True)["state_or_province_code"]
-                     .agg(lambda s: s.iloc[0]).astype(str).rename("state_code").reset_index())
-
-        s = (cur_store
-             .merge(latest, on="store_number", how="left")
-             .merge(selling_days, on="store_number", how="left")
-             .merge(oos_days, on="store_number", how="left")
-             .merge(prior_units, on="store_number", how="left")
-             .merge(state_map, on="store_number", how="left"))
-        for col in ["on_hand", "in_warehouse", "in_transit", "selling_days", "oos_days", "units_prior7"]:
-            s[col] = s[col].fillna(0)
+            decline_drop = st.slider(
+                "Decline sensitivity (drop vs normal rate)", 10, 95, 20, step=5, format="%d%%",
+                help="Flag a still-stocked store whose recent daily rate fell at least this much "
+                     "below its trailing run-rate. Lower = more sensitive (flags more stores).")
+        with c3:
+            dark_floor = st.slider(
+                "'Went dark' sensitivity (lost units)", 1, 15, 4,
+                help="A stocked store that stopped selling is flagged once its expected lost units "
+                     "(normal daily rate × silent days) reach this. Lower = reacts faster, "
+                     "especially for high-velocity stores.")
 
         # ── Benchmarks for the impact estimate ───────────────────────────────
-        sellers = s[s["units_7d"] > 0]
-        peer_med_week = float(sellers["units_7d"].median()) if len(sellers) else 0.0
-        peer_med_day = peer_med_week / 7.0
+        sellers = s[s["recent_daily"] > 0]
+        peer_med_day = float(sellers["recent_daily"].median()) if len(sellers) else 0.0
         _units_all = float(dfa["pos_quantity_this_year"].sum())
         _sales_all = float(dfa["pos_sales_this_year"].sum())
         blended_aur = (_sales_all / _units_all) if _units_all else 0.0
+        # Expected daily velocity: the store's own run-rate if it has one, else the
+        # peer median — never invents demand beyond what's demonstrated.
+        s["expected_daily"] = np.where(s["baseline_units"] > 0, s["baseline_daily"], peer_med_day)
 
-        # Each store's expected daily velocity: its own recent rate if it has one,
-        # otherwise the peer median — never invents demand beyond what's demonstrated.
-        own_day = s["units_prior7"] / 7.0
-        s["expected_day"] = np.where(own_day > 0, own_day, peer_med_day)
+        BASE_FLOOR = 5   # min baseline units over the trailing window to count as an established seller
 
         # ── Classification ────────────────────────────────────────────────────
         # Severity: 3 = High, 2 = Medium, 1 = Low. A store may trip several rules;
-        # we keep the max severity and list every reason for the rep.
+        # we keep the max severity, list every reason, and take the worst impact.
         def _classify(r):
-            issues, sev = [], 0
+            issues, sev, lost = [], 0, 0.0
             has_stock = r["on_hand"] >= min_oh
-            no_sales = r["units_7d"] == 0
-            if has_stock and no_sales:
-                issues.append("On-hand stock but ZERO sales for 7 days — product likely not on the floor (backroom/phantom inventory or display down)")
+            established = r["baseline_units"] >= BASE_FLOOR
+            recent_zero = r["recent_units"] == 0
+            # A. Went dark — established seller, stocked, that has stopped selling.
+            #    Keyed off the trailing zero-sale streak with a velocity-scaled gate:
+            #    a brisk seller (where even one zero day is statistically rare) flags
+            #    after ~1 silent day, a slow seller only after a longer gap.
+            dark_fired = False
+            if (has_stock and r["baseline_units"] > 0 and r["dark_streak"] >= 1
+                    and r["baseline_daily"] * r["dark_streak"] >= dark_floor):
+                issues.append(
+                    f"Was selling ~{r['baseline_daily']:.1f}/day but 0 sales for the last "
+                    f"{int(r['dark_streak'])} day(s) with stock on hand — likely off the floor")
                 sev = max(sev, 3)
-            if no_sales and r["in_warehouse"] > 0:
-                issues.append(f"{r['in_warehouse']:.0f} units sitting in the store's back room with no sales")
+                lost = max(lost, r["baseline_daily"] * 7)
+                dark_fired = True
+            # B. Idle backroom stock — units in the back, nothing selling.
+            if recent_zero and r["in_warehouse"] > 0:
+                issues.append(f"{r['in_warehouse']:.0f} units sitting in the store's back room with no recent sales")
                 sev = max(sev, 3)
-            if (r["units_prior7"] >= 3 and has_stock
-                    and r["units_7d"] <= (1 - collapse_drop / 100.0) * r["units_prior7"]):
-                drop_pct = (1 - r["units_7d"] / r["units_prior7"]) * 100
-                issues.append(f"Sales down {drop_pct:.0f}% vs prior week ({r['units_prior7']:.0f}→{r['units_7d']:.0f} units) despite on-hand stock")
-                # Severity scales with the size of the drop, so a moderate dip
-                # doesn't sit in the same bucket as a near-total collapse.
+                lost = max(lost, r["expected_daily"] * 7)
+            # C. Declining vs its own normal run-rate (still selling, but down). Skipped
+            #    when "went dark" already fired, so the two don't contradict each other.
+            if (established and has_stock and not dark_fired and not recent_zero
+                    and r["recent_daily"] <= (1 - decline_drop / 100.0) * r["baseline_daily"]):
+                drop_pct = (1 - r["recent_daily"] / r["baseline_daily"]) * 100
+                issues.append(
+                    f"Selling {drop_pct:.0f}% below its normal rate "
+                    f"({r['baseline_daily']:.1f}→{r['recent_daily']:.1f} units/day) despite stock")
                 sev = max(sev, 3 if drop_pct >= 70 else 2 if drop_pct >= 40 else 1)
-            if r["oos_days"] >= 5 and (r["in_warehouse"] > 0 or r["in_transit"] > 0 or r["units_7d_ly"] >= 3):
-                issues.append(f"Out of stock {r['oos_days']:.0f} of 7 days with replenishment available (in back room / in transit)")
+                lost = max(lost, (r["baseline_daily"] - r["recent_daily"]) * 7)
+            # D. Stuck stock — holding stock but no movement anywhere in the lookback.
+            if has_stock and recent_zero and r["baseline_units"] == 0:
+                issues.append("Holding on-hand stock but no sales in the lookback — stock may be stranded / never set on the floor")
                 sev = max(sev, 2)
-            if (r["units_7d"] > 0 and peer_med_week > 0 and has_stock
-                    and r["units_prior7"] >= 3 and r["units_7d"] < 0.25 * peer_med_week):
-                issues.append("Selling far below comparable stores (under 25% of the peer median)")
+                lost = max(lost, peer_med_day * 7)
+            # E. Chronic OOS with supply available upstream.
+            if r["oos_days"] >= 5 and (r["in_warehouse"] > 0 or r["in_transit"] > 0 or r["units_7d_ly"] >= 3):
+                issues.append(f"Out of stock {int(r['oos_days'])} of 7 days with replenishment available (in back room / in transit)")
+                sev = max(sev, 2)
+                lost = max(lost, r["expected_daily"] * r["oos_days"])
+            # F. Underperforming vs comparable stores.
+            if (not recent_zero and peer_med_day > 0 and has_stock and established
+                    and r["recent_daily"] < 0.25 * peer_med_day):
+                issues.append("Selling far below comparable stores (under 25% of the peer daily rate)")
                 sev = max(sev, 1)
-            return pd.Series({"severity": sev, "issues": "  •  ".join(issues)})
+                lost = max(lost, (peer_med_day - r["recent_daily"]) * 7)
+            return pd.Series({"severity": sev, "issues": "  •  ".join(issues), "lost_units": round(lost)})
 
-        s[["severity", "issues"]] = s.apply(_classify, axis=1)
-
-        # ── Impact estimate (drives the ranking) ──────────────────────────────
-        def _lost_units(r):
-            if r["severity"] == 0:
-                return 0.0
-            if r["units_7d"] == 0:                       # full week of lost selling
-                return r["expected_day"] * 7
-            if r["oos_days"] >= 5:                        # lost only on the OOS days
-                return r["expected_day"] * r["oos_days"]
-            return max(r["expected_day"] * 7 - r["units_7d"], 0.0)  # shortfall vs expected
-
-        s["lost_units"] = s.apply(_lost_units, axis=1).round(0)
+        s[["severity", "issues", "lost_units"]] = s.apply(_classify, axis=1)
+        s["lost_units"] = pd.to_numeric(s["lost_units"], errors="coerce").fillna(0)
         s["lost_sales"] = (s["lost_units"] * blended_aur).round(0)
 
         flagged = s[s["severity"] > 0].copy()
@@ -2384,12 +2417,11 @@ with tab_actions:
         flagged["priority"] = flagged["severity"].map(sev_label)
 
         # ── Priority filter ───────────────────────────────────────────────────
-        with c3:
-            levels = st.multiselect(
-                "Priority levels to include",
-                options=["🔴 High", "🟠 Medium", "🟡 Low"],
-                default=["🔴 High", "🟠 Medium", "🟡 Low"],
-                help="Trim the list to the urgency you want to dispatch.")
+        levels = st.multiselect(
+            "Priority levels to include",
+            options=["🔴 High", "🟠 Medium", "🟡 Low"],
+            default=["🔴 High", "🟠 Medium", "🟡 Low"],
+            help="Trim the list to the urgency you want to dispatch.")
         if levels:
             flagged = flagged[flagged["priority"].isin(levels)]
         flagged = flagged.sort_values(["severity", "lost_units"], ascending=[False, False]).reset_index(drop=True)
@@ -2397,34 +2429,36 @@ with tab_actions:
         # ── KPI strip ─────────────────────────────────────────────────────────
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Stores flagged", f"{len(flagged):,}",
-                  help="Stores with at least one rep-fixable problem in the last 7 days.")
+                  help="Stores with at least one rep-fixable problem right now.")
         k2.metric("High priority", f"{int((flagged['severity'] == 3).sum()):,}", delta_color="inverse")
-        k3.metric("Est. lost units (7d)", f"{flagged['lost_units'].sum():,.0f}",
-                  help="Sum of each flagged store's estimated shortfall vs its expected velocity.")
-        k4.metric("Est. lost sales (7d)", f"${flagged['lost_sales'].sum():,.0f}",
-                  help="Estimated lost units priced at the blended average unit retail.")
+        k3.metric("Est. lost units (/wk)", f"{flagged['lost_units'].sum():,.0f}",
+                  help="Sum of each flagged store's estimated weekly shortfall vs its expected velocity.")
+        k4.metric("Est. lost sales (/wk)", f"${flagged['lost_sales'].sum():,.0f}",
+                  help="Estimated weekly lost units priced at the blended average unit retail.")
 
         with st.expander("How stores are flagged (methodology)"):
             st.markdown(
                 f"""
-Every store is scored over the **last 7 days** ({win_start.strftime('%b %d')}–{mr.strftime('%b %d')}),
-focusing only on problems a **rep can physically fix in the store**:
+Each store compares its **recent 3-day** selling rate against its own **trailing {baseline_days}-day
+run-rate** (a stable baseline that won't whipsaw on low daily volume), plus a fast "went dark" check.
+Only problems a **rep can physically fix in the store** are flagged:
 
 | Flag | Trigger | Priority |
 |---|---|---|
-| **Not on floor / phantom stock** | On-hand ≥ {min_oh} units but **zero** sales all 7 days | 🔴 High |
-| **Idle backroom stock** | Zero sales while units sit in the store's back room | 🔴 High |
-| **Sales collapse** | Sales fell ≥ {collapse_drop}% vs the prior week despite on-hand stock | 🔴 ≥70% · 🟠 ≥40% · 🟡 ≥{collapse_drop}% |
+| **Went dark (stocked)** | Established seller with stock on hand but 0 recent sales; fires once expected lost units (normal rate × silent days) reach **{dark_floor}** — so a brisk seller flags after ~1 day, a slow seller only after a longer gap | 🔴 High |
+| **Idle backroom stock** | No recent sales while units sit in the store's back room | 🔴 High |
+| **Declining vs normal** | Recent daily rate ≥ {decline_drop}% below the store's run-rate, with stock | 🔴 ≥70% · 🟠 ≥40% · 🟡 ≥{decline_drop}% |
+| **Stuck stock** | Holding on-hand stock but no sales anywhere in the lookback | 🟠 Medium |
 | **Chronic OOS w/ supply** | Out of stock ≥ 5 of 7 days while replenishment is available | 🟠 Medium |
-| **Underperforming vs peers** | A normal seller now under 25% of the peer-median weekly units | 🟡 Low |
+| **Underperforming vs peers** | Established, stocked store selling under 25% of the peer daily rate | 🟡 Low |
 
-**Ranking** — stores are sorted by estimated **lost units**: each store's own recent
-daily velocity (or, if it has none, the peer median of {peer_med_day:.1f} units/day) multiplied by the
-affected days. A store out of stock or dark all week is credited a full 7 days; a chronic-OOS
-store only its OOS days. Lost sales price that at the blended unit retail of ${blended_aur:.2f}.
+**Ranking** — stores sort by estimated **lost units per week**: the gap between the store's expected
+rate (its run-rate, or the peer median of {peer_med_day:.1f}/day if it has no history) and its recent rate,
+scaled to a week. Lost sales price that at the blended unit retail of ${blended_aur:.2f}.
 
-The on-hand threshold and collapse cutoff are adjustable above. Stores that simply don't
-carry the item (no on-hand, no prior sales, no upstream supply) are **not** flagged.
+The thresholds above are adjustable. Stores that simply don't carry the item (no stock, no history,
+no upstream supply) are **not** flagged. The short recent window reacts within 1–3 days; the long
+baseline keeps low-volume daily noise from triggering false dispatches.
 """
             )
 
@@ -2469,13 +2503,14 @@ carry the item (no on-hand, no prior sales, no upstream supply) are **not** flag
                 "Zip": out.get("zip"),
                 "Priority": out["priority"],
                 "Issue(s)": out["issues"],
-                "Units (7d)": out["units_7d"].astype(int),
-                "Units prior 7d": out["units_prior7"].astype(int),
+                "Recent units/day": out["recent_daily"].round(2),
+                "Normal units/day": out["baseline_daily"].round(2),
+                "Days silent": out["dark_streak"].astype(int),
                 "On hand": out["on_hand"].astype(int),
                 "In back room": out["in_warehouse"].astype(int),
                 "OOS days (of 7)": out["oos_days"].astype(int),
-                "Est. lost units": out["lost_units"].astype(int),
-                "Est. lost $": out["lost_sales"].astype(int),
+                "Est. lost units/wk": out["lost_units"].astype(int),
+                "Est. lost $/wk": out["lost_sales"].astype(int),
             })
 
             addr_only = st.checkbox(
@@ -2502,7 +2537,9 @@ carry the item (no on-hand, no prior sales, no upstream supply) are **not** flag
                 export, width='stretch', hide_index=True, height=460,
                 column_config={
                     "Issue(s)": st.column_config.TextColumn(width="large"),
-                    "Est. lost $": st.column_config.NumberColumn(format="$%d"),
+                    "Recent units/day": st.column_config.NumberColumn(format="%.2f"),
+                    "Normal units/day": st.column_config.NumberColumn(format="%.2f"),
+                    "Est. lost $/wk": st.column_config.NumberColumn(format="$%d"),
                 })
             st.caption(
                 "Sorted by priority, then estimated lost units. Hand the CSV to the field-service "
