@@ -2,13 +2,16 @@
 streamlit_app.py — FunPop Sales Dashboard
 
 Tab structure:
-  Overview          — KPIs, last 10 days, item performance, stockout risk
-  Sales & Velocity  — Weekly sales, U/S/W
+  Overview          — KPIs, last 10 days, item performance, stockout risk (incl.
+                      estimated lost sales $ and in-stock % service level)
+  Sales & Velocity  — Weekly sales, AUR/price trend, YoY units bridge (distribution
+                      vs velocity), U/S/W, velocity-tier heatmap, store leaderboard
   Forecast          — Upcoming demand forecast vs sales, attainment & bias, store
                       replenishment watchlist, and DC demand coverage
   Inventory & DC    — Weekly inventory, phantom inventory, DC pipeline (true alignment)
-  Channels          — Omni sales, eComm inventory, store returns
-  Distribution      — Modular coverage, state performance
+  Channels          — Omni sales (+ channel-mix over time), eComm inventory, store
+                      returns (+ returns by reason)
+  Distribution      — Modular coverage, state performance (choropleth + ranked bar)
 
 Data sources (BigQuery, dv_supplier dataset):
   store_sales + store_invt + store_dim + item_dim ─→ load_store_data
@@ -437,6 +440,59 @@ def _wm_week_label(weeks: pd.Series, is_partial=None):
     return np.where(np.asarray(is_partial), base + " *", base)
 
 
+# US state/territory → Census FIPS id, used to join state POS aggregates onto the
+# us-10m TopoJSON for the choropleth on the Distribution tab. The TopoJSON keys
+# features by these numeric ids; the feed gives us 2-letter codes, so we bridge.
+STATE_FIPS = {
+    "AL": 1, "AK": 2, "AZ": 4, "AR": 5, "CA": 6, "CO": 8, "CT": 9, "DE": 10,
+    "DC": 11, "FL": 12, "GA": 13, "HI": 15, "ID": 16, "IL": 17, "IN": 18,
+    "IA": 19, "KS": 20, "KY": 21, "LA": 22, "ME": 23, "MD": 24, "MA": 25,
+    "MI": 26, "MN": 27, "MS": 28, "MO": 29, "MT": 30, "NE": 31, "NV": 32,
+    "NH": 33, "NJ": 34, "NM": 35, "NY": 36, "NC": 37, "ND": 38, "OH": 39,
+    "OK": 40, "OR": 41, "PA": 42, "RI": 44, "SC": 45, "SD": 46, "TN": 47,
+    "TX": 48, "UT": 49, "VT": 50, "VA": 51, "WA": 53, "WV": 54, "WI": 55,
+    "WY": 56, "PR": 72,
+}
+# Client-side fetch (Vega renders in the browser, so the server never reaches out).
+US_STATES_TOPO_URL = "https://vega.github.io/vega-datasets/data/us-10m.json"
+
+
+def _waterfall_chart(steps: list, value_fmt: str = ",.0f", height: int = 300):
+    """Build a left-to-right waterfall from a list of {label, amount, kind} dicts.
+    kind='total' draws a full-height bar from zero (anchors); kind='delta' floats
+    from the running total. Used for the YoY units bridge (LY → distribution →
+    velocity → TY)."""
+    running = 0.0
+    rows = []
+    for s in steps:
+        if s["kind"] == "total":
+            start, end, running = 0.0, s["amount"], s["amount"]
+            band = "Total"
+        else:
+            start = running
+            running += s["amount"]
+            end = running
+            band = "Up" if s["amount"] >= 0 else "Down"
+        rows.append({**s, "start": start, "end": end, "band": band,
+                     "label_amt": ("" if s["kind"] == "total" else f"{s['amount']:+{value_fmt}}")})
+    wf = pd.DataFrame(rows)
+    order = list(wf["label"])
+    base = alt.Chart(wf).encode(
+        x=alt.X("label:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)))
+    bars = base.mark_bar(size=46).encode(
+        y=alt.Y("start:Q", title="Units"),
+        y2="end:Q",
+        color=alt.Color("band:N", scale=alt.Scale(
+            domain=["Total", "Up", "Down"], range=["#185FA5", "#27500A", "#791F1F"]),
+            legend=None),
+        tooltip=[alt.Tooltip("label:N", title=""),
+                 alt.Tooltip("amount:Q", format=value_fmt, title="Effect"),
+                 alt.Tooltip("end:Q", format=value_fmt, title="Cumulative")])
+    labels = base.mark_text(dy=-6, color="#333", fontWeight="bold").encode(
+        y=alt.Y("end:Q"), text=alt.Text("label_amt:N"))
+    return (bars + labels).properties(height=height)
+
+
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
@@ -747,6 +803,25 @@ with tab_overview:
         total_stores=("store_number", "nunique"),
     ).sort_values("business_date").reset_index(drop=True)
     oos_daily["oos_pct"] = (oos_daily["oos_stores"] / oos_daily["total_stores"] * 100).round(1)
+    oos_daily["in_stock_pct"] = (100 - oos_daily["oos_pct"]).round(1)
+
+    # ── Estimated lost sales from stockouts (last 7 days) ────────────────────
+    # For every OOS store-day in the last 7 days, credit the store's OWN recent
+    # average daily velocity (only stores that have demonstrated they sell, so we
+    # never invent demand for a store that wouldn't have moved product anyway),
+    # priced at the blended average unit retail. Conservative by construction: a
+    # store OOS the entire window has no selling days and contributes nothing.
+    recent_cut7 = most_recent - timedelta(days=6)
+    store_vel = (df[df["pos_quantity_this_year"] > 0]
+                 .groupby("store_number")["pos_quantity_this_year"].mean())
+    _units_all = float(df["pos_quantity_this_year"].sum())
+    _sales_all = float(df["pos_sales_this_year"].sum())
+    blended_aur = (_sales_all / _units_all) if _units_all else 0.0
+    oos_recent = store_day_oh[(store_day_oh["is_oos"] == 1)
+                              & (store_day_oh["business_date"] >= recent_cut7)].copy()
+    oos_recent["exp_units"] = oos_recent["store_number"].map(store_vel).fillna(0.0)
+    lost_units_7d = float(oos_recent["exp_units"].sum())
+    lost_sales_7d = lost_units_7d * blended_aur
 
     sr_l, sr_r = st.columns([2, 3])
     with sr_l:
@@ -758,9 +833,15 @@ with tab_overview:
             prior = oos_daily[oos_daily["business_date"] <= week_ago_target]
             week_ago = prior.iloc[-1] if not prior.empty else oos_daily.iloc[0]
             oos_delta = int(latest_oos["oos_stores"] - week_ago["oos_stores"])
+            st.metric("Est. lost sales (last 7 days)", f"${lost_sales_7d:,.0f}",
+                      delta=f"≈ {lost_units_7d:,.0f} units", delta_color="off",
+                      help="Sum over OOS store-days of each store's own recent avg "
+                           "daily velocity, priced at the blended unit retail. "
+                           "Conservative — never credits demand a store hasn't shown.")
             st.metric("Stores OOS today", f"{int(latest_oos['oos_stores']):,}",
                       delta=f"{oos_delta:+,} vs week ago", delta_color="inverse")
-            st.metric("OOS rate today", f"{latest_oos['oos_pct']:.1f}%")
+            st.metric("In-stock % today", f"{latest_oos['in_stock_pct']:.1f}%",
+                      help="Share of stores carrying on-hand > 0. Retail service-level standard.")
         # Chronic = OOS on 7+ distinct days in the window (reuses store_day_oh).
         chronic = int((store_day_oh[store_day_oh["is_oos"] == 1]
                        .groupby("store_number").size() >= 7).sum())
@@ -777,6 +858,23 @@ with tab_overview:
                 .encode(x="business_date:T", y="oos_stores:Q")
             )
             st.altair_chart(chart, width='stretch')
+
+    # In-stock % service-level trend with a 95% target band. Speaks the retail
+    # KPI language directly (vs the raw OOS count above).
+    if not oos_daily.empty:
+        target = 95.0
+        y_min = float(min(oos_daily["in_stock_pct"].min(), target)) - 1
+        svc_line = alt.Chart(oos_daily).mark_line(color="#185FA5", strokeWidth=2.5, point=True).encode(
+            x=alt.X("business_date:T", title="Date"),
+            y=alt.Y("in_stock_pct:Q", title="In-stock %",
+                    scale=alt.Scale(domain=[max(0, y_min), 100])),
+            tooltip=[alt.Tooltip("business_date:T", title="Date"),
+                     alt.Tooltip("in_stock_pct:Q", format=".1f", title="In-stock %")])
+        svc_rule = alt.Chart(pd.DataFrame({"y": [target]})).mark_rule(
+            color="#27500A", strokeDash=[5, 4]).encode(y="y:Q")
+        svc_txt = alt.Chart(pd.DataFrame({"y": [target], "t": [f"{target:.0f}% target"]})).mark_text(
+            align="left", dx=4, dy=-6, color="#27500A").encode(y="y:Q", text="t:N")
+        st.altair_chart((svc_line + svc_rule + svc_txt).properties(height=220), width='stretch')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -839,6 +937,80 @@ with tab_sales:
                          "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
                          "YoY %": st.column_config.NumberColumn(format="%.1f%%"),
                      })
+
+    # ── Average unit retail (AUR / price realization) ────────────────────────
+    st.divider()
+    st.subheader("Average unit retail (AUR)")
+    st.caption(
+        "Sales ÷ units, by week. Falling AUR with steady units means price erosion or "
+        "unplanned markdowns eating margin — a units-only view hides it."
+    )
+    if not weekly_sales.empty:
+        aur = weekly_sales.copy()
+        aur["aur_ty"] = np.where(aur["units_ty_raw"] > 0, aur["sales_ty_raw"] / aur["units_ty_raw"], np.nan)
+        aur["aur_ly"] = np.where(aur["units_ly_raw"] > 0, aur["sales_ly_raw"] / aur["units_ly_raw"], np.nan)
+        am = aur.melt(id_vars=["week_label", "walmart_calendar_week"],
+                      value_vars=["aur_ty", "aur_ly"], var_name="Period", value_name="AUR")
+        am["Period"] = am["Period"].map({"aur_ty": "This Year", "aur_ly": "Last Year"})
+        am = am.dropna(subset=["AUR"])
+        aur_l, aur_r = st.columns([3, 2])
+        with aur_l:
+            st.altair_chart((alt.Chart(am).mark_line(point=True, strokeWidth=2.5).encode(
+                x=alt.X("week_label:N", sort=list(aur["week_label"]), title="Week",
+                        axis=alt.Axis(labelAngle=-30)),
+                y=alt.Y("AUR:Q", title="Avg unit retail ($)", scale=alt.Scale(zero=False)),
+                color=alt.Color("Period:N", scale=alt.Scale(domain=["This Year", "Last Year"],
+                                range=["#185FA5", "#A0A09A"])),
+                tooltip=["week_label", "Period", alt.Tooltip("AUR:Q", format="$.2f")],
+            ).properties(height=280)), width='stretch')
+        with aur_r:
+            cur_aur = aur["aur_ty"].dropna()
+            cur, prev = (cur_aur.iloc[-1] if len(cur_aur) else np.nan,
+                         cur_aur.iloc[0] if len(cur_aur) else np.nan)
+            blended_now = (aur["sales_ty_raw"].sum() / aur["units_ty_raw"].sum()
+                           if aur["units_ty_raw"].sum() else 0)
+            blended_ly = (aur["sales_ly_raw"].sum() / aur["units_ly_raw"].sum()
+                          if aur["units_ly_raw"].sum() else 0)
+            st.metric("Blended AUR (period)", f"${blended_now:,.2f}",
+                      delta=f"{((blended_now - blended_ly) / blended_ly * 100) if blended_ly else 0:+.1f}% vs LY")
+            if np.isfinite(cur) and np.isfinite(prev) and prev:
+                st.metric("Latest week AUR", f"${cur:,.2f}",
+                          delta=f"{(cur - prev) / prev * 100:+.1f}% vs first week shown")
+
+    # ── YoY units bridge (distribution vs velocity) ──────────────────────────
+    st.divider()
+    st.subheader("What moved units YoY")
+    st.caption(
+        "Decomposes the year-over-year unit change into the **distribution effect** "
+        "(change in the number of stores selling × last year's per-store rate) and the "
+        "**velocity effect** (change in units per selling store × this year's store count). "
+        "Tells you whether to chase shelf placement or sell-through."
+    )
+    _u_ty = float(df["pos_quantity_this_year"].sum())
+    _u_ly = float(df["pos_quantity_last_year"].sum())
+    _s_ty = int(df[df["pos_quantity_this_year"] > 0]["store_number"].nunique())
+    _s_ly = int(df[df["pos_quantity_last_year"] > 0]["store_number"].nunique())
+    _r_ty = (_u_ty / _s_ty) if _s_ty else 0.0
+    _r_ly = (_u_ly / _s_ly) if _s_ly else 0.0
+    dist_effect = (_s_ty - _s_ly) * _r_ly
+    velo_effect = (_r_ty - _r_ly) * _s_ty
+    bridge_steps = [
+        {"label": "LY units", "amount": _u_ly, "kind": "total"},
+        {"label": "Distribution", "amount": dist_effect, "kind": "delta"},
+        {"label": "Velocity", "amount": velo_effect, "kind": "delta"},
+        {"label": "TY units", "amount": _u_ty, "kind": "total"},
+    ]
+    br_l, br_r = st.columns([3, 2])
+    with br_l:
+        st.altair_chart(_waterfall_chart(bridge_steps, height=300), width='stretch')
+    with br_r:
+        st.metric("Selling stores", f"{_s_ty:,}", delta=f"{_s_ty - _s_ly:+,} vs LY")
+        st.metric("Units / selling store", f"{_r_ty:,.1f}",
+                  delta=f"{((_r_ty - _r_ly) / _r_ly * 100) if _r_ly else 0:+.1f}% vs LY")
+        _driver = ("distribution (fewer/more stores carrying)"
+                   if abs(dist_effect) >= abs(velo_effect) else
+                   "velocity (per-store sell-through)")
+        st.caption(f"Net YoY change of **{_u_ty - _u_ly:+,.0f} units** is driven mainly by **{_driver}**.")
 
     # ── Velocity U/S/W ───────────────────────────────────────────────────────
     st.subheader("Velocity — Units per Store per Week (U/S/W)")
@@ -962,6 +1134,90 @@ with tab_sales:
         xOffset="Period:N",
         tooltip=["bucket", "Period", alt.Tooltip("stores:Q", format=",")],
     ).properties(height=300)), width='stretch')
+
+    # ── Velocity tier migration heatmap (week × tier) ────────────────────────
+    st.markdown("**How the store base moves between velocity tiers, week by week**")
+    st.caption(
+        "Each cell = number of stores in that U/S/W tier that week. Watch stores drift "
+        "down toward the '0 (none)' row (losing momentum) or climb into 5-10 / 10-20 / 20+."
+    )
+    _days_map = weekly_sales.set_index("walmart_calendar_week")["days_in_week"]
+    sw = df.groupby(["walmart_calendar_week", "store_number"], as_index=False)[
+        "pos_quantity_this_year"].sum()
+    sw["days"] = sw["walmart_calendar_week"].map(_days_map).fillna(7).clip(lower=1)
+    sw["uspw"] = sw["pos_quantity_this_year"] * (7 / sw["days"])
+    sw["tier"] = sw["uspw"].apply(_bucket)
+    heat = sw.groupby(["walmart_calendar_week", "tier"], as_index=False).size().rename(
+        columns={"size": "stores"})
+    heat["week_label"] = _wm_week_label(heat["walmart_calendar_week"])
+    if not heat.empty:
+        week_order = (heat[["walmart_calendar_week", "week_label"]].drop_duplicates()
+                      .sort_values("walmart_calendar_week")["week_label"].tolist())
+        st.altair_chart((alt.Chart(heat).mark_rect().encode(
+            x=alt.X("week_label:N", sort=week_order, title="Week", axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("tier:N", sort=list(reversed(ORDER)), title="U/S/W tier"),
+            color=alt.Color("stores:Q", scale=alt.Scale(scheme="blues"),
+                            legend=alt.Legend(title="Stores")),
+            tooltip=["week_label", "tier", alt.Tooltip("stores:Q", format=",")],
+        ).properties(height=300)), width='stretch')
+
+    # ── Store leaderboard ────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Store leaderboard")
+    st.caption(
+        "Per-store performance over the lookback window. Sort any column; download the full "
+        "list for offline review. Decliner/mover callouts limited to stores that sold last year."
+    )
+    store_rank = df.groupby(["store_number", "state_or_province_code"],
+                            as_index=False, observed=True).agg(
+        units_ty=("pos_quantity_this_year", "sum"),
+        units_ly=("pos_quantity_last_year", "sum"),
+        sales_ty=("pos_sales_this_year", "sum"),
+    )
+    _lm = df.groupby("store_number")["business_date"].transform("max") == df["business_date"]
+    _oh = df[_lm].groupby("store_number", as_index=False)[
+        "store_on_hand_quantity_this_year"].sum().rename(
+            columns={"store_on_hand_quantity_this_year": "on_hand"})
+    store_rank = store_rank.merge(_oh, on="store_number", how="left")
+    store_rank["on_hand"] = store_rank["on_hand"].fillna(0)
+    store_rank["yoy_units"] = store_rank["units_ty"] - store_rank["units_ly"]
+    store_rank["yoy_pct"] = _yoy_pct(store_rank["units_ty"], store_rank["units_ly"])
+    store_rank["wos"] = np.where(store_rank["units_ty"] > 0,
+        (store_rank["on_hand"] / (store_rank["units_ty"] / weeks_in_period)).round(1), np.nan)
+
+    lb_l, lb_r = st.columns(2)
+    _sold_ly = store_rank[store_rank["units_ly"] > 0]
+    with lb_l:
+        st.markdown("**Biggest YoY decliners** (sold last year)")
+        decl = _sold_ly.sort_values("yoy_units").head(10)[
+            ["store_number", "state_or_province_code", "units_ty", "units_ly", "yoy_units", "yoy_pct"]].copy()
+        decl.columns = ["Store", "State", "Units TY", "Units LY", "YoY Units", "YoY %"]
+        st.dataframe(decl, width='stretch', hide_index=True, column_config={
+            "YoY %": st.column_config.NumberColumn(format="%.1f%%")})
+    with lb_r:
+        st.markdown("**Biggest YoY gainers**")
+        gain = store_rank.sort_values("yoy_units", ascending=False).head(10)[
+            ["store_number", "state_or_province_code", "units_ty", "units_ly", "yoy_units", "yoy_pct"]].copy()
+        gain.columns = ["Store", "State", "Units TY", "Units LY", "YoY Units", "YoY %"]
+        st.dataframe(gain, width='stretch', hide_index=True, column_config={
+            "YoY %": st.column_config.NumberColumn(format="%.1f%%")})
+
+    full_tbl = store_rank.sort_values("units_ty", ascending=False)[
+        ["store_number", "state_or_province_code", "units_ty", "units_ly",
+         "yoy_units", "yoy_pct", "sales_ty", "on_hand", "wos"]].copy()
+    full_tbl.columns = ["Store", "State", "Units TY", "Units LY", "YoY Units",
+                        "YoY %", "Sales TY ($)", "On hand", "WOS"]
+    st.dataframe(full_tbl, width='stretch', hide_index=True, height=380, column_config={
+        "YoY %": st.column_config.NumberColumn(format="%.1f%%"),
+        "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
+        "WOS": st.column_config.NumberColumn(format="%.1f wks"),
+    })
+    st.download_button(
+        "⬇ Download full store list (CSV)",
+        data=full_tbl.to_csv(index=False).encode("utf-8"),
+        file_name=f"store_leaderboard_{most_recent.strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1511,6 +1767,31 @@ with tab_channels:
                          alt.Tooltip("yoy_pct:Q", format=".1f")],
             ).properties(height=280)), width='stretch')
 
+        # ── Channel mix over time ────────────────────────────────────────────
+        st.markdown("**Channel mix over time**")
+        st.caption(
+            "Weekly units by service channel. A shrinking in-store slice with a growing "
+            "pickup/delivery slice is channel migration, not lost demand — read it before "
+            "calling a unit decline a problem."
+        )
+        chan_tl = omni_filt.copy()
+        chan_tl["week_start"] = _walmart_week_start(chan_tl["business_date"])
+        chan_wk = chan_tl.groupby(["week_start", "service_channel"], as_index=False)["units_ty"].sum()
+        if not chan_wk.empty:
+            mix_mode = st.radio("Show as", ["Units", "% mix"], index=0, horizontal=True,
+                                key="chan_mix_mode")
+            y_enc = (alt.Y("units_ty:Q", stack="normalize", title="Share of units",
+                           axis=alt.Axis(format="%"))
+                     if mix_mode == "% mix"
+                     else alt.Y("units_ty:Q", stack="zero", title="Units"))
+            st.altair_chart((alt.Chart(chan_wk).mark_area().encode(
+                x=alt.X("week_start:T", title="Week"),
+                y=y_enc,
+                color=alt.Color("service_channel:N", legend=alt.Legend(title="Channel")),
+                tooltip=[alt.Tooltip("week_start:T", title="Week"), "service_channel:N",
+                         alt.Tooltip("units_ty:Q", format=",", title="Units")],
+            ).properties(height=300)), width='stretch')
+
     # ── eComm Inventory ──────────────────────────────────────────────────────
     st.divider()
     st.subheader("eComm inventory (ship nodes)")
@@ -1604,6 +1885,29 @@ with tab_channels:
                     tooltip=["week_label", "Period", alt.Tooltip("Returns:Q", format=",")],
                 ).properties(height=280)), width='stretch')
 
+            # ── Returns by reason ────────────────────────────────────────────
+            st.markdown("**Why product comes back (return reason)**")
+            st.caption(
+                "Breaks returns down by Walmart's return-reason code. A spike concentrated in "
+                "one reason (damage, quality, wrong item) points at a fixable root cause rather "
+                "than general softness."
+            )
+            by_reason = ret_filt.groupby("return_reason", as_index=False).agg(
+                returns_ty=("returns_ty", "sum"),
+                return_sales_ty=("return_sales_ty", "sum"),
+            )
+            by_reason = by_reason[by_reason["returns_ty"] != 0].sort_values(
+                "returns_ty", ascending=False).head(12)
+            by_reason["return_reason"] = by_reason["return_reason"].fillna("(blank)").astype(str)
+            if not by_reason.empty:
+                st.altair_chart((alt.Chart(by_reason).mark_bar(color="#791F1F").encode(
+                    x=alt.X("returns_ty:Q", title="Returns (units)"),
+                    y=alt.Y("return_reason:N", sort="-x", title="Return reason code"),
+                    tooltip=[alt.Tooltip("return_reason:N", title="Reason"),
+                             alt.Tooltip("returns_ty:Q", format=",", title="Returns"),
+                             alt.Tooltip("return_sales_ty:Q", format="$,.0f", title="Return $")],
+                ).properties(height=max(160, 26 * len(by_reason)))), width='stretch')
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 6 — DISTRIBUTION
@@ -1661,16 +1965,50 @@ with tab_dist:
 
     # ── Performance by state ─────────────────────────────────────────────────
     st.divider()
-    st.subheader("Performance by state (top 20)")
+    st.subheader("Performance by state")
 
-    state_perf = df.groupby("state_or_province_code", as_index=False, observed=True).agg(
+    state_perf_all = df.groupby("state_or_province_code", as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
         sales_ty=("pos_sales_this_year", "sum"),
         stores=("store_number", "nunique"),
     )
-    state_perf["yoy_pct"] = _yoy_pct(state_perf["units_ty"], state_perf["units_ly"])
-    state_perf = state_perf.sort_values("units_ty", ascending=False).head(20)
+    state_perf_all["yoy_pct"] = _yoy_pct(state_perf_all["units_ty"], state_perf_all["units_ly"])
+    state_perf_all["state"] = state_perf_all["state_or_province_code"].astype(str)
+    state_perf_all["fips"] = state_perf_all["state"].map(STATE_FIPS)
+
+    # Geographic heat map (choropleth). The TopoJSON is fetched by the viewer's
+    # browser when Vega renders, so the server makes no outbound call; if a viewer
+    # can't reach the CDN the map simply doesn't draw — the ranked bar below always
+    # does, so no information is lost.
+    map_metric = st.radio("Map color", ["Units TY", "YoY %"], index=0, horizontal=True,
+                          key="state_map_metric")
+    geo = state_perf_all.dropna(subset=["fips"]).copy()
+    geo["fips"] = geo["fips"].astype(int)
+    if not geo.empty:
+        if map_metric == "YoY %":
+            color_enc = alt.Color("yoy_pct:Q", scale=alt.Scale(scheme="redyellowgreen", domainMid=0),
+                                  legend=alt.Legend(title="YoY %"))
+        else:
+            color_enc = alt.Color("units_ty:Q", scale=alt.Scale(scheme="blues"),
+                                  legend=alt.Legend(title="Units TY"))
+        states_topo = alt.topo_feature(US_STATES_TOPO_URL, "states")
+        choropleth = (alt.Chart(states_topo).mark_geoshape(stroke="white", strokeWidth=0.5).encode(
+            color=color_enc,
+            tooltip=[alt.Tooltip("state:N", title="State"),
+                     alt.Tooltip("units_ty:Q", format=",", title="Units TY"),
+                     alt.Tooltip("units_ly:Q", format=",", title="Units LY"),
+                     alt.Tooltip("yoy_pct:Q", format=".1f", title="YoY %"),
+                     alt.Tooltip("stores:Q", format=",", title="Stores")],
+        ).transform_lookup(
+            lookup="id",
+            from_=alt.LookupData(geo, "fips",
+                                 ["units_ty", "units_ly", "yoy_pct", "stores", "state"]),
+        ).project("albersUsa").properties(height=380))
+        st.altair_chart(choropleth, width='stretch')
+
+    st.markdown("**Top 20 states by units**")
+    state_perf = state_perf_all.sort_values("units_ty", ascending=False).head(20)
 
     st.altair_chart((alt.Chart(state_perf).mark_bar().encode(
         x=alt.X("units_ty:Q", title="Units TY"),
