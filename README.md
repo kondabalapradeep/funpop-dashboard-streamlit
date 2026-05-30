@@ -104,6 +104,7 @@ That's it — no BigQuery write access or GCP console changes are required. Afte
 - Store inventory snapshot (on-hand, in-warehouse, in-transit, weeks of supply)
 - Full store rankings table (sortable, filterable, with status)
 - DC analysis section (KPIs, critical/overstock callouts, full table) — appears only if DC query returns data
+- **Store Actions tab** — analyzes the last 7 days to flag stores with a *physically rep-fixable* problem (on-hand stock but zero sales / phantom inventory, idle backroom stock, sales collapse, chronic out-of-stock with supply available, or underperformance vs peers), ranks them by estimated lost units, and lets you **download a CSV dispatch list** (store number, address, city, state, zip + priority/issue) to hand to a field-service company. Addresses are pulled from `store_dim` via an introspecting loader, so it auto-adapts to the dataset's actual address/zip column names; if no address columns exist it degrades to store number + state.
 
 **Not yet included** (the original HTML dashboard had these — easy to add as additional Streamlit sections if you want them):
 - U/S/W weekly breakdown
