@@ -634,9 +634,9 @@ with tab_overview:
     weekly_velocity = units_ty / stores_selling / weeks_in_window if stores_selling else 0
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Units sold", f"{units_ty:,}", f"{units_yoy_pct:+.1f}% YoY")
+    k1.metric("Units sold", f"{units_ty:,}", f"{units_yoy:+,} ({units_yoy_pct:+.1f}%) YoY")
     k2.metric("Sales", f"${sales_ty:,.0f}", f"{sales_yoy_pct:+.1f}% YoY")
-    k3.metric("YoY units", f"{units_yoy:+,}")
+    k3.metric("Units LY", f"{units_ly:,}", help="Units sold in the same period last year")
     k4.metric("Stores w/ sales", f"{stores_selling:,}/{stores_total:,}",
               f"{(stores_selling/stores_total*100 if stores_total else 0):.0f}%")
     k5.metric("Avg units/store/wk", f"{weekly_velocity:.1f}")
@@ -680,9 +680,11 @@ with tab_overview:
         ).properties(height=300))
         st.altair_chart(chart, width='stretch')
     with c_r:
-        show = daily[["weekday", "date_str", "units_ty", "yoy_pct", "stores_selling"]].iloc[::-1].copy()
+        show = daily[["weekday", "date_str", "units_ty", "units_ly", "yoy_units",
+                      "yoy_pct", "stores_selling"]].iloc[::-1].copy()
         show["stores_selling"] = show["stores_selling"].astype(int)
-        show.columns = ["Day", "Date", "Units TY", "YoY %", "Stores Selling"]
+        show[["units_ly", "yoy_units"]] = show[["units_ly", "yoy_units"]].astype(int)
+        show.columns = ["Day", "Date", "Units TY", "Units LY", "YoY Units", "YoY %", "Stores Selling"]
         st.dataframe(show, width='stretch', hide_index=True, height=380,
                      column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
 
@@ -711,6 +713,7 @@ with tab_overview:
     item_perf["sales_yoy_pct"] = _yoy_pct(item_perf["sales_ty"], item_perf["sales_ly"])
     item_perf["on_hand"] = item_perf["item"].map(group_oh).fillna(0).astype(int)
     item_perf["yoy_pct"] = _yoy_pct(item_perf["units_ty"], item_perf["units_ly"])
+    item_perf["yoy_units"] = item_perf["units_ty"] - item_perf["units_ly"]
     full_units_per_group = df.groupby("item_group")["pos_quantity_this_year"].sum()
     item_perf["wos_units_ty"] = item_perf["item"].map(full_units_per_group).fillna(0)
     item_perf["wos"] = np.where(item_perf["wos_units_ty"] > 0,
@@ -723,7 +726,10 @@ with tab_overview:
                 st.markdown(f"### {row['item']}")
                 nums = sorted(group_items.get(row["item"], []))
                 st.caption(("Items " if len(nums) > 1 else "Item ") + ", ".join(str(n) for n in nums))
-                st.metric("Units sold", f"{int(row['units_ty']):,}", f"{row['yoy_pct']:+.1f}% YoY")
+                st.metric("Units sold", f"{int(row['units_ty']):,}",
+                          f"{int(row['yoy_units']):+,} ({row['yoy_pct']:+.1f}%) YoY")
+                st.metric("Units LY", f"{int(row['units_ly']):,}",
+                          help="Units sold in the same period last year")
                 st.metric("Sales", f"${row['sales_ty']:,.0f}", f"{row['sales_yoy_pct']:+.1f}% YoY")
                 st.metric("On hand (latest)", f"{int(row['on_hand']):,}")
                 wos_label = "∞" if not np.isfinite(row['wos']) else f"{row['wos']:.1f} wks"
@@ -919,8 +925,9 @@ with tab_sales:
         for col, (_, row) in zip(iu_cols, item_uspw.iterrows()):
             with col:
                 yoy_pct = row["uspw_yoy_pct"]
+                uspw_yoy = row["uspw_ty"] - row["uspw_ly"]
                 st.metric(f"{row['item']}", f"{row['uspw_ty']:.2f} U/S/W",
-                          delta=f"{yoy_pct:+.1f}% vs LY ({row['uspw_ly']:.2f})")
+                          delta=f"{uspw_yoy:+.2f} ({yoy_pct:+.1f}%) vs LY {row['uspw_ly']:.2f}")
 
     # ── Store velocity distribution ──────────────────────────────────────────
     st.markdown("**Store-level velocity distribution**")
