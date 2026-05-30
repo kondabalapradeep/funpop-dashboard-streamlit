@@ -148,6 +148,25 @@ def main() -> int:
         print("ERROR: every query failed; leaving the snapshot untouched", file=sys.stderr)
         return 1
 
+    # Static store address directory for the Store Actions export. Addresses are
+    # reference data, so we build it here (introspecting store_dim) and commit it
+    # under a fixed key; the app reads that parquet straight from disk instead of
+    # querying store_dim on every cold start. A failure here must not sink the
+    # rest of the snapshot.
+    try:
+        import store_directory
+        run_query = lambda sql: client.query(
+            sql, job_config=bigquery.QueryJobConfig()
+        ).to_dataframe(create_bqstorage_client=False)
+        dir_df = store_directory.build_directory_df(run_query, project, dataset)
+        if store_directory.DIRECTORY_FILENAME and not dir_df.empty:
+            updated = snapshot.write_if_changed(store_directory.DIRECTORY_FILENAME, dir_df)
+            changed = changed or updated
+            print(f"  store_directory: {len(dir_df):,} rows -> {store_directory.DIRECTORY_FILENAME} "
+                  f"({'updated' if updated else 'unchanged'})")
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARN: store directory build failed: {e}", file=sys.stderr)
+
     if changed:
         snapshot.write_manifest()
         print("Snapshot data changed; manifest timestamp updated.")
