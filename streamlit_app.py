@@ -1741,48 +1741,107 @@ with tab_inv:
     pr3.metric("In-stock % (today)", f"{100 - oos_pct:.1f}%",
                help="Share of stores with on-hand > 0 — retail service-level standard.")
 
-    # ── Weekly inventory trend ───────────────────────────────────────────────
+    # ── Inventory by location (latest snapshot) ──────────────────────────────
     st.divider()
-    st.subheader("Weekly inventory trend (network total)")
-
-    last_day_per_week_item = (
-        df.groupby(["walmart_calendar_week", "walmart_item_number"])["business_date"]
-        .max().reset_index().rename(columns={"business_date": "snapshot_date"})
+    st.subheader("Inventory by location (latest snapshot)")
+    st.caption(
+        "Actual unit counts at each stage of the pipeline on the most recent day of data. "
+        "Use the scope toggle to isolate shelf vs. bin items. This section ignores the "
+        "sidebar item filter so you can slice it independently."
     )
-    eow = df.merge(last_day_per_week_item,
-                   left_on=["walmart_calendar_week", "walmart_item_number", "business_date"],
-                   right_on=["walmart_calendar_week", "walmart_item_number", "snapshot_date"],
-                   how="inner")
-    weekly_inv = eow.groupby("walmart_calendar_week", as_index=False).agg(
-        on_hand_ty=("store_on_hand_quantity_this_year", "sum"),
-        on_hand_ly=("store_on_hand_quantity_last_year", "sum"),
-        in_warehouse=("store_in_warehouse_quantity_this_year", "sum"),
+
+    inv_scope = st.radio(
+        "Item scope",
+        options=["All", "Bins (full + half)", "Shelf"],
+        index=0,
+        horizontal=True,
+        key="inv_location_scope",
+    )
+    if inv_scope == "Bins (full + half)":
+        inv_items = list(BIN_ITEMS)
+    elif inv_scope == "Shelf":
+        inv_items = list(SHELF_ITEMS)
+    else:
+        inv_items = list(ACTIVE_ITEMS)
+
+    # Store-side: most recent business day only, scoped to the chosen items.
+    store_latest_date = df_all["business_date"].max()
+    store_snap = df_all[
+        (df_all["business_date"] == store_latest_date)
+        & (df_all["walmart_item_number"].isin(inv_items))
+    ]
+
+    # DC-side: most recent inventory date only, scoped to the chosen items.
+    if not dc_df_all.empty:
+        dc_latest_snap_date = dc_df_all["inventory_date"].max()
+        dc_snap = dc_df_all[
+            (dc_df_all["inventory_date"] == dc_latest_snap_date)
+            & (dc_df_all["walmart_item_number"].isin(inv_items))
+        ]
+    else:
+        dc_latest_snap_date = None
+        dc_snap = pd.DataFrame()
+
+    store_oh_n = float(store_snap["store_on_hand_quantity_this_year"].sum())
+    in_whse_n = float(store_snap["store_in_warehouse_quantity_this_year"].sum())
+    in_transit_n = float(store_snap["store_in_transit_quantity_this_year"].sum())
+    dc_oh_n = float(dc_snap["on_hand_warehouse_inventory_in_units_this_year"].sum()) if not dc_snap.empty else 0.0
+    dc_oo_n = float(dc_snap["on_order_warehouse_quantity_in_units_this_year"].sum()) if not dc_snap.empty else 0.0
+    # Total units physically in the network = store on-hand + in-transit + DC on-hand.
+    # In-warehouse is DC stock earmarked for stores (would double-count DC on-hand)
+    # and on-order hasn't arrived yet — both excluded from the physical total.
+    total_network = store_oh_n + in_transit_n + dc_oh_n
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("In store (on-hand)", f"{store_oh_n:,.0f}")
+    c2.metric("In warehouse", f"{in_whse_n:,.0f}", help="DC stock earmarked for stores")
+    c3.metric("In transit", f"{in_transit_n:,.0f}", help="On the way to stores")
+    c4.metric("DC on-hand", f"{dc_oh_n:,.0f}", help="Distribution-center on-hand (eaches)")
+    c5.metric("DC on-order", f"{dc_oo_n:,.0f}", help="Inbound to the DCs (eaches)")
+    c6.metric("Total network", f"{total_network:,.0f}",
+              help="Store on-hand + in-transit + DC on-hand (no double-count)")
+
+    # Per-item breakdown table with a totals row.
+    store_by_item = store_snap.groupby("walmart_item_number", as_index=False).agg(
+        store_oh=("store_on_hand_quantity_this_year", "sum"),
+        in_whse=("store_in_warehouse_quantity_this_year", "sum"),
         in_transit=("store_in_transit_quantity_this_year", "sum"),
-        snapshot_date=("snapshot_date", "max"),
-    ).sort_values("walmart_calendar_week").reset_index(drop=True)
-    weekly_inv["week_label"] = _wm_week_label(weekly_inv["walmart_calendar_week"])
+    )
+    if not dc_snap.empty:
+        dc_by_item = dc_snap.groupby("walmart_item_number", as_index=False).agg(
+            dc_oh=("on_hand_warehouse_inventory_in_units_this_year", "sum"),
+            dc_oo=("on_order_warehouse_quantity_in_units_this_year", "sum"),
+        )
+    else:
+        dc_by_item = pd.DataFrame(columns=["walmart_item_number", "dc_oh", "dc_oo"])
 
-    if not weekly_inv.empty:
-        m = weekly_inv.melt(id_vars=["week_label", "walmart_calendar_week"],
-                            value_vars=["on_hand_ty", "in_warehouse", "in_transit"],
-                            var_name="Component", value_name="Units")
-        m["Component"] = m["Component"].map({
-            "on_hand_ty": "On Hand (stores)", "in_warehouse": "In Warehouse", "in_transit": "In Transit",
-        })
-        st.altair_chart((alt.Chart(m).mark_area().encode(
-            x=alt.X("week_label:N", sort=list(weekly_inv["week_label"]),
-                    title="Week (end-of-week snapshot)", axis=alt.Axis(labelAngle=-30)),
-            y=alt.Y("Units:Q", stack="zero", title="Units"),
-            color=alt.Color("Component:N", scale=alt.Scale(
-                domain=["On Hand (stores)", "In Warehouse", "In Transit"],
-                range=["#185FA5", "#5BA3D8", "#A8D0E6"])),
-            tooltip=["week_label", "Component", alt.Tooltip("Units:Q", format=",")],
-        ).properties(height=320)), width='stretch')
+    breakdown = store_by_item.merge(dc_by_item, on="walmart_item_number", how="outer").fillna(0)
+    if not breakdown.empty:
+        breakdown["Item"] = breakdown["walmart_item_number"].map(ITEM_LABELS).fillna(
+            breakdown["walmart_item_number"].astype(str))
+        breakdown["Total"] = breakdown["store_oh"] + breakdown["in_transit"] + breakdown["dc_oh"]
+        breakdown = breakdown.sort_values("Total", ascending=False)
 
-        latest = weekly_inv.iloc[-1]
-        yoy = ((latest["on_hand_ty"] - latest["on_hand_ly"]) / latest["on_hand_ly"] * 100) if latest["on_hand_ly"] else 0
-        st.caption(f"Latest week network on-hand: **{int(latest['on_hand_ty']):,}** units "
-                   f"({yoy:+.1f}% vs LY {int(latest['on_hand_ly']):,})")
+        show_inv = breakdown[["Item", "store_oh", "in_whse", "in_transit",
+                              "dc_oh", "dc_oo", "Total"]].copy()
+        show_inv.columns = ["Item", "In store", "In warehouse", "In transit",
+                            "DC on-hand", "DC on-order", "Total network"]
+        totals_row = {
+            "Item": "Total", "In store": store_oh_n, "In warehouse": in_whse_n,
+            "In transit": in_transit_n, "DC on-hand": dc_oh_n, "DC on-order": dc_oo_n,
+            "Total network": total_network,
+        }
+        show_inv = pd.concat([show_inv, pd.DataFrame([totals_row])], ignore_index=True)
+        _numcols = ["In store", "In warehouse", "In transit",
+                    "DC on-hand", "DC on-order", "Total network"]
+        st.dataframe(
+            show_inv, width='stretch', hide_index=True,
+            column_config={c: st.column_config.NumberColumn(format="%d") for c in _numcols},
+        )
+
+    _dc_note = (f" · DC snapshot **{dc_latest_snap_date.strftime('%b %d, %Y')}**"
+                if dc_latest_snap_date is not None else " · DC data unavailable")
+    st.caption(f"Store snapshot **{store_latest_date.strftime('%b %d, %Y')}**{_dc_note}.")
 
     # ── NEW: Phantom Inventory ───────────────────────────────────────────────
     st.divider()
