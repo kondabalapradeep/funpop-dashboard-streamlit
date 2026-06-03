@@ -117,6 +117,12 @@ def main() -> int:
 
     print(f"Store feed advanced (max={new_max}, prior={prior_max}); rebuilding all queries.")
 
+    # Keys this build is responsible for. Built up-front from the full job list
+    # (not from per-query success) so a transient single-query failure can't make
+    # the prune below delete that query's still-current parquet. The static
+    # store-directory key is added after its build attempt.
+    built_keys = {snapshot.snapshot_key(fn, ps) for fn, ps in jobs}
+
     # Write the store result first (it's already in hand), then run the rest.
     succeeded = 0
     changed = False
@@ -155,6 +161,7 @@ def main() -> int:
     # rest of the snapshot.
     try:
         import store_directory
+        built_keys.add(store_directory.DIRECTORY_FILENAME)
         run_query = lambda sql: client.query(
             sql, job_config=bigquery.QueryJobConfig()
         ).to_dataframe(create_bqstorage_client=False)
@@ -166,6 +173,15 @@ def main() -> int:
                   f"({'updated' if updated else 'unchanged'})")
     except Exception as e:  # noqa: BLE001
         print(f"  WARN: store directory build failed: {e}", file=sys.stderr)
+
+    # Drop any parquet from an earlier build that this run did not (re)produce.
+    # The snapshot key embeds the day's rolling lookback, so without this prune
+    # old files linger and get served as "fresh" the next time the app's key
+    # cycles back onto them — the bug that froze the dashboard on a stale date.
+    removed = snapshot.prune_snapshot(built_keys)
+    if removed:
+        changed = True
+        print(f"  pruned {len(removed)} stale snapshot file(s) from prior builds.")
 
     if changed:
         snapshot.write_manifest()
