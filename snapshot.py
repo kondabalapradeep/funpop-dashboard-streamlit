@@ -85,6 +85,37 @@ def write_manifest(built_at: datetime | None = None) -> None:
     MANIFEST_PATH.write_text(ts + "\n")
 
 
+def prune_snapshot(keep_keys) -> list[str]:
+    """Delete committed snapshot parquets that are NOT part of the latest build.
+
+    The snapshot key embeds the day's Standard-view lookback (``27 + days into
+    the current Walmart week``), which cycles weekly — so a given key is only
+    rewritten on the matching weekday. Left alone, prior builds' parquets pile
+    up, and (much worse) the next time the app's rolling key lands back on one,
+    ``read_snapshot`` happily serves a week-old file because the *global*
+    ``built_at`` stamp still looks fresh. That is how the dashboard froze on an
+    old business_date.
+
+    Keeping only the current build's files means any key the latest build did
+    not produce is simply absent on disk, so ``read_snapshot`` returns ``None``
+    and the app falls back to a live query (fresh) instead of serving stale
+    data. ``built_at.txt`` and any non-parquet files are left untouched. Returns
+    the filenames removed.
+
+    ``keep_keys`` is the set of snapshot keys (no extension) the build wrote or
+    intended to write this run, including the static store-directory key."""
+    keep = {f"{k}.parquet" for k in keep_keys}
+    removed = []
+    for path in SNAPSHOT_DIR.glob("*.parquet"):
+        if path.name not in keep:
+            try:
+                path.unlink()
+                removed.append(path.name)
+            except OSError as e:  # noqa: BLE001 - a prune failure must not sink the build
+                logger.warning("could not prune stale snapshot %s: %s", path.name, e)
+    return removed
+
+
 # ── App side ─────────────────────────────────────────────────────────────────
 def read_snapshot(key: str, max_age_seconds: int = MAX_AGE_SECONDS):
     """Return the snapshotted DataFrame for ``key``, or ``None`` if it is
