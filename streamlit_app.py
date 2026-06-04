@@ -1792,6 +1792,118 @@ with tab_inv:
                 if dc_latest_snap_date is not None else " · DC data unavailable")
     st.caption(f"Store snapshot **{store_latest_date.strftime('%b %d, %Y')}**{_dc_note}.")
 
+    # ── Daily system inventory flow (last full week + week to date) ───────────
+    # The two sections above are point-in-time snapshots; this one trends the
+    # whole-network position day by day so you can see inventory building or
+    # draining across the pipeline, alongside the daily sell-through that drives
+    # it. Window = the last full Walmart week (Sat–Fri) plus the current week to
+    # date, anchored on the most recent day of store data.
+    st.divider()
+    st.subheader("Daily system inventory flow")
+
+    most_recent_norm = most_recent.normalize()
+    days_since_sat = (most_recent_norm.weekday() - 5) % 7          # Walmart week = Sat–Fri
+    cur_week_start = most_recent_norm - timedelta(days=days_since_sat)
+    flow_start = cur_week_start - timedelta(days=7)                # start of the last full week
+    last_week_end = cur_week_start - timedelta(days=1)
+    st.caption(
+        f"Total units in the network each day across the **last full week** "
+        f"({flow_start.strftime('%b %d')}–{last_week_end.strftime('%b %d')}) and the "
+        f"**current week to date** ({cur_week_start.strftime('%b %d')}–"
+        f"{most_recent.strftime('%b %d')}). Total network = store on-hand + in-transit + "
+        "DC on-hand (in-warehouse and on-order are excluded to avoid double-counting). "
+        "Reflects the sidebar View filter."
+    )
+
+    flow = df[df["business_date"] >= flow_start]
+    store_daily = flow.groupby("business_date", as_index=False).agg(
+        in_store=("store_on_hand_quantity_this_year", "sum"),
+        in_transit=("store_in_transit_quantity_this_year", "sum"),
+        units_sold=("pos_quantity_this_year", "sum"),
+    )
+    if not dc_df.empty:
+        dc_daily = (
+            dc_df[dc_df["inventory_date"] >= flow_start]
+            .groupby("inventory_date", as_index=False)
+            .agg(dc_oh=("on_hand_warehouse_inventory_in_units_this_year", "sum"))
+            .rename(columns={"inventory_date": "business_date"})
+        )
+    else:
+        dc_daily = pd.DataFrame(columns=["business_date", "dc_oh"])
+
+    fd = store_daily.merge(dc_daily, on="business_date", how="left").sort_values("business_date")
+    # DC on-hand is a level that carries over; if the DC feed lags a day, carry the
+    # last known value forward rather than dropping the network total to zero.
+    fd["dc_oh"] = fd["dc_oh"].ffill().fillna(0)
+    fd["total_network"] = fd["in_store"] + fd["in_transit"] + fd["dc_oh"]
+    fd["delta"] = fd["total_network"].diff()
+    fd["date_str"] = fd["business_date"].dt.strftime("%b %d")
+    fd["weekday"] = fd["business_date"].dt.strftime("%a")
+
+    if fd.empty:
+        st.info("Not enough recent data to chart the daily inventory flow.")
+    else:
+        latest_total = float(fd["total_network"].iloc[-1])
+        net_change = latest_total - float(fd["total_network"].iloc[0])
+        dod = fd["delta"].iloc[-1]
+        dod = float(dod) if pd.notna(dod) else 0.0
+        units_window = float(fd["units_sold"].sum())
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Total system inventory", f"{latest_total:,.0f}", f"{dod:+,.0f} vs prior day")
+        f2.metric("Net change over window", f"{net_change:+,.0f}",
+                  help="Latest total network minus the first day shown.")
+        f3.metric("Units sold (window)", f"{units_window:,.0f}",
+                  help=f"Total POS units across the {len(fd)} days shown.")
+
+        # Stacked bars = inventory position by stage (left axis); overlaid line =
+        # daily units sold (right, independent axis) so the throughput driving the
+        # level is visible alongside it.
+        stage_order = ["In store", "In transit", "DC on-hand"]
+        chart_df = fd.rename(columns={
+            "in_store": "In store", "in_transit": "In transit", "dc_oh": "DC on-hand"})
+        pos_long = chart_df.melt(id_vars=["date_str"], value_vars=stage_order,
+                                 var_name="Stage", value_name="Units")
+        x_enc = alt.X("date_str:N", sort=list(fd["date_str"]), title=None,
+                      axis=alt.Axis(labelAngle=-30))
+        bars = alt.Chart(pos_long).mark_bar().encode(
+            x=x_enc,
+            y=alt.Y("Units:Q", title="Units in network", stack="zero"),
+            color=alt.Color("Stage:N", title="Stage",
+                            scale=alt.Scale(domain=stage_order,
+                                            range=["#185FA5", "#C49A2E", "#27500A"])),
+            tooltip=["date_str", "Stage", alt.Tooltip("Units:Q", format=",")],
+        )
+        line = alt.Chart(fd).mark_line(point=True, strokeWidth=2.5, color="#791F1F").encode(
+            x=x_enc,
+            y=alt.Y("units_sold:Q", title="Units sold / day"),
+            tooltip=["date_str", "weekday",
+                     alt.Tooltip("units_sold:Q", format=",", title="Units sold")],
+        )
+        st.altair_chart(
+            alt.layer(bars, line).resolve_scale(y="independent").properties(height=340),
+            width='stretch',
+        )
+        st.caption("Bars = inventory position by stage (left axis). "
+                   "Red line = units sold per day (right axis).")
+
+        show_flow = fd[["weekday", "date_str", "in_store", "in_transit", "dc_oh",
+                        "total_network", "units_sold", "delta"]].iloc[::-1].copy()
+        show_flow.columns = ["Day", "Date", "In store", "In transit", "DC on-hand",
+                             "Total network", "Units sold", "Δ network"]
+        _intcols = ["In store", "In transit", "DC on-hand", "Total network", "Units sold"]
+        show_flow[_intcols] = show_flow[_intcols].round().astype(int)
+        # Nullable int keeps the oldest day's blank Δ (no prior day) rendering empty.
+        show_flow["Δ network"] = show_flow["Δ network"].round().astype("Int64")
+        st.dataframe(
+            show_flow, width='stretch', hide_index=True,
+            column_config={
+                **{c: st.column_config.NumberColumn(format="%d") for c in _intcols},
+                "Δ network": st.column_config.NumberColumn(
+                    format="%+d", help="Day-over-day change in total network units."),
+            },
+        )
+
     # ── NEW: Phantom Inventory ───────────────────────────────────────────────
     st.divider()
     st.subheader("Phantom inventory (backroom adjustments)")
