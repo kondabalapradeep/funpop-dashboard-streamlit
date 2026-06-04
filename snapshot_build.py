@@ -26,6 +26,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 import snapshot
+import transforms
 from constants import ACTIVE_ITEMS
 
 SQL_DIR = Path(__file__).parent / "sql"
@@ -124,6 +125,12 @@ def main() -> int:
     built_keys = {snapshot.snapshot_key(fn, ps) for fn, ps in jobs}
 
     # Write the store result first (it's already in hand), then run the rest.
+    # Pre-shrink frames the app would otherwise re-shrink on every cold start
+    # (see transforms.SNAPSHOT_TRANSFORMS): the heavy store frame reads back from
+    # BigQuery as ~375 MB of boxed Decimals, so committing it already downcast
+    # cuts the app's cold-start prep for it from ~4 s to ~0.1 s. The transform is
+    # idempotent, so the app safely re-applies it after reading.
+    store_df = transforms.SNAPSHOT_TRANSFORMS["store_query.sql"](store_df)
     succeeded = 0
     changed = False
     try:
@@ -140,6 +147,11 @@ def main() -> int:
                 load_sql(filename, project, dataset),
                 job_config=bigquery.QueryJobConfig(query_parameters=params),
             ).to_dataframe(create_bqstorage_client=False)
+            # Pre-shrink the heavy frames the app would re-shrink on cold start
+            # (store handled above; forecast is the other Decimal-boxed one).
+            transform = transforms.SNAPSHOT_TRANSFORMS.get(filename)
+            if transform is not None:
+                df = transform(df)
             key = snapshot.snapshot_key(filename, params)
             updated = snapshot.write_if_changed(key, df)
         except Exception as e:  # noqa: BLE001 - one bad query shouldn't sink the rest
