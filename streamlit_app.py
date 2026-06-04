@@ -1811,13 +1811,15 @@ with tab_inv:
         f"({flow_start.strftime('%b %d')}–{last_week_end.strftime('%b %d')}) and the "
         f"**current week to date** ({cur_week_start.strftime('%b %d')}–"
         f"{most_recent.strftime('%b %d')}). Total network = store on-hand + in-transit + "
-        "DC on-hand (in-warehouse and on-order are excluded to avoid double-counting). "
+        "DC on-hand. In-warehouse is shown for context but excluded from the total (it "
+        "would double-count DC on-hand), as is on-order (not yet arrived). "
         "Reflects the sidebar View filter."
     )
 
     flow = df[df["business_date"] >= flow_start]
     store_daily = flow.groupby("business_date", as_index=False).agg(
         in_store=("store_on_hand_quantity_this_year", "sum"),
+        in_whse=("store_in_warehouse_quantity_this_year", "sum"),
         in_transit=("store_in_transit_quantity_this_year", "sum"),
         units_sold=("pos_quantity_this_year", "sum"),
     )
@@ -1887,11 +1889,11 @@ with tab_inv:
         st.caption("Bars = inventory position by stage (left axis). "
                    "Red line = units sold per day (right axis).")
 
-        show_flow = fd[["weekday", "date_str", "in_store", "in_transit", "dc_oh",
+        show_flow = fd[["weekday", "date_str", "in_store", "in_whse", "in_transit", "dc_oh",
                         "total_network", "units_sold", "delta"]].iloc[::-1].copy()
-        show_flow.columns = ["Day", "Date", "In store", "In transit", "DC on-hand",
+        show_flow.columns = ["Day", "Date", "In store", "In warehouse", "In transit", "DC on-hand",
                              "Total network", "Units sold", "Δ network"]
-        _intcols = ["In store", "In transit", "DC on-hand", "Total network", "Units sold"]
+        _intcols = ["In store", "In warehouse", "In transit", "DC on-hand", "Total network", "Units sold"]
         show_flow[_intcols] = show_flow[_intcols].round().astype(int)
         # Nullable int keeps the oldest day's blank Δ (no prior day) rendering empty.
         show_flow["Δ network"] = show_flow["Δ network"].round().astype("Int64")
