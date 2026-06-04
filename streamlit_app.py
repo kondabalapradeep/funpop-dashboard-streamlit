@@ -56,6 +56,7 @@ from constants import (
 )
 import snapshot
 import store_directory
+import transforms
 
 # Walmart is in Bentonville (Central Time). Daily BI Link feeds typically
 # land around 7am Central, sometimes later.
@@ -238,55 +239,15 @@ def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
     # Record the wall-clock time of this BQ fetch. Only executes on cache miss,
     # so this is the actual "last refresh" stamp.
     _freshness_state()["last_refresh_at"] = datetime.now(CENTRAL_TZ).isoformat()
-    if df.empty:
-        return df
-    # Memory hygiene — this is the dashboard's heaviest frame (~4,500 stores ×
-    # ~35 days × 3 items ≈ 550k rows) and Community Cloud caps app RAM, so an
-    # un-trimmed frame (with @st.cache_data holding a copy per cache key) is what
-    # pushes the app over the limit. Two cheap wins, both safe with older
-    # snapshots thanks to the guards:
-    #   • Drop columns the query fetches but the dashboard never reads
-    #     (store_name / city_name / item_name). These are repeated Python strings
-    #     across every row — together ~120 MB in memory for nothing.
-    #   • Store the low-cardinality state code (~50 distinct) as a category
-    #     instead of a repeated string — another ~30 MB.
-    df = df.drop(columns=["store_name", "city_name", "item_name"], errors="ignore")
-    if "state_or_province_code" in df.columns:
-        df["state_or_province_code"] = df["state_or_province_code"].astype("category")
-    df["business_date"] = pd.to_datetime(df["business_date"])
-    int_cols = [
-        "pos_quantity_this_year", "pos_quantity_last_year",
-        "store_on_hand_quantity_this_year", "store_on_hand_quantity_last_year",
-        "store_in_warehouse_quantity_this_year", "store_in_transit_quantity_this_year",
-    ]
-    money_cols = [
-        "store_specific_retail_amount_this_year",
-        "pos_sales_this_year", "pos_sales_last_year",
-    ]
-    for c in int_cols + money_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    # Unit-price correction (float division — must run before we shrink dtypes).
-    sold = df[df["pos_quantity_this_year"] > 0]
-    if len(sold) and sold["store_specific_retail_amount_this_year"].median() > 10:
-        unit_price = np.where(
-            df["pos_quantity_this_year"] > 0,
-            (df["pos_sales_this_year"] / df["pos_quantity_this_year"].replace(0, np.nan)).round(2),
-            0,
-        )
-        df["store_specific_retail_amount_this_year"] = np.where(np.isnan(unit_price), 0, unit_price)
-    # Shrink dtypes — this is the app's heaviest frame and @st.cache_data holds a
-    # copy per key, so wide dtypes are what tip Community Cloud over its RAM cap.
-    # Counts are whole numbers (pandas sums int32 in an int64 accumulator, so no
-    # overflow); money fits float32 to the dollar at network scale and the UI
-    # rounds to whole dollars anyway. Roughly halves the numeric footprint.
-    for c in int_cols:
-        df[c] = df[c].round().astype("int32")
-    for c in money_cols:
-        df[c] = df[c].astype("float32")
-    for c in ["walmart_item_number", "store_number", "walmart_calendar_week"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int32")
-    return df
+    # Normalise + shrink dtypes. This is the dashboard's heaviest frame (~544k
+    # rows): a raw BigQuery read boxes its NUMERIC columns as Python Decimals and
+    # balloons to ~375 MB, so this step both halves the cached footprint (keeping
+    # the app under Community Cloud's RAM cap) and is the bulk of cold-start cost.
+    # The scheduled snapshot builder now applies the same idempotent transform
+    # before committing the parquet, so a cold start reads an already-shrunk
+    # ~31 MB frame and this call is a cheap no-op (~4,100 ms → ~95 ms); a live
+    # pull or an older un-shrunk snapshot still gets fully processed here.
+    return transforms.process_store_frame(df)
 
 
 @st.cache_data(ttl=86400, max_entries=3, show_spinner="Loading DC data...")
@@ -342,21 +303,9 @@ def load_dc_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
 
 
 # ─── Secondary loaders (fault-tolerant) ──────────────────────────────────────
-def _shrink_frame(df: pd.DataFrame, int_cols=(), float_cols=(), cat_cols=()) -> pd.DataFrame:
-    """Shrink a cached frame's dtypes in place: counts → int32 (pandas still sums
-    them in an int64 accumulator, so no overflow), money/rates → float32, and
-    repeated codes/strings → category. @st.cache_data keeps a copy per key, so
-    trimming dtypes is what keeps the app under Community Cloud's RAM cap."""
-    for c in int_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype("int32")
-    for c in float_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("float32")
-    for c in cat_cols:
-        if c in df.columns:
-            df[c] = df[c].astype("category")
-    return df
+# Shared with the snapshot builder via transforms.py so the two never drift; see
+# that module for why dtype-shrinking matters (Community Cloud RAM cap).
+_shrink_frame = transforms.shrink_frame
 
 
 @st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
@@ -379,10 +328,10 @@ def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
         ])
-        if not df.empty:
-            df["forecast_date"] = pd.to_datetime(df["forecast_date"])
-            _shrink_frame(df, int_cols=["store_number", "walmart_item_number"],
-                          float_cols=["forecast_quantity"])
+        # Shared with the snapshot builder (transforms.py): forecast_quantity
+        # arrives as boxed Decimals over ~273k rows, so the builder pre-shrinks
+        # this frame too and the cold-start read here is a cheap no-op.
+        df = transforms.process_forecast_frame(df)
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
