@@ -69,6 +69,24 @@ def process_store_frame(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for c in int_cols + money_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    # Collapse the sales-side fan-out before anything sums these columns.
+    # store_sales carries several rows per store-day-item (split by a sales
+    # dimension the dashboard never selects); the LEFT JOIN to the
+    # one-row-per-key inventory feed copies each inventory level onto every one
+    # of those rows. POS is additive across the split and must be summed, but the
+    # inventory levels (on-hand / in-warehouse / in-transit / retail) are
+    # identical copies — summing them reads store on-hand ~2x high. Collapse to
+    # one row per store-day-item: sum POS, take each level column once.
+    # Idempotent: an already-collapsed frame has no duplicate keys, so the guard
+    # skips the groupby and returns the data unchanged.
+    key = ["business_date", "store_number", "walmart_item_number"]
+    if df.duplicated(subset=key).any():
+        cols = list(df.columns)
+        sum_cols = ["pos_quantity_this_year", "pos_quantity_last_year",
+                    "pos_sales_this_year", "pos_sales_last_year"]
+        agg = {c: ("sum" if c in sum_cols else "first")
+               for c in cols if c not in key}
+        df = df.groupby(key, as_index=False, sort=False).agg(agg)[cols]
     # Unit-price correction (float division — must run before we shrink dtypes).
     # Idempotent: once applied, retail amounts are unit prices (~$3), so the
     # median > 10 guard never re-triggers on a second pass.
