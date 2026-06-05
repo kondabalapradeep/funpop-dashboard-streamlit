@@ -337,6 +337,54 @@ def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
         return pd.DataFrame(), str(e)
 
 
+@st.cache_data(ttl=86400, max_entries=4, show_spinner=False)
+def load_store_ly_oh(ly_start: str, ly_end: str, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    """Last year's daily store inventory totals (on-hand / in-transit / in-whse)
+    for the [ly_start, ly_end] window — the comparable days for the inventory
+    tab's next-7-day projection. The query already de-duplicates and sums to one
+    row per day, so this loader just normalises dtypes. Returns (frame, error);
+    a failure degrades the projection, never the page."""
+    try:
+        df = _cached_query("store_ly_oh_query.sql", [
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
+            bigquery.ScalarQueryParameter("ly_start", "DATE", pd.Timestamp(ly_start).date()),
+            bigquery.ScalarQueryParameter("ly_end", "DATE", pd.Timestamp(ly_end).date()),
+        ])
+        if df.empty:
+            return df, None
+        df["inventory_date"] = pd.to_datetime(df["inventory_date"])
+        for c in ["in_store_ly", "in_transit_ly", "in_whse_ly"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype("int64")
+        return df, None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+@st.cache_data(ttl=86400, max_entries=4, show_spinner=False)
+def load_dc_ly_oh(ly_start: str, ly_end: str, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    """Last year's daily DC on-hand (eaches) for the [ly_start, ly_end] window,
+    for the next-7-day projection. Applies the same warehouse-pack -> eaches
+    conversion as load_dc_data, then sums to one row per day. Returns
+    (frame, error)."""
+    try:
+        df = _cached_query("dc_ly_oh_query.sql", [
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
+            bigquery.ScalarQueryParameter("ly_start", "DATE", pd.Timestamp(ly_start).date()),
+            bigquery.ScalarQueryParameter("ly_end", "DATE", pd.Timestamp(ly_end).date()),
+        ])
+        if df.empty:
+            return df, None
+        df["inventory_date"] = pd.to_datetime(df["inventory_date"])
+        on_hand = pd.to_numeric(df["on_hand_whpk_qty"], errors="coerce").fillna(0)
+        pack_each = pd.to_numeric(df["warehouse_pack_each_quantity"], errors="coerce").fillna(0)
+        fallback = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+        multiplier = pack_each.where(pack_each > 0, fallback)
+        df["dc_oh_ly"] = (on_hand * multiplier).round().astype("int64")
+        return df.groupby("inventory_date", as_index=False)["dc_oh_ly"].sum(), None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
 @st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_omni_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     try:
@@ -1863,23 +1911,79 @@ with tab_inv:
         f3.metric("Units sold (window)", f"{units_window:,.0f}",
                   help=f"Total POS units across the {len(fd)} days shown.")
 
+        # ── Forward projection: the next 7 days from last year's on-hand ──────
+        # Anchor on the last actual day; estimate each upcoming day from last
+        # year's actual network position on the comparable day (52-week / 364-day
+        # shift, preserving weekday). Pull that comparable last-year window and
+        # shift its dates forward to line up with the upcoming days.
+        proj_dates = pd.date_range(most_recent_norm + timedelta(days=1), periods=7, freq="D")
+        _ly_start = (proj_dates.min() - timedelta(days=364)).date().isoformat()
+        _ly_end = (proj_dates.max() - timedelta(days=364)).date().isoformat()
+        sly_df, sly_err = load_store_ly_oh(_ly_start, _ly_end, slot)
+        dly_df, dly_err = load_dc_ly_oh(_ly_start, _ly_end, slot)
+
+        proj = pd.DataFrame({"business_date": proj_dates})
+        if not sly_df.empty:
+            _s = sly_df.copy()
+            _s["business_date"] = _s["inventory_date"] + pd.Timedelta(days=364)
+            proj = proj.merge(_s[["business_date", "in_store_ly", "in_transit_ly", "in_whse_ly"]],
+                              on="business_date", how="left")
+        for _src, _dst in [("in_store_ly", "in_store"), ("in_transit_ly", "in_transit"),
+                           ("in_whse_ly", "in_whse")]:
+            proj[_dst] = proj[_src] if _src in proj.columns else np.nan
+        if not dly_df.empty:
+            _d = dly_df.copy()
+            _d["business_date"] = _d["inventory_date"] + pd.Timedelta(days=364)
+            proj = proj.merge(_d[["business_date", "dc_oh_ly"]], on="business_date", how="left")
+            proj = proj.rename(columns={"dc_oh_ly": "dc_oh"})
+        else:
+            proj["dc_oh"] = np.nan
+        # DC on-hand is a level: carry it across any missing last-year day, seeding
+        # from the latest actual so a leading gap doesn't zero the network total.
+        proj["dc_oh"] = proj["dc_oh"].ffill()
+        if proj["dc_oh"].isna().any():
+            proj["dc_oh"] = proj["dc_oh"].fillna(float(fd["dc_oh"].iloc[-1]))
+        # Drop upcoming days with no comparable last-year store reading rather than
+        # invent a level for them.
+        proj = proj.dropna(subset=["in_store"]).reset_index(drop=True)
+        have_proj = not proj.empty
+        if have_proj:
+            proj["in_transit"] = proj["in_transit"].fillna(0)
+            proj["in_whse"] = proj["in_whse"].fillna(0)
+            proj["total_network"] = proj["in_store"] + proj["in_transit"] + proj["dc_oh"]
+            proj["date_str"] = proj["business_date"].dt.strftime("%b %d")
+            proj["weekday"] = proj["business_date"].dt.strftime("%a")
+
         # Stacked bars = inventory position by stage (left axis); overlaid line =
         # daily units sold (right, independent axis) so the throughput driving the
-        # level is visible alongside it.
+        # level is visible alongside it. Upcoming days (right of the dashed rule)
+        # are drawn faded — projected from last year's on-hand, not actuals.
         stage_order = ["In store", "In transit", "DC on-hand"]
-        chart_df = fd.rename(columns={
-            "in_store": "In store", "in_transit": "In transit", "dc_oh": "DC on-hand"})
-        pos_long = chart_df.melt(id_vars=["date_str"], value_vars=stage_order,
-                                 var_name="Stage", value_name="Units")
-        x_enc = alt.X("date_str:N", sort=list(fd["date_str"]), title=None,
-                      axis=alt.Axis(labelAngle=-30))
+        _rename = {"in_store": "In store", "in_transit": "In transit", "dc_oh": "DC on-hand"}
+        act_long = fd.rename(columns=_rename).melt(
+            id_vars=["date_str"], value_vars=stage_order, var_name="Stage", value_name="Units")
+        act_long["Phase"] = "Actual"
+        if have_proj:
+            proj_long = proj.rename(columns=_rename).melt(
+                id_vars=["date_str"], value_vars=stage_order, var_name="Stage", value_name="Units")
+            proj_long["Phase"] = "Projected (last yr)"
+            pos_long = pd.concat([act_long, proj_long], ignore_index=True)
+            _order = list(fd["date_str"]) + list(proj["date_str"])
+        else:
+            pos_long = act_long
+            _order = list(fd["date_str"])
+        x_enc = alt.X("date_str:N", sort=_order, title=None, axis=alt.Axis(labelAngle=-30))
         bars = alt.Chart(pos_long).mark_bar().encode(
             x=x_enc,
             y=alt.Y("Units:Q", title="Units in network", stack="zero"),
             color=alt.Color("Stage:N", title="Stage",
                             scale=alt.Scale(domain=stage_order,
                                             range=["#185FA5", "#C49A2E", "#27500A"])),
-            tooltip=["date_str", "Stage", alt.Tooltip("Units:Q", format=",")],
+            opacity=alt.Opacity("Phase:N",
+                                scale=alt.Scale(domain=["Actual", "Projected (last yr)"],
+                                                range=[1.0, 0.45]),
+                                legend=alt.Legend(title=None) if have_proj else None),
+            tooltip=["date_str", "Stage", alt.Tooltip("Units:Q", format=","), "Phase"],
         )
         line = alt.Chart(fd).mark_line(point=True, strokeWidth=2.5, color="#791F1F").encode(
             x=x_enc,
@@ -1887,12 +1991,20 @@ with tab_inv:
             tooltip=["date_str", "weekday",
                      alt.Tooltip("units_sold:Q", format=",", title="Units sold")],
         )
+        _layers = [bars]
+        if have_proj:
+            _layers.append(
+                alt.Chart(pd.DataFrame({"date_str": [proj["date_str"].iloc[0]]}))
+                .mark_rule(color="#888", strokeDash=[4, 4]).encode(x=x_enc))
+        _layers.append(line)
         st.altair_chart(
-            alt.layer(bars, line).resolve_scale(y="independent").properties(height=340),
+            alt.layer(*_layers).resolve_scale(y="independent").properties(height=340),
             width='stretch',
         )
+        _proj_cap = (" Faded bars right of the dashed line = next 7 days projected from "
+                     "last year's on-hand." if have_proj else "")
         st.caption("Bars = inventory position by stage (left axis). "
-                   "Red line = units sold per day (right axis).")
+                   "Red line = units sold per day (right axis)." + _proj_cap)
 
         show_flow = fd[["weekday", "date_str", "in_store", "in_whse", "in_transit", "dc_oh",
                         "total_network", "units_sold", "delta"]].iloc[::-1].copy()
@@ -1910,6 +2022,33 @@ with tab_inv:
                     format="%+d", help="Day-over-day change in total network units."),
             },
         )
+
+        if have_proj:
+            st.markdown("**Projected next 7 days — estimated need from last year's on-hand**")
+            st.caption(
+                f"Each upcoming day = last year's actual network position on the comparable "
+                f"day (same weekday, 52 weeks back), covering "
+                f"{proj['date_str'].iloc[0]}–{proj['date_str'].iloc[-1]}. A seasonal reference for "
+                "what to stock toward, not a forecast — last year's levels are currently running "
+                "above this year's on-hand. Total network = in store + in transit + DC on-hand."
+            )
+            p_end = float(proj["total_network"].iloc[-1])
+            pj1, pj2 = st.columns(2)
+            pj1.metric("Projected total network (day 7)", f"{p_end:,.0f}",
+                       f"{p_end - latest_total:+,.0f} vs latest actual")
+            pj2.metric("Projected in store (day 7)", f"{float(proj['in_store'].iloc[-1]):,.0f}")
+            show_proj = proj[["weekday", "date_str", "in_store", "in_whse", "in_transit",
+                              "dc_oh", "total_network"]].copy()
+            show_proj.columns = ["Day", "Date", "In store", "In warehouse", "In transit",
+                                 "DC on-hand", "Total network"]
+            _pcols = ["In store", "In warehouse", "In transit", "DC on-hand", "Total network"]
+            show_proj[_pcols] = show_proj[_pcols].round().astype(int)
+            st.dataframe(
+                show_proj, width='stretch', hide_index=True,
+                column_config={c: st.column_config.NumberColumn(format="%d") for c in _pcols},
+            )
+        elif sly_err or dly_err:
+            st.caption("Next-7-day projection unavailable — last-year inventory could not be loaded.")
 
     # ── NEW: Phantom Inventory ───────────────────────────────────────────────
     st.divider()
