@@ -1813,19 +1813,24 @@ with tab_inv:
         f"{most_recent.strftime('%b %d')}). Total network = store on-hand + in-transit + "
         "DC on-hand. In-warehouse is shown for context but excluded from the total (it "
         "would double-count DC on-hand), as is on-order (not yet arrived). "
-        "Reflects the sidebar View filter."
+        "Shows the whole network across all items and ignores the sidebar item filter, "
+        "like the location snapshot above."
     )
 
-    flow = df[df["business_date"] >= flow_start]
+    # Whole-network trend: use the unfiltered frames (df_all/dc_df_all) so this
+    # always reflects the full network in the millions, matching the location
+    # snapshot above. The sidebar item filter would otherwise shrink a section
+    # that is meant to trend the whole-network position day by day.
+    flow = df_all[df_all["business_date"] >= flow_start]
     store_daily = flow.groupby("business_date", as_index=False).agg(
         in_store=("store_on_hand_quantity_this_year", "sum"),
         in_whse=("store_in_warehouse_quantity_this_year", "sum"),
         in_transit=("store_in_transit_quantity_this_year", "sum"),
         units_sold=("pos_quantity_this_year", "sum"),
     )
-    if not dc_df.empty:
+    if not dc_df_all.empty:
         dc_daily = (
-            dc_df[dc_df["inventory_date"] >= flow_start]
+            dc_df_all[dc_df_all["inventory_date"] >= flow_start]
             .groupby("inventory_date", as_index=False)
             .agg(dc_oh=("on_hand_warehouse_inventory_in_units_this_year", "sum"))
             .rename(columns={"inventory_date": "business_date"})
