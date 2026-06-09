@@ -1169,6 +1169,71 @@ with tab_sales:
             tooltip=["week_label", "Period", alt.Tooltip("U/S/W:Q", format=".2f")],
         ).properties(height=300)), width='stretch')
 
+    # ── Weekly historical U/S/W by merchandise major zone ────────────────────
+    # Major zones horizontally divide the country (numbered in multiples of 10;
+    # see mdse_maj_zone_nbr in the BI Link glossary), so this tracks each zone's
+    # velocity week over week and surfaces regional momentum shifts the national
+    # line hides. The denominator is the stores actually *selling* in that zone
+    # that week (pos_quantity_this_year > 0) — never the full store count — so it
+    # matches the "Units per Store per Week (w/o zeros)" definition. The current,
+    # in-progress Walmart week stays live: it's flagged with ' *' and its units
+    # are extrapolated to a 7-day equivalent for a fair read against full weeks.
+    if "mdse_major_zone_number" in df.columns:
+        st.markdown("**Weekly U/S/W by merchandise major zone**")
+        st.caption(
+            "Units per store per week for each major zone, normalized by the stores "
+            "actually selling in that zone (not total stores). Zones horizontally "
+            "divide the country; the in-progress week (*) is extrapolated to a full 7 days."
+        )
+        zdf = df[df["mdse_major_zone_number"] > 0]
+        if not zdf.empty:
+            zone_week = zdf.groupby(
+                ["walmart_calendar_week", "mdse_major_zone_number"], as_index=False,
+                observed=True,
+            ).agg(
+                units_raw=("pos_quantity_this_year", "sum"),
+                days_in_week=("business_date", "nunique"),
+            )
+            # Stores selling = distinct stores in the zone that moved a unit that
+            # week. This is the U/S/W denominator; zero-selling stores are excluded.
+            zone_stores = (zdf[zdf["pos_quantity_this_year"] > 0]
+                           .groupby(["walmart_calendar_week", "mdse_major_zone_number"],
+                                    observed=True)["store_number"].nunique()
+                           .rename("stores_selling").reset_index())
+            zone_week = zone_week.merge(
+                zone_stores, on=["walmart_calendar_week", "mdse_major_zone_number"], how="left")
+            zone_week["stores_selling"] = zone_week["stores_selling"].fillna(0).astype(int)
+            zone_week["units"] = zone_week["units_raw"] * _week_norm_factor(zone_week["days_in_week"])
+            zone_week["uspw"] = np.where(
+                zone_week["stores_selling"] > 0,
+                (zone_week["units"] / zone_week["stores_selling"]).round(2), 0)
+            zone_week["is_partial"] = zone_week["days_in_week"] < 7
+            zone_week["week_label"] = _wm_week_label(
+                zone_week["walmart_calendar_week"], zone_week["is_partial"])
+            zone_week["Zone"] = "Zone " + zone_week["mdse_major_zone_number"].astype(str)
+            zone_week = zone_week.sort_values(
+                ["walmart_calendar_week", "mdse_major_zone_number"]).reset_index(drop=True)
+            week_order = (zone_week[["walmart_calendar_week", "week_label"]].drop_duplicates()
+                          .sort_values("walmart_calendar_week")["week_label"].tolist())
+            st.altair_chart((alt.Chart(zone_week).mark_line(
+                point=alt.OverlayMarkDef(size=55), strokeWidth=2.5).encode(
+                x=alt.X("week_label:N", sort=week_order, title="Week",
+                        axis=alt.Axis(labelAngle=-30)),
+                y=alt.Y("uspw:Q", title="Units per Store per Week (stores selling)"),
+                color=alt.Color("Zone:N", title="Major zone"),
+                tooltip=["week_label", "Zone",
+                         alt.Tooltip("uspw:Q", title="U/S/W", format=".2f"),
+                         alt.Tooltip("stores_selling:Q", title="Stores selling", format=","),
+                         alt.Tooltip("units:Q", title="Units (7-day eq.)", format=",.0f")],
+            ).properties(height=320)), width='stretch')
+
+            # Companion table: zones down the side, weeks across, latest U/S/W per cell.
+            ztab = (zone_week.pivot(index="Zone", columns="week_label", values="uspw")
+                    .reindex(columns=week_order))
+            st.dataframe(ztab, width='stretch')
+        else:
+            st.info("No merchandise major-zone data is available for the current selection.")
+
     # ── U/S/W by item ────────────────────────────────────────────────────────
     # Full + Half bins are combined into a single "Bins" line; Shelf stays
     # separate. Active stores for "Bins" counts distinct stores that moved
