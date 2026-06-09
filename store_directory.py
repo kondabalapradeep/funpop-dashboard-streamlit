@@ -1,8 +1,9 @@
-"""Build the static store address directory from store_dim.
+"""Build the static store directory from store_dim.
 
 The Store Actions tab exports a per-store mailing address (number, address,
-city, state, zip) for the field-service vendor. Addresses are reference data
-that essentially never change, so rather than query store_dim on every cold
+city, state, zip) for the field-service vendor, and the Sales & Velocity tab
+breaks velocity down by Walmart merchandise zone — both are static store-level
+reference data sourced from store_dim. Rather than query store_dim on every cold
 start the scheduled snapshot job (snapshot_build.py) builds the directory once
 and commits it as a parquet under snapshot_data/; the deployed app reads that
 committed file straight from disk. If the file is missing the app falls back to
@@ -33,6 +34,13 @@ _CANDIDATES = {
     "state": ["state_prov_cd", "state_cd", "state_prov", "state", "prov"],
     "zip": ["postal_cd", "postal", "zip_cd", "zip"],
     "store_name": ["store_name", "store_nm", "location_name"],
+    # Walmart merchandise zone (e.g. 70 / 60 / 50). Names vary by feed; merch/mdse
+    # prefixes are tried first and bare "zone" is deliberately omitted so a
+    # time-zone column can't be picked up by mistake. If none match, the field is
+    # simply absent and the by-zone velocity view degrades gracefully.
+    "merch_zone": ["mdse_zone_nbr", "merch_zone_nbr", "merchandise_zone_nbr",
+                   "mdse_zone", "merch_zone", "merchandise_zone",
+                   "mdse_zn_nbr", "merch_zn_nbr", "mdse_zn", "merch_zn"],
 }
 _STORE_KEY_CANDIDATES = ["store_nbr", "store_num", "store_id"]
 
@@ -53,9 +61,14 @@ def clean_directory_df(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.copy()
     df["store_number"] = pd.to_numeric(df["store_number"], errors="coerce").fillna(0).astype("int32")
-    for c in ["store_name", "address", "city", "state", "zip"]:
+    for c in ["store_name", "address", "city", "state", "zip", "merch_zone"]:
         if c in df.columns:
             df[c] = df[c].astype("string").str.strip()
+    if "merch_zone" in df.columns:
+        # A numeric zone read back as a string often arrives as "70.0"; trim the
+        # trailing decimal so it displays as a clean "70".
+        df["merch_zone"] = (df["merch_zone"].str.replace(r"\.0+$", "", regex=True)
+                            .str.strip().replace({"": pd.NA}))
     if "zip" in df.columns:
         z = df["zip"].fillna("").str.replace(r"\.0+$", "", regex=True).str.strip()
         # New England ZIPs (0xxxx) lose their leading zero if store_dim stored
@@ -84,7 +97,7 @@ def build_directory_df(run_query, project: str, dataset: str) -> pd.DataFrame:
         raise ValueError("no store-number column on store_dim")
 
     selects = [f"  {store_col} AS store_number"]
-    for alias in ["store_name", "address", "city", "state", "zip"]:
+    for alias in ["store_name", "address", "city", "state", "zip", "merch_zone"]:
         col = best_col(cols, _CANDIDATES[alias])
         if col:
             selects.append(f"  ANY_VALUE(CAST({col} AS STRING)) AS {alias}")
