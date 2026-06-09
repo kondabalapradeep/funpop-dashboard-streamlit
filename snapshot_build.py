@@ -57,13 +57,6 @@ def query_jobs(lookback: int):
         ("returns_query.sql", [items, lb]),
         ("modular_query.sql", [items]),
         ("backroom_query.sql", [items, lb]),
-        # Miscellaneous tab sources (fault-tolerant in the app; a missing table
-        # here just logs a WARN and the rest of the snapshot proceeds).
-        ("affinity_query.sql", [items]),
-        ("hourly_query.sql", [items, lb]),
-        ("tender_query.sql", [items, lb]),
-        ("mumd_query.sql", [items, lb]),
-        ("oos_query.sql", [items, lb]),
     ]
 
 
