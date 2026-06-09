@@ -5,8 +5,7 @@ Tab structure:
   Overview          — KPIs, last 10 days, item performance, stockout risk (incl.
                       estimated lost sales $ and in-stock % service level)
   Sales & Velocity  — Weekly sales, AUR/price trend, YoY units bridge (distribution
-                      vs velocity), U/S/W (incl. by merchandise zone, WTD-daily +
-                      weekly), velocity-tier heatmap, store leaderboard
+                      vs velocity), U/S/W, velocity-tier heatmap, store leaderboard
   Forecast          — Upcoming demand forecast vs sales, attainment & bias, store
                       replenishment watchlist, and DC demand coverage
   Inventory & DC    — Weekly inventory, phantom inventory, DC pipeline (true alignment)
@@ -20,7 +19,7 @@ Tab structure:
 
 Data sources (BigQuery, dv_supplier dataset):
   store_sales + store_invt + store_dim + item_dim ─→ load_store_data
-  store_dim (addresses + merchandise zone, static directory) ─→ load_store_directory
+  store_dim (addresses, static committed directory) ─→ load_store_directory
   dc_item + dc_dim                                 ─→ load_dc_data
   dc_alignment                                     ─→ load_dc_alignment
   daily_demand_forecast                            ─→ load_forecast_data
@@ -640,20 +639,6 @@ df = df_all[df_all["walmart_item_number"].isin(item_filter)].copy()
 # Coarse display group (Bins = Full + Half) for the per-item breakouts that
 # shouldn't split the two bin packs. Carried into df_window via its slices.
 df["item_group"] = df["walmart_item_number"].map(item_group_label)
-# Merge the static per-store merchandise zone (e.g. 70 / 60 / 50) used by the
-# by-zone velocity view. It rides along with the committed store directory built
-# (via store_dim introspection) by the snapshot job, which keeps an unverified
-# column name off the heavy store-sales anchor query whose hard-coded column list
-# must not break. Absent until the next snapshot refresh populates it — the
-# by-zone view degrades gracefully meanwhile.
-_zone_dir, _ = load_store_directory(slot)
-if not _zone_dir.empty and "merch_zone" in _zone_dir.columns:
-    _zmap = (_zone_dir.dropna(subset=["merch_zone"])
-             .drop_duplicates("store_number")
-             .set_index("store_number")["merch_zone"])
-    df["merchandise_zone"] = df["store_number"].map(_zmap).astype("string")
-else:
-    df["merchandise_zone"] = pd.Series(pd.NA, index=df.index, dtype="string")
 dc_df = dc_df_all[dc_df_all["walmart_item_number"].isin(item_filter)].copy() if not dc_df_all.empty else dc_df_all
 
 if df.empty:
@@ -1218,86 +1203,6 @@ with tab_sales:
                 uspw_yoy = row["uspw_ty"] - row["uspw_ly"]
                 st.metric(f"{row['item']}", f"{row['uspw_ty']:.2f} U/S/W",
                           delta=f"{uspw_yoy:+.2f} ({yoy_pct:+.1f}%) vs LY {row['uspw_ly']:.2f}")
-
-    # ── U/S/W by merchandise zone (WTD daily + weekly) ───────────────────────
-    st.markdown("**U/S/W by merchandise zone — daily (WTD) & weekly**")
-    st.caption(
-        "Velocity split by Walmart merchandise zone (e.g. 70 / 60 / 50). "
-        "**WTD U/S/D** is units per *selling* store per day across the current "
-        "week-to-date; **Weekly U/S/W** is units per selling store per week over "
-        "the full lookback. Side by side they show whether a zone is currently "
-        "pacing ahead of or behind its established weekly rate."
-    )
-    if df["merchandise_zone"].notna().any():
-        zdf = df[df["merchandise_zone"].notna()].copy()
-        zdf["merchandise_zone"] = zdf["merchandise_zone"].astype(str)
-
-        # Weekly U/S/W over the full lookback (mirrors the per-item calc:
-        # units ÷ distinct selling stores ÷ weeks in the period).
-        zw = zdf.groupby("merchandise_zone", as_index=False).agg(
-            units_ty=("pos_quantity_this_year", "sum"),
-            units_ly=("pos_quantity_last_year", "sum"),
-        )
-        z_ty = (zdf[zdf["pos_quantity_this_year"] > 0]
-                .groupby("merchandise_zone")["store_number"].nunique()
-                .rename("stores_ty").reset_index())
-        z_ly = (zdf[zdf["pos_quantity_last_year"] > 0]
-                .groupby("merchandise_zone")["store_number"].nunique()
-                .rename("stores_ly").reset_index())
-        zw = zw.merge(z_ty, on="merchandise_zone", how="left").merge(
-            z_ly, on="merchandise_zone", how="left")
-        zw["stores_ty"] = zw["stores_ty"].fillna(0).astype(int)
-        zw["stores_ly"] = zw["stores_ly"].fillna(0).astype(int)
-        zw["uspw_ty"] = np.where(zw["stores_ty"] > 0,
-            (zw["units_ty"] / zw["stores_ty"] / weeks_in_period).round(2), 0)
-        zw["uspw_ly"] = np.where(zw["stores_ly"] > 0,
-            (zw["units_ly"] / zw["stores_ly"] / weeks_in_period).round(2), 0)
-        zw["uspw_yoy_pct"] = _yoy_pct(zw["uspw_ty"], zw["uspw_ly"])
-
-        # WTD daily: the current (most recent, in-progress) Walmart week, units
-        # per selling store per elapsed day. Not 7-day normalized — the point of
-        # the daily figure is the raw current pace.
-        cur_week = int(zdf["walmart_calendar_week"].max())
-        wtd = zdf[zdf["walmart_calendar_week"] == cur_week]
-        wtd_days = max(1, wtd["business_date"].dt.normalize().nunique())
-        wtd_units = (wtd.groupby("merchandise_zone", as_index=False)["pos_quantity_this_year"]
-                     .sum().rename(columns={"pos_quantity_this_year": "wtd_units"}))
-        wtd_stores = (wtd[wtd["pos_quantity_this_year"] > 0]
-                      .groupby("merchandise_zone")["store_number"].nunique()
-                      .rename("wtd_stores").reset_index())
-        zt = zw.merge(wtd_units, on="merchandise_zone", how="left").merge(
-            wtd_stores, on="merchandise_zone", how="left")
-        zt["wtd_units"] = zt["wtd_units"].fillna(0)
-        zt["wtd_stores"] = zt["wtd_stores"].fillna(0).astype(int)
-        zt["wtd_usd"] = np.where(zt["wtd_stores"] > 0,
-            (zt["wtd_units"] / zt["wtd_stores"] / wtd_days).round(2), 0)
-
-        # Sort zones high→low numerically when they're numbers (70, 60, 50 …),
-        # falling back to a label sort for any non-numeric zone codes.
-        zt["_sort"] = pd.to_numeric(zt["merchandise_zone"], errors="coerce")
-        zt = zt.sort_values(["_sort", "merchandise_zone"],
-                            ascending=[False, True]).drop(columns="_sort")
-
-        show_z = zt[["merchandise_zone", "stores_ty", "wtd_usd",
-                     "uspw_ty", "uspw_ly", "uspw_yoy_pct"]].copy()
-        show_z.columns = ["Zone", "Selling stores", "WTD U/S/D (daily)",
-                          "Weekly U/S/W", "Weekly U/S/W LY", "Weekly YoY %"]
-        st.caption(
-            f"WTD = Walmart week {cur_week} "
-            f"({wtd_days} day{'s' if wtd_days != 1 else ''} of data so far)."
-        )
-        st.dataframe(show_z, width='stretch', hide_index=True, column_config={
-            "WTD U/S/D (daily)": st.column_config.NumberColumn(format="%.2f"),
-            "Weekly U/S/W": st.column_config.NumberColumn(format="%.2f"),
-            "Weekly U/S/W LY": st.column_config.NumberColumn(format="%.2f"),
-            "Weekly YoY %": st.column_config.NumberColumn(format="%.1f%%"),
-        })
-    else:
-        st.info(
-            "Merchandise zone isn't in the current data yet. It's pulled from "
-            "`store_dim` by the snapshot job (store directory build) and will "
-            "populate after the next snapshot refresh."
-        )
 
     # ── Store velocity distribution ──────────────────────────────────────────
     st.markdown("**Store-level velocity distribution**")
