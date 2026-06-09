@@ -33,14 +33,20 @@ def shrink_frame(df: pd.DataFrame, int_cols=(), float_cols=(), cat_cols=()) -> p
     in an int64 accumulator, so no overflow), money/rates → float32, and repeated
     codes/strings → category. Idempotent — re-running on shrunk columns is a
     no-op."""
+    # Skip any column already in its target dtype. On a cold start that reads a
+    # pre-shrunk snapshot this turns the whole call into a near no-op; without
+    # the guard, to_numeric would up-cast an int32/float32 column back to 64-bit
+    # (transiently doubling it in memory — a Community Cloud RAM-cap risk) only
+    # to re-shrink it. A raw BigQuery pull is boxed Decimals / Int64 / object, so
+    # the guard never fires there and the column is shrunk as before.
     for c in int_cols:
-        if c in df.columns:
+        if c in df.columns and df[c].dtype != "int32":
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype("int32")
     for c in float_cols:
-        if c in df.columns:
+        if c in df.columns and df[c].dtype != "float32":
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("float32")
     for c in cat_cols:
-        if c in df.columns:
+        if c in df.columns and not isinstance(df[c].dtype, pd.CategoricalDtype):
             df[c] = df[c].astype("category")
     return df
 
@@ -55,6 +61,33 @@ def process_store_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.drop(columns=["store_name", "city_name", "item_name"], errors="ignore")
+    # Fast path for the cold-start read. The scheduled builder already runs this
+    # exact transform before committing the parquet, so a snapshot read arrives
+    # fully processed: collapsed to one row per key, unit-price corrected, and
+    # downcast to int32/float32. Re-running the whole body on it is pure overhead
+    # — worse, the to_numeric pass transiently up-casts every count/money column
+    # back to 64-bit (doubling the frame in memory, a Community Cloud RAM-cap
+    # risk) only to re-shrink it, and the duplicate scan + median recompute do
+    # real work to reach a no-op. Detect the finished form by dtype and skip
+    # straight to the cheap, idempotent normalisations. A live BigQuery pull
+    # arrives as boxed Decimals / Int64 (never int32+float32), so it always takes
+    # the full path below.
+    finished = (
+        "pos_quantity_this_year" in df.columns
+        and "store_specific_retail_amount_this_year" in df.columns
+        and df["pos_quantity_this_year"].dtype == "int32"
+        and df["store_specific_retail_amount_this_year"].dtype == "float32"
+    )
+    if finished:
+        if "state_or_province_code" in df.columns and not isinstance(
+                df["state_or_province_code"].dtype, pd.CategoricalDtype):
+            df["state_or_province_code"] = df["state_or_province_code"].astype("category")
+        if "mdse_major_zone_number" in df.columns and df["mdse_major_zone_number"].dtype != "int32":
+            df["mdse_major_zone_number"] = pd.to_numeric(
+                df["mdse_major_zone_number"], errors="coerce").fillna(0).round().astype("int32")
+        if not np.issubdtype(df["business_date"].dtype, np.datetime64):
+            df["business_date"] = pd.to_datetime(df["business_date"])
+        return df
     if "state_or_province_code" in df.columns:
         df["state_or_province_code"] = df["state_or_province_code"].astype("category")
     # Merchandise major zone: a store dimension that horizontally divides the
@@ -122,7 +155,8 @@ def process_forecast_frame(df: pd.DataFrame) -> pd.DataFrame:
     pre-shrink win applies here (~720 ms → ~50 ms on cold start)."""
     if df.empty:
         return df
-    df["forecast_date"] = pd.to_datetime(df["forecast_date"])
+    if not np.issubdtype(df["forecast_date"].dtype, np.datetime64):
+        df["forecast_date"] = pd.to_datetime(df["forecast_date"])
     shrink_frame(df, int_cols=["store_number", "walmart_item_number"],
                  float_cols=["forecast_quantity"])
     return df
