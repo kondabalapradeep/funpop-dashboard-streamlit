@@ -57,6 +57,14 @@ def process_store_frame(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop(columns=["store_name", "city_name", "item_name"], errors="ignore")
     if "state_or_province_code" in df.columns:
         df["state_or_province_code"] = df["state_or_province_code"].astype("category")
+    # Merchandise major zone: a store dimension that horizontally divides the
+    # country (numbered in multiples of 10; see mdse_maj_zone_nbr in the BI Link
+    # glossary). Newer snapshots/live pulls carry it; guarded so an older snapshot
+    # written before this column existed still loads. Coerce to int32 (0 = unknown)
+    # so the Sales & Velocity zone breakdown can group on it cleanly.
+    if "mdse_major_zone_number" in df.columns:
+        df["mdse_major_zone_number"] = pd.to_numeric(
+            df["mdse_major_zone_number"], errors="coerce").fillna(0).round().astype("int32")
     df["business_date"] = pd.to_datetime(df["business_date"])
     int_cols = [
         "pos_quantity_this_year", "pos_quantity_last_year",

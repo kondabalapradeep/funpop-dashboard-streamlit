@@ -21,7 +21,8 @@
 WITH store_dim_d AS (
   SELECT
     store_nbr,
-    ANY_VALUE(state_prov_cd)  AS state_prov_cd
+    ANY_VALUE(state_prov_cd)       AS state_prov_cd,
+    ANY_VALUE(mdse_maj_zone_nbr)   AS mdse_maj_zone_nbr
   FROM `{project}.{dataset}.store_dim`
   GROUP BY store_nbr
 ),
@@ -59,6 +60,7 @@ SELECT
   ss.wm_yr_wk_nbr                           AS walmart_calendar_week,
   ss.store_nbr                              AS store_number,
   sd.state_prov_cd                          AS state_or_province_code,
+  sd.mdse_maj_zone_nbr                      AS mdse_major_zone_number,
   ss.wm_item_nbr                            AS walmart_item_number,
   COALESCE(ss.ty_qty, 0)                    AS pos_quantity_this_year,
   COALESCE(ss.ly_qty, 0)                    AS pos_quantity_last_year,
