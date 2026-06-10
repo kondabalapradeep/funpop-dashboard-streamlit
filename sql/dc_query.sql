@@ -2,9 +2,11 @@
 -- Real table names confirmed against wmt-dv-bi-link-prod.dv_supplier.
 --
 -- Unit conversion: ty_on_hand_whpk_qty / ty_order_whpk_qty are warehouse PACKS,
--- not eaches. We expose ty_whpk_each_qty (eaches per pack) as a column so the app
--- converts packs→eaches using the real per-item value instead of a hardcoded
--- constant. NULLIF(...,0)→1 keeps inventory intact when the feed lacks a pack size.
+-- not eaches. We expose ty_whpk_each_qty (eaches per pack) RAW — NULL or 0 when
+-- the feed lacks a pack size — so the app converts packs→eaches with the real
+-- per-item value and falls back to constants.CASE_PACK_UNITS only where the
+-- feed has none. (A previous COALESCE(NULLIF(...,0),1) here silently defeated
+-- that fallback: rows missing a pack size were converted at 1 each.)
 --
 -- dc_dim and item_dim are de-duplicated to one row per key first, so a multi-row
 -- dimension can't fan out dc_item rows and inflate on-hand/on-order.
@@ -31,7 +33,7 @@ SELECT
   COALESCE(dim.ly_order_whpk_qty, 0)         AS on_order_warehouse_quantity_in_units_last_year,
   COALESCE(dim.ty_outs_each_qty, 0)          AS out_of_stock_each_quantity_this_year,
   COALESCE(dim.ly_outs_each_qty, 0)          AS out_of_stock_each_quantity_last_year,
-  COALESCE(NULLIF(dim.ty_whpk_each_qty, 0), 1) AS warehouse_pack_each_quantity
+  dim.ty_whpk_each_qty                       AS warehouse_pack_each_quantity
 FROM `{project}.{dataset}.dc_item` AS dim
 LEFT JOIN dc_dim_d AS dcd
   ON dim.dc_nbr = dcd.dc_nbr
@@ -39,4 +41,4 @@ LEFT JOIN item_dim_d AS idim
   ON dim.wm_item_nbr = idim.wm_item_nbr
 WHERE
   dim.wm_item_nbr IN UNNEST(@active_items)
-  AND dim.invt_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+  AND dim.invt_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)

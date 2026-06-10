@@ -10,4 +10,4 @@ SELECT
   COALESCE(ly_invt_adj_each_qty, 0)            AS adjustment_qty_ly
 FROM `{project}.{dataset}.backroom_adjusted_inventory`
 WHERE wm_item_nbr IN UNNEST(@active_items)
-  AND invt_adj_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+  AND invt_adj_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)

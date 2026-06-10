@@ -42,11 +42,21 @@ jobs:
         with:
           node-version: '20'
 
+      # Cache the ~150 MB Chromium download between runs; only the (small,
+      # uncacheable) OS library install is paid each time. Saves a couple of
+      # Actions minutes on every ping.
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-chromium-1.48.0
+
       - name: Install Playwright (Chromium)
         run: |
           npm init -y
           npm install playwright@1.48.0
-          npx playwright install --with-deps chromium
+          npx playwright install chromium       # no-op when the cache is warm
+          npx playwright install-deps chromium  # OS libs are per-runner
 
       - name: Ping dashboard (wake the container, warm cache from snapshot)
         env:

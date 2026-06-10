@@ -39,7 +39,7 @@ store_sales_d AS (
     SUM(ly_sales_amt) AS ly_sales_amt
   FROM `{project}.{dataset}.store_sales`
   WHERE wm_item_nbr IN UNNEST(@active_items)
-    AND bus_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+    AND bus_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)
   GROUP BY bus_dt, wm_yr_wk_nbr, store_nbr, wm_item_nbr
 ),
 store_invt_d AS (

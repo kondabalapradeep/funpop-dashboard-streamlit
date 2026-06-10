@@ -18,4 +18,4 @@ SELECT
 FROM `{project}.{dataset}.ecom_invt` AS ei
 JOIN catalog_items AS ci
   ON ei.catlg_item_id = ci.catlg_item_id
-WHERE ei.rpt_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+WHERE ei.rpt_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)

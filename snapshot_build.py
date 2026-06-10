@@ -1,8 +1,9 @@
 """Build the dashboard data snapshot.
 
 Runs every dashboard query once (read-only) and writes the results to parquet
-files under snapshot_data/, which the workflow then commits to the repo so the
-live Streamlit app can serve cold loads instantly (see snapshot.py for why).
+files under snapshot_data/, which the workflow then force-pushes as the single
+commit of the orphan `snapshot-data` branch (NOT the deploy branch — see
+snapshot.py for why) so the live Streamlit app can serve cold loads instantly.
 Invoked by .github/workflows/snapshot.yml on a schedule.
 
 Environment:

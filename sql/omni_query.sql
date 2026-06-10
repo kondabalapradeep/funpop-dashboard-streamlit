@@ -12,4 +12,4 @@ SELECT
   COALESCE(ly_shpd_based_net_sales_amt, 0)   AS sales_ly
 FROM `{project}.{dataset}.omni_sales`
 WHERE wm_item_nbr IN UNNEST(@active_items)
-  AND bus_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+  AND bus_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)
