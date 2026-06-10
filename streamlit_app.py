@@ -945,6 +945,10 @@ with tab_overview:
         sales_ty=("pos_sales_this_year", "sum"),
         sales_ly=("pos_sales_last_year", "sum"),
     ).rename(columns={"item_group": "item"})
+    # item_group is categorical (memory win on the big frame); cast the 2-3
+    # aggregated rows back to str so .map(...).fillna(0) below doesn't raise
+    # pandas' "Cannot setitem on a Categorical with a new category" error.
+    item_perf["item"] = item_perf["item"].astype(str)
     item_perf["sales_yoy_pct"] = _yoy_pct(item_perf["sales_ty"], item_perf["sales_ly"])
     item_perf["on_hand"] = item_perf["item"].map(group_oh).fillna(0).astype(int)
     item_perf["yoy_pct"] = _yoy_pct(item_perf["units_ty"], item_perf["units_ly"])
@@ -1324,12 +1328,17 @@ with tab_sales:
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
     ).rename(columns={"item_group": "item"})
+    # Same str cast as item_perf: keep the categorical out of the tiny agg
+    # frames so downstream merges/fills behave like plain strings.
+    item_uspw["item"] = item_uspw["item"].astype(str)
     ty_active_item = (df[df["pos_quantity_this_year"] > 0]
                       .groupby("item_group", observed=True)["store_number"].nunique()
                       .rename("stores_ty").reset_index().rename(columns={"item_group": "item"}))
+    ty_active_item["item"] = ty_active_item["item"].astype(str)
     ly_active_item = (df[df["pos_quantity_last_year"] > 0]
                       .groupby("item_group", observed=True)["store_number"].nunique()
                       .rename("stores_ly").reset_index().rename(columns={"item_group": "item"}))
+    ly_active_item["item"] = ly_active_item["item"].astype(str)
     item_uspw = item_uspw.merge(ty_active_item, on="item", how="left")
     item_uspw = item_uspw.merge(ly_active_item, on="item", how="left")
     item_uspw["stores_ty"] = item_uspw["stores_ty"].fillna(0).astype(int)
