@@ -1,4 +1,5 @@
-# Builds the durable dashboard data snapshot and commits it to the repo.
+# Builds the durable dashboard data snapshot and publishes it to the
+# `snapshot-data` branch as a single force-pushed commit.
 #
 # Why: Streamlit Community Cloud discards the app's in-memory @st.cache_data
 # whenever the process restarts (sleep, redeploy, recycle). Without a durable
@@ -7,9 +8,14 @@
 #
 # The dashboard's service-account key is read-only, so we can't write a snapshot
 # back into BigQuery. Instead this job runs the same read-only queries and
-# commits the results as parquet files under snapshot_data/. The committed push
-# also triggers a fresh Streamlit redeploy, so by the morning the app is serving
-# from the snapshot on disk. Pair with refresh.yml (keep-awake pings).
+# publishes the results as parquet files on the `snapshot-data` branch — NOT the
+# deploy branch. Committing them to main grew the repo's history ~3.5 MB/day
+# without bound and triggered a full Streamlit redeploy on every build
+# (restarting the container and dumping its warm cache right before the morning
+# visit). The orphan branch keeps exactly one commit, so the repo stays small
+# and deploys never churn; the app downloads the files from the branch's raw
+# URL on a cache miss (see snapshot.py) and falls back to a live query if
+# anything is missing. Pair with refresh.yml (keep-awake pings).
 #
 # Required repo secrets (Settings -> Secrets and variables -> Actions):
 #   GCP_SERVICE_ACCOUNT_JSON  the full service-account JSON (the same read-only
@@ -34,7 +40,7 @@ on:
     - cron: '17,47 12-15 * * *'   # 6:17/6:47..9:17/9:47am CST (UTC-6)
   workflow_dispatch:           # manual trigger from the Actions tab
 
-# Needed so the job can commit the refreshed snapshot back to the repo.
+# Needed so the job can force-push the snapshot-data branch.
 permissions:
   contents: write
 
@@ -56,22 +62,42 @@ jobs:
         # Same pins as the app so the snapshot serializes/deserializes identically.
         run: pip install -r requirements.txt
 
+      - name: Restore previous snapshot (for build gating / change detection)
+        # snapshot_build.py gates the rebuild on the store feed's max
+        # business_date actually advancing past the previous build's, so the
+        # prior snapshot must be on disk first. /tmp/snapprev keeps a pristine
+        # copy for the publish step's "did anything change?" check.
+        run: |
+          mkdir -p snapshot_data /tmp/snapprev
+          if git fetch --depth 1 origin snapshot-data; then
+            git archive FETCH_HEAD | tar -x -C snapshot_data
+            cp -a snapshot_data/. /tmp/snapprev/
+          else
+            echo "No snapshot-data branch yet; the first build will create it."
+          fi
+
       - name: Build snapshot
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
         run: python snapshot_build.py
 
-      - name: Commit snapshot if it changed
+      - name: Publish snapshot-data branch (single commit, force-pushed)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          # built_at.txt is only rewritten when some file's content actually
+          # changed, so it doubles as the cheap "anything to publish?" check
+          # (the business_date gate's skip path leaves it untouched).
+          if [ -f /tmp/snapprev/built_at.txt ] && cmp -s /tmp/snapprev/built_at.txt snapshot_data/built_at.txt; then
+            echo "Snapshot unchanged; nothing to publish."
+            exit 0
+          fi
+          cd snapshot_data
+          rm -rf .git
+          git init -q -b snapshot-data
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add snapshot_data
-          if git diff --cached --quiet; then
-            echo "No snapshot changes; nothing to commit."
-          else
-            git commit -m "Update dashboard snapshot"
-            # Rebase on any concurrent change before pushing, then retry once.
-            git pull --rebase origin "${GITHUB_REF_NAME}" || true
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          fi
+          git add -A
+          git commit -q -m "Dashboard snapshot $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:snapshot-data

@@ -33,6 +33,7 @@ Every secondary loader is fault-tolerant: a schema mismatch or auth issue
 on one source produces a section-local warning rather than a page crash.
 """
 
+import io
 import json
 import logging
 from datetime import datetime, timedelta
@@ -161,6 +162,15 @@ logger = logging.getLogger("funpop_dashboard")
 # and pulls live — used by the sidebar "Refresh data" button.
 _FORCE_LIVE_REFRESH = False
 
+# If the repo is ever made private, the raw-URL snapshot downloads need a
+# token; allow one via secrets without a code change. Public repo: leave unset.
+try:
+    _snap_token = st.secrets.get("snapshot_remote_token", "")
+    if _snap_token:
+        snapshot.SNAPSHOT_REMOTE_TOKEN = _snap_token
+except Exception:  # noqa: BLE001 - secrets file may be absent locally
+    pass
+
 
 def _section_error(label: str, err: object) -> None:
     """Log the real error server-side and show viewers a generic note.
@@ -199,7 +209,38 @@ def _run_query(sql, params=None):
     return client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=False)
 
 
-def _cached_query(sql_filename: str, params=None) -> pd.DataFrame:
+def _standard_lookback(d) -> int:
+    """The Standard view's rolling lookback for date ``d`` (Central): 4 full
+    Walmart weeks (Sat-Fri) + days into the current week. The +1 keeps today's
+    date inside the ``bus_dt >= today - lookback`` filter even though the feed
+    lags a day, so the window starts exactly on the right Saturday. Mirrored by
+    snapshot_build.lookback_for_today so the snapshot key matches."""
+    return 27 + ((d.weekday() - 5) % 7) + 1
+
+
+def _read_prior_day_snapshot(sql_filename: str, params):
+    """Early-morning snapshot fallback. The snapshot key embeds the day's
+    Standard lookback, which changes at midnight Central — but the matching
+    parquet isn't published until the ~6-9am build runs. Without this, every
+    visit between midnight and the build paid the full live multi-query load.
+    Yesterday's still-fresh snapshot is what a live pull would return anyway
+    until the feed lands (~7am), so serve it instead. Restricted to before 8am
+    (after that, live is plausibly fresher) and to the rolling Standard
+    lookback — a custom slider value never remaps to a different key."""
+    now = datetime.now(CENTRAL_TZ)
+    if now.hour >= 8:
+        return None
+    lb = next((p for p in params if getattr(p, "name", "") == "lookback_days"), None)
+    if lb is None or lb.value != _standard_lookback(now.date()):
+        return None
+    prior_lb = _standard_lookback(now.date() - timedelta(days=1))
+    alt = [bigquery.ScalarQueryParameter("lookback_days", "INT64", prior_lb)
+           if getattr(p, "name", "") == "lookback_days" else p
+           for p in params]
+    return snapshot.read_snapshot(snapshot.snapshot_key(sql_filename, alt))
+
+
+def _cached_query(sql_filename: str, params=None, meta: dict | None = None) -> pd.DataFrame:
     """Fetch a query result, preferring the durable BigQuery snapshot written
     by snapshot_build.py (run on a schedule by GitHub Actions) over a live pull.
 
@@ -210,16 +251,25 @@ def _cached_query(sql_filename: str, params=None) -> pd.DataFrame:
     miss/staleness/error falls through to a live query, so behaviour is never
     worse than a direct pull.
 
+    When ``meta`` is given, meta["source"] is set to "snapshot" or "live" so
+    the caller can report where the data actually came from.
+
     The sidebar "Refresh data" button sets _force_live_refresh so it bypasses
     the snapshot and still confirms the very latest data."""
     params = params or []
     if not _FORCE_LIVE_REFRESH:
         try:
             df = snapshot.read_snapshot(snapshot.snapshot_key(sql_filename, params))
+            if df is None:
+                df = _read_prior_day_snapshot(sql_filename, params)
             if df is not None:
+                if meta is not None:
+                    meta["source"] = "snapshot"
                 return df
         except Exception as e:  # noqa: BLE001 - snapshot is best-effort
             logger.warning("snapshot lookup skipped for %s: %s", sql_filename, e)
+    if meta is not None:
+        meta["source"] = "live"
     return _run_query(_load_sql(sql_filename), params)
 
 
@@ -232,13 +282,22 @@ def _cached_query(sql_filename: str, params=None) -> pd.DataFrame:
 # the current view (plus a couple of recent ones) and evicts the rest.
 @st.cache_data(ttl=86400, max_entries=3, show_spinner="Loading store data...")
 def load_store_data(lookback_days: int, refresh_slot: str = "") -> pd.DataFrame:
+    meta = {}
     df = _cached_query("store_query.sql", [
         bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
         bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
-    ])
-    # Record the wall-clock time of this BQ fetch. Only executes on cache miss,
-    # so this is the actual "last refresh" stamp.
-    _freshness_state()["last_refresh_at"] = datetime.now(CENTRAL_TZ).isoformat()
+    ], meta=meta)
+    # Record what this cache miss actually did: a live BigQuery pull is stamped
+    # "now", but a snapshot read is stamped with the snapshot's own build time —
+    # the header must never claim a fresh pull for hours-old snapshot data.
+    state = _freshness_state()
+    if meta.get("source") == "snapshot":
+        built = snapshot.built_at()
+        state["last_refresh_at"] = built.isoformat() if built else None
+        state["last_refresh_source"] = "snapshot"
+    else:
+        state["last_refresh_at"] = datetime.now(CENTRAL_TZ).isoformat()
+        state["last_refresh_source"] = "live pull"
     # Normalise + shrink dtypes. This is the dashboard's heaviest frame (~544k
     # rows): a raw BigQuery read boxes its NUMERIC columns as Python Decimals and
     # balloons to ~375 MB, so this step both halves the cached footprint (keeping
@@ -435,14 +494,18 @@ def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
 @st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
 def load_store_directory(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     # Prefer the static committed directory: addresses don't change, so the
-    # snapshot job builds it once and commits it, and the app reads it straight
-    # from disk — no live query on cold start. It is read directly (not via the
-    # freshness-gated snapshot reader) because a stale address is still correct.
+    # snapshot job builds it once and publishes it (local file in a dev
+    # checkout, snapshot-data branch in deployment) — no live query on cold
+    # start. It is read directly (not via the freshness-gated snapshot reader)
+    # because a stale address is still correct.
     try:
         if store_directory.DIRECTORY_PATH.exists():
             df = pd.read_parquet(store_directory.DIRECTORY_PATH)
-            if not df.empty:
-                return store_directory.clean_directory_df(df), None
+        else:
+            raw = snapshot.fetch_remote(store_directory.DIRECTORY_PATH.name)
+            df = pd.read_parquet(io.BytesIO(raw)) if raw is not None else pd.DataFrame()
+        if not df.empty:
+            return store_directory.clean_directory_df(df), None
     except Exception as e:  # noqa: BLE001 - a bad file must fall back to live
         logger.warning("store directory snapshot read failed: %s", e)
     # Fallback: build it live (until the snapshot job has committed the file).
@@ -579,20 +642,16 @@ with st.sidebar:
     if view_mode == "Standard (4 full weeks + current)":
         # Walmart fiscal week = Saturday-Friday.
         # weekday(): Monday=0..Sunday=6, so Saturday=5.
-        # Days since the most recent Saturday (start of current WM week):
         _today_central = datetime.now(CENTRAL_TZ).date()
         _days_since_sat = (_today_central.weekday() - 5) % 7  # 0 on a Saturday
-        _days_into_current = _days_since_sat + 1               # +1 to include today
-        # Window must start on the Saturday 4 weeks before the current WM week.
-        # The BQ filter is `bus_dt >= today - lookback`, so:
-        #   lookback = 27 + days_into_current
-        #            = 28 full-week days + (days_into_current - 1) elapsed days.
-        # (Using 28 + days_into_current pulled one extra day, creating a stray
-        #  1-day partial week at the left edge of the weekly charts.)
-        lookback = 27 + _days_into_current
+        # Window starts on the Saturday 4 weeks before the current WM week;
+        # see _standard_lookback for the formula. Because the feed lags a day,
+        # the window holds exactly `lookback` days of data: 28 for the 4 full
+        # weeks + `_days_since_sat` of the current week.
+        lookback = _standard_lookback(_today_central)
         st.caption(
-            f"📅 Showing **4 full Walmart weeks + {_days_into_current} day(s)** "
-            f"into the current week ({lookback + 1} calendar days)"
+            f"📅 Showing **4 full Walmart weeks + {_days_since_sat} day(s)** "
+            f"of the current week ({lookback} calendar days)"
         )
     else:
         lookback = st.slider(
@@ -634,12 +693,21 @@ if df_all.empty:
     )
     st.stop()
 
-# Apply item filter
-df = df_all[df_all["walmart_item_number"].isin(item_filter)].copy()
+# Apply item filter. st.cache_data hands back a fresh copy of df_all on every
+# run, so the Total view (a no-op filter — the query is already restricted to
+# ACTIVE_ITEMS) can use it directly; only a real subset needs its own copy.
+# Skipping the redundant copy avoids duplicating the heaviest frame in memory.
+if item_view == "Total (all items)":
+    df = df_all
+else:
+    df = df_all[df_all["walmart_item_number"].isin(item_filter)].copy()
 # Coarse display group (Bins = Full + Half) for the per-item breakouts that
 # shouldn't split the two bin packs. Carried into df_window via its slices.
-df["item_group"] = df["walmart_item_number"].map(item_group_label)
-dc_df = dc_df_all[dc_df_all["walmart_item_number"].isin(item_filter)].copy() if not dc_df_all.empty else dc_df_all
+# Stored as category: as plain object strings this column alone is ~15 MB
+# across the full frame.
+df["item_group"] = df["walmart_item_number"].map(item_group_label).astype("category")
+dc_df = (dc_df_all if dc_df_all.empty or item_view == "Total (all items)"
+         else dc_df_all[dc_df_all["walmart_item_number"].isin(item_filter)])
 
 if df.empty:
     st.warning("No data matches the current item filter.")
@@ -649,14 +717,14 @@ most_recent = df["business_date"].max()
 period_days = max(1, df["business_date"].dt.normalize().nunique())
 weeks_in_period = max(1 / 7, period_days / 7)
 
-# Compute the performance window slice
+# Compute the performance window slice (read-only views — no copy needed)
 if perf_window == "Most recent day":
-    df_window = df[df["business_date"] == most_recent].copy()
+    df_window = df[df["business_date"] == most_recent]
     window_label = f"Day of {most_recent.strftime('%b %d, %Y')}"
     weeks_in_window = 1 / 7
 elif perf_window == "Last 7 days":
     cutoff_7d = most_recent - timedelta(days=6)
-    df_window = df[df["business_date"] >= cutoff_7d].copy()
+    df_window = df[df["business_date"] >= cutoff_7d]
     window_label = f"Last 7 days ({cutoff_7d.strftime('%b %d')}–{most_recent.strftime('%b %d')})"
     weeks_in_window = 1.0
 else:
@@ -680,6 +748,7 @@ elif days_behind > 1:
     freshness_note = f" ⚠️ {days_behind} days behind"
 
 last_refresh_iso = _freshness_state().get("last_refresh_at")
+last_refresh_source = _freshness_state().get("last_refresh_source")
 if last_refresh_iso:
     try:
         last_refresh_dt = datetime.fromisoformat(last_refresh_iso)
@@ -687,6 +756,10 @@ if last_refresh_iso:
         if last_refresh_dt.tzinfo is None:
             last_refresh_dt = last_refresh_dt.replace(tzinfo=CENTRAL_TZ)
         last_refresh_str = last_refresh_dt.astimezone(CENTRAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")
+        if last_refresh_source:
+            # "snapshot" = stamped with the scheduled build's own time, not the
+            # moment it was read — so the stamp is honest either way.
+            last_refresh_str += f" ({last_refresh_source})"
     except Exception:
         last_refresh_str = "unknown"
 else:
@@ -804,7 +877,7 @@ with tab_overview:
     st.subheader("Last 10 days — daily detail")
 
     cutoff_10d = most_recent - timedelta(days=9)
-    last10 = df[df["business_date"] >= cutoff_10d].copy()
+    last10 = df[df["business_date"] >= cutoff_10d]
 
     daily = last10.groupby("business_date", as_index=False).agg(
         units_ty=("pos_quantity_this_year", "sum"),
@@ -853,17 +926,20 @@ with tab_overview:
     st.subheader(f"Item performance — {window_label}")
 
     # On-hand uses each item's own latest snapshot date, then rolls up to the
-    # display group (Bins = Full on-hand + Half on-hand).
-    latest_per_item = df.groupby("walmart_item_number")["business_date"].max().to_dict()
+    # display group (Bins = Full on-hand + Half on-hand). Single masked pass
+    # instead of re-slicing the frame once per item.
+    _latest_mask = (df.groupby("walmart_item_number")["business_date"].transform("max")
+                    == df["business_date"])
+    _oh_by_item = df[_latest_mask].groupby("walmart_item_number")[
+        "store_on_hand_quantity_this_year"].sum()
     group_oh = {}
     group_items = {}
-    for item, item_max in latest_per_item.items():
-        snap = df[(df["walmart_item_number"] == item) & (df["business_date"] == item_max)]
-        g = item_group_label(item)
-        group_oh[g] = group_oh.get(g, 0) + int(snap["store_on_hand_quantity_this_year"].sum())
+    for item, oh in _oh_by_item.items():
+        g = item_group_label(int(item))
+        group_oh[g] = group_oh.get(g, 0) + int(oh)
         group_items.setdefault(g, []).append(int(item))
 
-    item_perf = df_window.groupby("item_group", as_index=False).agg(
+    item_perf = df_window.groupby("item_group", as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
         sales_ty=("pos_sales_this_year", "sum"),
@@ -873,7 +949,7 @@ with tab_overview:
     item_perf["on_hand"] = item_perf["item"].map(group_oh).fillna(0).astype(int)
     item_perf["yoy_pct"] = _yoy_pct(item_perf["units_ty"], item_perf["units_ly"])
     item_perf["yoy_units"] = item_perf["units_ty"] - item_perf["units_ly"]
-    full_units_per_group = df.groupby("item_group")["pos_quantity_this_year"].sum()
+    full_units_per_group = df.groupby("item_group", observed=True)["pos_quantity_this_year"].sum()
     item_perf["wos_units_ty"] = item_perf["item"].map(full_units_per_group).fillna(0)
     item_perf["wos"] = np.where(item_perf["wos_units_ty"] > 0,
         (item_perf["on_hand"] / (item_perf["wos_units_ty"] / weeks_in_period)).round(1), np.inf)
@@ -909,14 +985,17 @@ with tab_overview:
     oos_daily["in_stock_pct"] = (100 - oos_daily["oos_pct"]).round(1)
 
     # ── Estimated lost sales from stockouts (last 7 days) ────────────────────
-    # For every OOS store-day in the last 7 days, credit the store's OWN recent
-    # average daily velocity (only stores that have demonstrated they sell, so we
-    # never invent demand for a store that wouldn't have moved product anyway),
-    # priced at the blended average unit retail. Conservative by construction: a
-    # store OOS the entire window has no selling days and contributes nothing.
+    # For every OOS store-day in the last 7 days, credit the store's OWN average
+    # daily velocity over the window (so we never invent demand for a store that
+    # wouldn't have moved product anyway), priced at the blended average unit
+    # retail. Conservative by construction: a store with no sales in the window
+    # has zero velocity and contributes nothing.
     recent_cut7 = most_recent - timedelta(days=6)
-    store_vel = (df[df["pos_quantity_this_year"] > 0]
-                 .groupby("store_number")["pos_quantity_this_year"].mean())
+    # True average daily velocity per store: window units ÷ window data days
+    # (zero-sale days included). A per-row mean here would average
+    # store-day-item rows — not a daily figure, and it undercounts multi-item
+    # stores. Stores with no sales get 0 and contribute nothing — conservative.
+    store_vel = df.groupby("store_number")["pos_quantity_this_year"].sum() / period_days
     _units_all = float(df["pos_quantity_this_year"].sum())
     _sales_all = float(df["pos_sales_this_year"].sum())
     blended_aur = (_sales_all / _units_all) if _units_all else 0.0
@@ -938,9 +1017,10 @@ with tab_overview:
             oos_delta = int(latest_oos["oos_stores"] - week_ago["oos_stores"])
             st.metric("Est. lost sales (last 7 days)", f"${lost_sales_7d:,.0f}",
                       delta=f"≈ {lost_units_7d:,.0f} units", delta_color="off",
-                      help="Sum over OOS store-days of each store's own recent avg "
-                           "daily velocity, priced at the blended unit retail. "
-                           "Conservative — never credits demand a store hasn't shown.")
+                      help="Sum over OOS store-days of each store's own average "
+                           "daily velocity (window units ÷ days), priced at the "
+                           "blended unit retail. Conservative — never credits "
+                           "demand a store hasn't shown.")
             st.metric("Stores OOS today", f"{int(latest_oos['oos_stores']):,}",
                       delta=f"{oos_delta:+,} vs week ago", delta_color="inverse")
             st.metric("In-stock % today", f"{latest_oos['in_stock_pct']:.1f}%",
@@ -1240,15 +1320,15 @@ with tab_sales:
     # either pack (not the sum of the per-pack store counts, which would
     # double-count stores selling both).
     st.markdown("**U/S/W by item (period total)**")
-    item_uspw = df.groupby("item_group", as_index=False).agg(
+    item_uspw = df.groupby("item_group", as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
     ).rename(columns={"item_group": "item"})
     ty_active_item = (df[df["pos_quantity_this_year"] > 0]
-                      .groupby("item_group")["store_number"].nunique()
+                      .groupby("item_group", observed=True)["store_number"].nunique()
                       .rename("stores_ty").reset_index().rename(columns={"item_group": "item"}))
     ly_active_item = (df[df["pos_quantity_last_year"] > 0]
-                      .groupby("item_group")["store_number"].nunique()
+                      .groupby("item_group", observed=True)["store_number"].nunique()
                       .rename("stores_ly").reset_index().rename(columns={"item_group": "item"}))
     item_uspw = item_uspw.merge(ty_active_item, on="item", how="left")
     item_uspw = item_uspw.merge(ly_active_item, on="item", how="left")
@@ -1403,9 +1483,9 @@ with tab_forecast:
     elif fcst_df.empty:
         st.info("No forecast records returned for the selected items and lookback window.")
     else:
-        fc = fcst_df[fcst_df["walmart_item_number"].isin(item_filter)].copy()
+        fc = fcst_df[fcst_df["walmart_item_number"].isin(item_filter)]
         # Actuals lag ~1 day, so "upcoming" = forecast dated after the latest actual.
-        future = fc[fc["forecast_date"] > most_recent].copy()
+        future = fc[fc["forecast_date"] > most_recent]
         horizon_days = int((future["forecast_date"].max() - most_recent).days) if not future.empty else 0
 
         # Recent run-rate from actuals (last 7 data days) — the baseline we compare against.
@@ -1989,14 +2069,13 @@ with tab_inv:
     elif br_df.empty:
         st.info("No backroom adjustment records in window.")
     else:
-        br_filt = br_df[br_df["walmart_item_number"].isin(item_filter)].copy()
+        br_filt = br_df[br_df["walmart_item_number"].isin(item_filter)]
         if br_filt.empty:
             st.info("No adjustments for the selected items.")
         else:
             # Daily total adjustment volume and net direction
             br_daily = br_filt.groupby("adjustment_date", as_index=False).agg(
                 net_adj=("adjustment_qty_ty", "sum"),
-                abs_adj=("adjustment_qty_ty", lambda s: s.abs().sum()),
                 stores_affected=("store_number", "nunique"),
             ).sort_values("adjustment_date")
 
@@ -2122,7 +2201,7 @@ with tab_channels:
     elif omni_df.empty:
         st.info("No omni sales records.")
     else:
-        omni_filt = omni_df[omni_df["walmart_item_number"].isin(item_filter)].copy()
+        omni_filt = omni_df[omni_df["walmart_item_number"].isin(item_filter)]
 
         omni_total_ty = float(omni_filt["units_ty"].sum())
         omni_total_ly = float(omni_filt["units_ly"].sum())
@@ -2196,7 +2275,7 @@ with tab_channels:
     elif ecom_df.empty:
         st.info("No eComm inventory records.")
     else:
-        ecom_filt = ecom_df[ecom_df["walmart_item_number"].isin(item_filter)].copy()
+        ecom_filt = ecom_df[ecom_df["walmart_item_number"].isin(item_filter)]
         latest_ecom = ecom_filt["report_date"].max() if not ecom_filt.empty else None
         if latest_ecom is not None:
             ecom_snap = ecom_filt[ecom_filt["report_date"] == latest_ecom]
@@ -2321,7 +2400,14 @@ with tab_dist:
     elif mod_df.empty:
         st.info("No modular plan records returned.")
     else:
-        mod_filt = mod_df[mod_df["walmart_item_number"].isin(item_filter)].copy()
+        mod_filt = mod_df[mod_df["walmart_item_number"].isin(item_filter)]
+        # Planogram universe = currently-valid placements only. The query keeps
+        # the validity flag; rows explicitly marked invalid would otherwise
+        # overstate "In plan" (and understate coverage).
+        if "item_valid_flag" in mod_filt.columns:
+            _invalid = (mod_filt["item_valid_flag"].astype(str).str.strip().str.lower()
+                        .isin(["n", "no", "0", "false", "f"]))
+            mod_filt = mod_filt[~_invalid]
         if mod_filt.empty:
             st.info("No modular plans for selected items.")
         else:
@@ -2444,7 +2530,8 @@ with tab_actions:
         scope_items = list(BIN_ITEMS)
     else:
         scope_items = list(SHELF_ITEMS)
-    dfa = df_all[df_all["walmart_item_number"].isin(scope_items)].copy()
+    dfa = (df_all if scope == "All items"
+           else df_all[df_all["walmart_item_number"].isin(scope_items)])
 
     if dfa.empty:
         st.info("No store data for the selected item scope.")
@@ -2585,9 +2672,12 @@ with tab_actions:
                 issues.append("Holding on-hand stock but no sales in the lookback — stock may be stranded / never set on the floor")
                 sev = max(sev, 2)
                 lost = max(lost, peer_med_day * 7)
-            # E. Chronic OOS with supply available upstream.
+            # E. Chronic OOS with supply available upstream (or proven LY demand).
             if r["oos_days"] >= 5 and (r["in_warehouse"] > 0 or r["in_transit"] > 0 or r["units_7d_ly"] >= 3):
-                issues.append(f"Out of stock {int(r['oos_days'])} of 7 days with replenishment available (in back room / in transit)")
+                why = ("replenishment available (in back room / in transit)"
+                       if (r["in_warehouse"] > 0 or r["in_transit"] > 0)
+                       else f"LY demand of {int(r['units_7d_ly'])} units this week")
+                issues.append(f"Out of stock {int(r['oos_days'])} of 7 days despite {why}")
                 sev = max(sev, 2)
                 lost = max(lost, r["expected_daily"] * r["oos_days"])
             # F. Underperforming vs comparable stores.
@@ -2639,7 +2729,7 @@ Only problems a **rep can physically fix in the store** are flagged:
 | **Idle backroom stock** | No recent sales while units sit in the store's back room | 🔴 High |
 | **Declining vs normal** | Recent daily rate ≥ {decline_drop}% below the store's run-rate, with stock | 🔴 ≥70% · 🟠 ≥40% · 🟡 ≥{decline_drop}% |
 | **Stuck stock** | Holding on-hand stock but no sales anywhere in the lookback | 🟠 Medium |
-| **Chronic OOS w/ supply** | Out of stock ≥ 5 of 7 days while replenishment is available | 🟠 Medium |
+| **Chronic OOS w/ supply** | Out of stock ≥ 5 of 7 days with replenishment available (or proven LY demand) | 🟠 Medium |
 | **Underperforming vs peers** | Established, stocked store selling under 25% of the peer daily rate | 🟡 Low |
 
 **Ranking** — stores sort by estimated **lost units per week**: the gap between the store's expected

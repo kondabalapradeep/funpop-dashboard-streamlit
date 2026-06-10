@@ -6,4 +6,4 @@ SELECT
   COALESCE(fcst_tot_dmand_each_qty, 0) AS forecast_quantity
 FROM `{project}.{dataset}.daily_demand_forecast`
 WHERE wm_item_nbr IN UNNEST(@active_items)
-  AND fcst_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+  AND fcst_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)

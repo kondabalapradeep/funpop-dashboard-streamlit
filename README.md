@@ -9,14 +9,17 @@ A Streamlit app that pulls live data from BigQuery using your service-account JS
 | File | What it is |
 |---|---|
 | `streamlit_app.py` | The Streamlit app — auth, BQ queries, UI rendering. |
-| `funpop_core.py` | Original data-prep logic, reused unchanged (HTML template is in here too but unused). |
+| `constants.py` | Item IDs, Full/Half/Shelf labels, case-pack sizes (single source of truth, verified against the feed's own item names). |
+| `transforms.py` | Dtype-shrinking transforms shared by the app and the snapshot builder. |
+| `snapshot.py` / `snapshot_build.py` | Durable query-result snapshot: built on a schedule, published to the `snapshot-data` branch, read by the app on cold start. |
+| `store_directory.py` | Builds the static store mailing-address directory for the Store Actions export. |
 | `sql/store_query.sql` | The store JOIN query. |
 | `sql/dc_query.sql` | The DC query. |
 | `sql/forecast_query.sql` | Daily demand-forecast query (powers the Forecast tab). |
 | `sql/dc_alignment_query.sql` | Store→DC alignment (rolls store forecast up to DCs). |
 | `requirements.txt` | Python deps. |
 | `.streamlit/secrets.toml.example` | Template — copy locally to `secrets.toml`, paste into Streamlit Cloud's UI for production. |
-| `.gitignore` | Keeps `secrets.toml` and `*.json` out of git. |
+| `.gitignore` | Keeps `secrets.toml`, `*.json`, and `snapshot_data/` out of git. |
 
 ---
 
@@ -76,7 +79,7 @@ You get a URL like `https://funpop-dashboard.streamlit.app` — that's what you 
 Several layers, mostly automatic:
 
 1. **In-app cache + hourly auto-refresh** — the BQ loaders are wrapped in `@st.cache_data` keyed by a time slot that advances every hour from 6am Central. Each new hour triggers a fresh pull until the day's data lands; once confirmed fresh, the slot locks to `today_done` and no more pulls happen that day.
-2. **Durable snapshot (so cold loads are instant)** — Streamlit Community Cloud throws away the in-memory cache whenever the app process restarts (sleep, redeploy, recycle). A scheduled GitHub Actions job (`.github/workflows/snapshot.yml` → `snapshot_build.py`) runs every dashboard query and commits the results as parquet files under `snapshot_data/`. On a cold start the app reads those files (fast) instead of re-running the heavy joins. Any snapshot miss/staleness/error silently falls back to a live query, so the app is never *worse* than a direct pull. The service-account key only needs **read** access — nothing is written back to BigQuery.
+2. **Durable snapshot (so cold loads are instant)** — Streamlit Community Cloud throws away the in-memory cache whenever the app process restarts (sleep, redeploy, recycle). A scheduled GitHub Actions job (`.github/workflows/snapshot.yml` → `snapshot_build.py`) runs every dashboard query and publishes the results as parquet files on the **`snapshot-data` branch** (a single force-pushed commit, so the repo's history never grows and snapshot updates never trigger an app redeploy). On a cold start the app downloads those files from the branch's raw URL (fast, ~3.5 MB total) instead of re-running the heavy joins. Any snapshot miss/staleness/error silently falls back to a live query, so the app is never *worse* than a direct pull. The service-account key only needs **read** access — nothing is written back to BigQuery.
 3. **Keep-awake pings** — `.github/workflows/refresh.yml` loads the app in a headless browser in a tight cluster around 8am Central, so the container is awake and warmed from the snapshot when you open it in the morning.
 4. **Manual button** — the sidebar "Refresh data" button clears the cache and bypasses the snapshot to force a live pull. Use it to confirm the very latest data.
 
@@ -91,7 +94,7 @@ The snapshot builder runs in GitHub Actions, so it needs its own copy of the rea
 
 That's it — no BigQuery write access or GCP console changes are required. After adding the secrets, open the **Actions** tab → **Build dashboard snapshot** → **Run workflow** to build the first snapshot and confirm it succeeds.
 
-> The job commits a small `snapshot_data/` folder to the repo each time the data changes (≈ once a day, when the feed lands). That commit also redeploys the app with the fresh snapshot baked in. If you ever want to stop it, disable the **Build dashboard snapshot** workflow.
+> The job force-pushes a small `snapshot_data` set to the `snapshot-data` branch each time the data changes (≈ once a day, when the feed lands). That branch always holds exactly one commit, so the repo stays small and the app is **not** redeployed by snapshot updates. If you ever want to stop it, disable the **Build dashboard snapshot** workflow.
 
 ---
 
@@ -106,18 +109,9 @@ That's it — no BigQuery write access or GCP console changes are required. Afte
 - DC analysis section (KPIs, critical/overstock callouts, full table) — appears only if DC query returns data
 - **Store Actions tab** — flags stores with a *physically rep-fixable* problem and lets you **download a CSV dispatch list** (store number, address, city, state, zip + priority/issue) to hand to a field-service company. To react fast without chasing daily noise on low-volume SKUs, it compares each store's **recent 3-day** selling rate against its own **trailing ~21-day run-rate** (a stable baseline), plus a velocity-scaled *"went dark"* check that flags a stocked store the moment its expected lost units (normal rate × silent days) cross a floor — so a brisk seller is caught after ~1 silent day, a slow seller only after a longer gap. Flags: went dark, idle backroom stock, declining vs normal (severity scales with the drop), stuck stock, chronic out-of-stock with supply available, and underperformance vs peers. Stores are ranked by estimated lost units/week. The tab has its own **item scope** control (all items / both bins / shelf only) so it works independently of the sidebar filter, and the on-hand / decline / "went dark" thresholds are adjustable. Addresses come from a **static store directory** built once by the snapshot job (`store_directory.py` introspects `store_dim`'s columns, so it auto-adapts to the dataset's actual address/zip names) and committed as `snapshot_data/store_directory.parquet`; the app reads it straight from disk and only queries `store_dim` live as a fallback. If no address columns exist it degrades to store number + state.
 
-**Not yet included** (the original HTML dashboard had these — easy to add as additional Streamlit sections if you want them):
-- U/S/W weekly breakdown
-- Price-point migration cards
-- Retail performance by date / per-price tracking
-- Per-week composition trends (Up/Down/Zero/Flat by week)
-- Item filter "All / one item only" toggle pattern from the original (this version uses a multiselect)
-
-To add any of these: the data is already in the `data` dict returned by `compute_dashboard()` — just add a section that reads `data["uspw"]`, `data["summary"]`, etc., and renders it with `st.dataframe` or `st.bar_chart`. Use the existing sections as templates.
-
 ---
 
 ## Two ongoing reminders
 
 1. **The old GitHub token** (`ghp_dmQH...`) — revoke at github.com/settings/tokens if you haven't already. It's not used by this Streamlit version, but it's still exposed wherever the old script lives.
-2. **DC unit conversion** — same caveat as before: if DC on-hand numbers look way too small versus the CSV version, the BQ table is delivering warehouse packs, not eaches. Fix in `sql/dc_query.sql` by multiplying `ty_on_hand_whpk_qty` by `ty_whpk_each_qty`.
+2. **DC unit conversion** — the BQ table delivers warehouse packs, not eaches. The app converts packs→eaches using the feed's own per-row `ty_whpk_each_qty`, falling back to `constants.CASE_PACK_UNITS` where the feed has no pack size. If DC on-hand ever looks off by a large factor, check those two sources against each other.

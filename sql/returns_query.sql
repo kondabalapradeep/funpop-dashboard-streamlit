@@ -10,4 +10,4 @@ SELECT
   COALESCE(ly_rtn_sales_amt, 0)           AS return_sales_ly
 FROM `{project}.{dataset}.store_returns`
 WHERE wm_item_nbr IN UNNEST(@active_items)
-  AND rtn_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
+  AND rtn_dt >= DATE_SUB(CURRENT_DATE('America/Chicago'), INTERVAL @lookback_days DAY)

@@ -8,3 +8,8 @@ venv/
 # Streamlit secrets / service-account credentials — never commit
 .streamlit/secrets.toml
 *.json
+
+# Snapshot parquets live on the orphan `snapshot-data` branch (force-pushed by
+# .github/workflows/snapshot.yml), never on the deploy branch — committing them
+# here grew the repo's history ~3.5 MB/day and redeployed the app on every build.
+snapshot_data/
