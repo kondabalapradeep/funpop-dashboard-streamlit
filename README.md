@@ -101,6 +101,8 @@ That's it — no BigQuery write access or GCP console changes are required. Afte
 ## What's in the dashboard (and what's not)
 
 **Included in this scaffold:**
+- **Per-tab fragments** — every tab body runs as an `st.fragment`, so widgets inside a tab (scope radios, threshold sliders, the leaderboard search box) rerun only that tab's computations instead of all seven. Sidebar controls still rerun the whole page.
+- **Sidebar state filter** — scope the entire dashboard (Overview through Store Actions, including the dispatch export) to chosen states; DC sections stay network-wide because one DC serves stores in many states.
 - Period KPIs (units TY/LY, YOY, last-7-day rollup)
 - Last-7-days tracker table
 - 4-week daily trend chart

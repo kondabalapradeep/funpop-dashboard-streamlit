@@ -131,6 +131,7 @@ st.markdown(
             flex-wrap: wrap;
             gap: 0.75rem;
         }
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
         div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
             flex: 1 1 100% !important;
             min-width: 100% !important;
@@ -147,6 +148,19 @@ st.markdown(
         div[data-testid="stDataFrame"] {
             overflow-x: auto;
         }
+    }
+    /* KPI metrics as bordered cards — groups each number with its label/delta
+       so a strip of five reads as five tiles, not floating digits. Translucent
+       grey keeps it legible in both light and dark themes. */
+    div[data-testid="stMetric"] {
+        background-color: rgba(128, 128, 128, 0.06);
+        border: 1px solid rgba(128, 128, 128, 0.18);
+        border-radius: 10px;
+        padding: 0.6rem 0.9rem;
+    }
+    /* Long metric labels wrap instead of truncating with an ellipsis. */
+    div[data-testid="stMetric"] label {
+        white-space: normal;
     }
     </style>
     """,
@@ -693,6 +707,26 @@ if df_all.empty:
     )
     st.stop()
 
+# ─── Geography filter ────────────────────────────────────────────────────────
+# Rendered after the primary load because the option list comes from the data.
+# Scopes every store-level view (Overview through Store Actions) to the chosen
+# states; DC sections stay network-wide since one DC serves stores in many states.
+with st.sidebar:
+    st.divider()
+    _state_opts = sorted(df_all["state_or_province_code"].astype(str).unique())
+    state_sel = st.multiselect(
+        "States (empty = all)",
+        options=_state_opts,
+        default=[],
+        help="Scope the dashboard to specific states. DC sections remain "
+             "network-wide — a DC serves stores across several states.",
+    )
+if state_sel:
+    df_all = df_all[df_all["state_or_province_code"].isin(state_sel)].copy()
+    if df_all.empty:
+        st.warning("No store data for the selected states.")
+        st.stop()
+
 # Apply item filter. st.cache_data hands back a fresh copy of df_all on every
 # run, so the Total view (a no-op filter — the query is already restricted to
 # ACTIVE_ITEMS) can use it directly; only a real subset needs its own copy.
@@ -765,35 +799,40 @@ if last_refresh_iso:
 else:
     last_refresh_str = "not yet (cached)"
 
+_state_note = (f"  ·  {len(state_sel)} state{'s' if len(state_sel) != 1 else ''} selected"
+               if state_sel else "")
 st.caption(
     f"**Last refreshed:** {last_refresh_str}  ·  "
     f"**Data range:** {df['business_date'].min().strftime('%b %d, %Y')} – "
     f"{most_recent.strftime('%b %d, %Y')} ({period_days} data days){freshness_note}  ·  "
-    f"{df['store_number'].nunique():,} stores  ·  {item_view}"
-)
-st.caption(
-    f"Note: Walmart's BI Link feed runs on a 1-day lag — today's most recent "
-    f"data point is **{most_recent.strftime('%b %d')}** (yesterday Central). "
-    f"Auto-refresh runs hourly from 6am Central until new data lands."
+    f"{df['store_number'].nunique():,} stores  ·  {item_view}{_state_note}  \n"
+    f"Walmart's BI Link feed runs on a 1-day lag, so the most recent data point is "
+    f"**{most_recent.strftime('%b %d')}**. Auto-refresh runs hourly from 6am Central "
+    f"until new data lands."
 )
 
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
 tab_overview, tab_sales, tab_forecast, tab_inv, tab_channels, tab_dist, tab_actions = st.tabs([
-    "Overview",
-    "Sales & Velocity",
-    "Forecast",
-    "Inventory & DC",
-    "Channels",
-    "Distribution",
-    "Store Actions",
+    "📊 Overview",
+    "📈 Sales & Velocity",
+    "🔮 Forecast",
+    "📦 Inventory & DC",
+    "🛒 Channels",
+    "🗺️ Distribution",
+    "🚩 Store Actions",
 ])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 1 — OVERVIEW
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_overview:
+# Each tab body is an st.fragment: a widget inside a tab (scope radio, slider,
+# search box) reruns only that tab's code instead of recomputing all seven tabs'
+# aggregations over the ~544k-row frame — the difference between a sub-second
+# and a multi-second interaction. Sidebar widgets still trigger a full rerun.
+@st.fragment
+def _render_overview():
     # ── Executive alert strip ────────────────────────────────────────────────
     # Auto-generated "what changed" headlines so a GM gets the signal before the
     # detail. Everything here is derived from the store frame already in memory —
@@ -1067,7 +1106,8 @@ with tab_overview:
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 2 — SALES & VELOCITY
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_sales:
+@st.fragment
+def _render_sales():
     # ── Weekly sales trend ───────────────────────────────────────────────────
     st.subheader("Weekly sales trend")
 
@@ -1367,17 +1407,17 @@ with tab_sales:
     store_uspw["uspw_ty"] = (store_uspw["units_ty"] / weeks_in_period).round(1)
     store_uspw["uspw_ly"] = (store_uspw["units_ly"] / weeks_in_period).round(1)
 
-    def _bucket(v):
-        if v == 0: return "0 (none)"
-        if v < 1:  return "0-1"
-        if v < 3:  return "1-3"
-        if v < 5:  return "3-5"
-        if v < 10: return "5-10"
-        if v < 20: return "10-20"
-        return "20+"
     ORDER = ["0 (none)", "0-1", "1-3", "3-5", "5-10", "10-20", "20+"]
-    store_uspw["bucket_ty"] = store_uspw["uspw_ty"].apply(_bucket)
-    store_uspw["bucket_ly"] = store_uspw["uspw_ly"].apply(_bucket)
+
+    def _bucket_series(v: pd.Series) -> pd.Series:
+        """Vectorised U/S/W tier label (pd.cut beats a per-row apply here)."""
+        out = pd.cut(v, bins=[-np.inf, 1, 3, 5, 10, 20, np.inf], right=False,
+                     labels=ORDER[1:]).astype(object)
+        out[v == 0] = ORDER[0]
+        return out
+
+    store_uspw["bucket_ty"] = _bucket_series(store_uspw["uspw_ty"])
+    store_uspw["bucket_ly"] = _bucket_series(store_uspw["uspw_ly"])
     d_ty = store_uspw["bucket_ty"].value_counts().reindex(ORDER, fill_value=0).reset_index()
     d_ty.columns = ["bucket", "stores"]; d_ty["Period"] = "This Year"
     d_ly = store_uspw["bucket_ly"].value_counts().reindex(ORDER, fill_value=0).reset_index()
@@ -1403,7 +1443,7 @@ with tab_sales:
         "pos_quantity_this_year"].sum()
     sw["days"] = sw["walmart_calendar_week"].map(_days_map).fillna(7).clip(lower=1)
     sw["uspw"] = sw["pos_quantity_this_year"] * (7 / sw["days"])
-    sw["tier"] = sw["uspw"].apply(_bucket)
+    sw["tier"] = _bucket_series(sw["uspw"])
     heat = sw.groupby(["walmart_calendar_week", "tier"], as_index=False).size().rename(
         columns={"size": "stores"})
     heat["week_label"] = _wm_week_label(heat["walmart_calendar_week"])
@@ -1464,7 +1504,18 @@ with tab_sales:
          "yoy_units", "yoy_pct", "sales_ty", "on_hand", "wos"]].copy()
     full_tbl.columns = ["Store", "State", "Units TY", "Units LY", "YoY Units",
                         "YoY %", "Sales TY ($)", "On hand", "WOS"]
-    st.dataframe(full_tbl, width='stretch', hide_index=True, height=380, column_config={
+    lb_query = st.text_input(
+        "Find a store", "", key="lb_store_search",
+        placeholder="Store number (e.g. 1234) or state code (e.g. TX)",
+        help="Filters the table below. Leave empty to show every store.")
+    show_tbl = full_tbl
+    if lb_query.strip():
+        q = lb_query.strip().upper()
+        show_tbl = full_tbl[
+            full_tbl["Store"].astype(str).str.contains(q, regex=False)
+            | (full_tbl["State"].astype(str).str.upper() == q)]
+        st.caption(f"{len(show_tbl):,} of {len(full_tbl):,} stores match “{lb_query.strip()}”.")
+    st.dataframe(show_tbl, width='stretch', hide_index=True, height=380, column_config={
         "YoY %": st.column_config.NumberColumn(format="%.1f%%"),
         "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
         "WOS": st.column_config.NumberColumn(format="%.1f wks"),
@@ -1480,7 +1531,8 @@ with tab_sales:
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 3 — FORECAST
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_forecast:
+@st.fragment
+def _render_forecast():
     st.caption(
         "Walmart's daily demand forecast for your items — what's coming, how well actual "
         "sales have tracked it, and whether store shelves and DCs are positioned to cover it."
@@ -1781,7 +1833,8 @@ with tab_forecast:
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 4 — INVENTORY & DC
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_inv:
+@st.fragment
+def _render_inventory():
     # ── Inventory health at a glance ─────────────────────────────────────────
     st.subheader("Inventory health at a glance")
 
@@ -2197,7 +2250,8 @@ with tab_inv:
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 5 — CHANNELS (omni sales, ecom inventory, returns)
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_channels:
+@st.fragment
+def _render_channels():
     st.subheader("Omni-channel sales")
     st.caption(
         "Sales across all channels (in-store + pickup + ship-to-home + ship-from-store etc). "
@@ -2395,7 +2449,8 @@ with tab_channels:
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 6 — DISTRIBUTION
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_dist:
+@st.fragment
+def _render_distribution():
     # ── NEW: Modular coverage (distribution gap) ─────────────────────────────
     st.subheader("Modular coverage gap")
     st.caption(
@@ -2516,14 +2571,16 @@ with tab_dist:
 # ═══════════════════════════════════════════════════════════════════════════
 #   TAB 7 — STORE ACTIONS (field-intervention list + vendor export)
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_actions:
+@st.fragment
+def _render_actions():
     st.subheader("Stores flagged for an in-person visit")
     st.caption(
         "Surfaces stores with a **physically fixable** problem — product that should be "
         "selling but isn't — so you can dispatch a rep. Compares each store's **recent 3-day** rate "
         "against its own **trailing run-rate**, so it reacts within 1–3 days without chasing daily "
         "noise. Export the ranked list (with mailing address) to hand to the field-service company. "
-        "This tab has its own item scope below, so it works independently of the sidebar filter."
+        "This tab has its own item scope below (independent of the sidebar item filter); "
+        "the sidebar **state** filter still applies, so you can pull a regional dispatch list."
     )
 
     # This tab carries its own item scope (independent of the sidebar View) so a
@@ -2644,60 +2701,65 @@ with tab_actions:
         # Severity: 3 = High, 2 = Medium, 1 = Low. A store may trip several rules;
         # we keep the max severity, list every reason, and take the worst impact.
         def _classify(r):
+            """r is an itertuples row — attribute access over a plain tuple keeps
+            this loop ~10× faster than a per-row apply building a pd.Series,
+            which matters because every threshold-slider change re-runs it."""
             issues, sev, lost = [], 0, 0.0
-            has_stock = r["on_hand"] >= min_oh
-            established = r["baseline_units"] >= BASE_FLOOR
-            recent_zero = r["recent_units"] == 0
+            has_stock = r.on_hand >= min_oh
+            established = r.baseline_units >= BASE_FLOOR
+            recent_zero = r.recent_units == 0
             # A. Went dark — established seller, stocked, that has stopped selling.
             #    Keyed off the trailing zero-sale streak with a velocity-scaled gate:
             #    a brisk seller (where even one zero day is statistically rare) flags
             #    after ~1 silent day, a slow seller only after a longer gap.
             dark_fired = False
-            if (has_stock and r["baseline_units"] > 0 and r["dark_streak"] >= 1
-                    and r["baseline_daily"] * r["dark_streak"] >= dark_floor):
+            if (has_stock and r.baseline_units > 0 and r.dark_streak >= 1
+                    and r.baseline_daily * r.dark_streak >= dark_floor):
                 issues.append(
-                    f"Was selling ~{r['baseline_daily']:.1f}/day but 0 sales for the last "
-                    f"{int(r['dark_streak'])} day(s) with stock on hand — likely off the floor")
+                    f"Was selling ~{r.baseline_daily:.1f}/day but 0 sales for the last "
+                    f"{int(r.dark_streak)} day(s) with stock on hand — likely off the floor")
                 sev = max(sev, 3)
-                lost = max(lost, r["baseline_daily"] * 7)
+                lost = max(lost, r.baseline_daily * 7)
                 dark_fired = True
             # B. Idle backroom stock — units in the back, nothing selling.
-            if recent_zero and r["in_warehouse"] > 0:
-                issues.append(f"{r['in_warehouse']:.0f} units sitting in the store's back room with no recent sales")
+            if recent_zero and r.in_warehouse > 0:
+                issues.append(f"{r.in_warehouse:.0f} units sitting in the store's back room with no recent sales")
                 sev = max(sev, 3)
-                lost = max(lost, r["expected_daily"] * 7)
+                lost = max(lost, r.expected_daily * 7)
             # C. Declining vs its own normal run-rate (still selling, but down). Skipped
             #    when "went dark" already fired, so the two don't contradict each other.
             if (established and has_stock and not dark_fired and not recent_zero
-                    and r["recent_daily"] <= (1 - decline_drop / 100.0) * r["baseline_daily"]):
-                drop_pct = (1 - r["recent_daily"] / r["baseline_daily"]) * 100
+                    and r.recent_daily <= (1 - decline_drop / 100.0) * r.baseline_daily):
+                drop_pct = (1 - r.recent_daily / r.baseline_daily) * 100
                 issues.append(
                     f"Selling {drop_pct:.0f}% below its normal rate "
-                    f"({r['baseline_daily']:.1f}→{r['recent_daily']:.1f} units/day) despite stock")
+                    f"({r.baseline_daily:.1f}→{r.recent_daily:.1f} units/day) despite stock")
                 sev = max(sev, 3 if drop_pct >= 70 else 2 if drop_pct >= 40 else 1)
-                lost = max(lost, (r["baseline_daily"] - r["recent_daily"]) * 7)
+                lost = max(lost, (r.baseline_daily - r.recent_daily) * 7)
             # D. Stuck stock — holding stock but no movement anywhere in the lookback.
-            if has_stock and recent_zero and r["baseline_units"] == 0:
+            if has_stock and recent_zero and r.baseline_units == 0:
                 issues.append("Holding on-hand stock but no sales in the lookback — stock may be stranded / never set on the floor")
                 sev = max(sev, 2)
                 lost = max(lost, peer_med_day * 7)
             # E. Chronic OOS with supply available upstream (or proven LY demand).
-            if r["oos_days"] >= 5 and (r["in_warehouse"] > 0 or r["in_transit"] > 0 or r["units_7d_ly"] >= 3):
+            if r.oos_days >= 5 and (r.in_warehouse > 0 or r.in_transit > 0 or r.units_7d_ly >= 3):
                 why = ("replenishment available (in back room / in transit)"
-                       if (r["in_warehouse"] > 0 or r["in_transit"] > 0)
-                       else f"LY demand of {int(r['units_7d_ly'])} units this week")
-                issues.append(f"Out of stock {int(r['oos_days'])} of 7 days despite {why}")
+                       if (r.in_warehouse > 0 or r.in_transit > 0)
+                       else f"LY demand of {int(r.units_7d_ly)} units this week")
+                issues.append(f"Out of stock {int(r.oos_days)} of 7 days despite {why}")
                 sev = max(sev, 2)
-                lost = max(lost, r["expected_daily"] * r["oos_days"])
+                lost = max(lost, r.expected_daily * r.oos_days)
             # F. Underperforming vs comparable stores.
             if (not recent_zero and peer_med_day > 0 and has_stock and established
-                    and r["recent_daily"] < 0.25 * peer_med_day):
+                    and r.recent_daily < 0.25 * peer_med_day):
                 issues.append("Selling far below comparable stores (under 25% of the peer daily rate)")
                 sev = max(sev, 1)
-                lost = max(lost, (peer_med_day - r["recent_daily"]) * 7)
-            return pd.Series({"severity": sev, "issues": "  •  ".join(issues), "lost_units": round(lost)})
+                lost = max(lost, (peer_med_day - r.recent_daily) * 7)
+            return sev, "  •  ".join(issues), round(lost)
 
-        s[["severity", "issues", "lost_units"]] = s.apply(_classify, axis=1)
+        _results = [_classify(r) for r in s.itertuples(index=False)]
+        s["severity"], s["issues"], s["lost_units"] = (
+            zip(*_results) if _results else ((), (), ()))
         s["lost_units"] = pd.to_numeric(s["lost_units"], errors="coerce").fillna(0)
         s["lost_sales"] = (s["lost_units"] * blended_aur).round(0)
 
@@ -2834,6 +2896,23 @@ baseline keeps low-volume daily noise from triggering false dispatches.
                 "Sorted by priority, then estimated lost units. Hand the CSV to the field-service "
                 "company; the address columns come straight from `store_dim`."
             )
+
+
+# ─── Render the tabs ─────────────────────────────────────────────────────────
+with tab_overview:
+    _render_overview()
+with tab_sales:
+    _render_sales()
+with tab_forecast:
+    _render_forecast()
+with tab_inv:
+    _render_inventory()
+with tab_channels:
+    _render_channels()
+with tab_dist:
+    _render_distribution()
+with tab_actions:
+    _render_actions()
 
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
