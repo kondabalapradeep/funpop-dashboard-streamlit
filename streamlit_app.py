@@ -679,7 +679,9 @@ with st.sidebar:
         "Performance window",
         options=["Most recent day", "Last 7 days", "Full lookback"],
         index=0,
-        help="Filters KPIs and Item Performance only.",
+        help="Scopes the KPI strips and the item / store / state / channel summary "
+             "tables on every tab. Trend charts (weekly and daily series) always "
+             "span the full date range so the window has context.",
     )
 
 
@@ -765,6 +767,11 @@ else:
     df_window = df
     window_label = f"Full lookback ({df['business_date'].min().strftime('%b %d')}–{most_recent.strftime('%b %d')}, {period_days} data days)"
     weeks_in_window = weeks_in_period
+
+# First day of the performance window. Secondary feeds (omni, returns) carry
+# their own date columns, so sections built from them apply the same calendar
+# window with `frame[date_col] >= window_start` instead of re-deriving it.
+window_start = df_window["business_date"].min()
 
 
 # ─── Header ──────────────────────────────────────────────────────────────────
@@ -1108,6 +1115,12 @@ def _render_overview():
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_sales():
+    st.caption(
+        f"Weekly trend charts span the full date range. The summary sections — "
+        f"YoY bridge, U/S/W by item, velocity distribution, store leaderboard — "
+        f"follow the sidebar **Performance window**, currently *{window_label}*."
+    )
+
     # ── Weekly sales trend ───────────────────────────────────────────────────
     st.subheader("Weekly sales trend")
 
@@ -1206,17 +1219,18 @@ def _render_sales():
 
     # ── YoY units bridge (distribution vs velocity) ──────────────────────────
     st.divider()
-    st.subheader("What moved units YoY")
+    st.subheader(f"What moved units YoY — {window_label}")
     st.caption(
         "Decomposes the year-over-year unit change into the **distribution effect** "
         "(change in the number of stores selling × last year's per-store rate) and the "
         "**velocity effect** (change in units per selling store × this year's store count). "
-        "Tells you whether to chase shelf placement or sell-through."
+        "Tells you whether to chase shelf placement or sell-through. "
+        "Follows the sidebar performance window."
     )
-    _u_ty = float(df["pos_quantity_this_year"].sum())
-    _u_ly = float(df["pos_quantity_last_year"].sum())
-    _s_ty = int(df[df["pos_quantity_this_year"] > 0]["store_number"].nunique())
-    _s_ly = int(df[df["pos_quantity_last_year"] > 0]["store_number"].nunique())
+    _u_ty = float(df_window["pos_quantity_this_year"].sum())
+    _u_ly = float(df_window["pos_quantity_last_year"].sum())
+    _s_ty = int(df_window[df_window["pos_quantity_this_year"] > 0]["store_number"].nunique())
+    _s_ly = int(df_window[df_window["pos_quantity_last_year"] > 0]["store_number"].nunique())
     _r_ty = (_u_ty / _s_ty) if _s_ty else 0.0
     _r_ly = (_u_ly / _s_ly) if _s_ly else 0.0
     dist_effect = (_s_ty - _s_ly) * _r_ly
@@ -1363,19 +1377,19 @@ def _render_sales():
     # separate. Active stores for "Bins" counts distinct stores that moved
     # either pack (not the sum of the per-pack store counts, which would
     # double-count stores selling both).
-    st.markdown("**U/S/W by item (period total)**")
-    item_uspw = df.groupby("item_group", as_index=False, observed=True).agg(
+    st.markdown(f"**U/S/W by item — {window_label}**")
+    item_uspw = df_window.groupby("item_group", as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
     ).rename(columns={"item_group": "item"})
     # Same str cast as item_perf: keep the categorical out of the tiny agg
     # frames so downstream merges/fills behave like plain strings.
     item_uspw["item"] = item_uspw["item"].astype(str)
-    ty_active_item = (df[df["pos_quantity_this_year"] > 0]
+    ty_active_item = (df_window[df_window["pos_quantity_this_year"] > 0]
                       .groupby("item_group", observed=True)["store_number"].nunique()
                       .rename("stores_ty").reset_index().rename(columns={"item_group": "item"}))
     ty_active_item["item"] = ty_active_item["item"].astype(str)
-    ly_active_item = (df[df["pos_quantity_last_year"] > 0]
+    ly_active_item = (df_window[df_window["pos_quantity_last_year"] > 0]
                       .groupby("item_group", observed=True)["store_number"].nunique()
                       .rename("stores_ly").reset_index().rename(columns={"item_group": "item"}))
     ly_active_item["item"] = ly_active_item["item"].astype(str)
@@ -1384,9 +1398,9 @@ def _render_sales():
     item_uspw["stores_ty"] = item_uspw["stores_ty"].fillna(0).astype(int)
     item_uspw["stores_ly"] = item_uspw["stores_ly"].fillna(0).astype(int)
     item_uspw["uspw_ty"] = np.where(item_uspw["stores_ty"] > 0,
-        (item_uspw["units_ty"] / item_uspw["stores_ty"] / weeks_in_period).round(2), 0)
+        (item_uspw["units_ty"] / item_uspw["stores_ty"] / weeks_in_window).round(2), 0)
     item_uspw["uspw_ly"] = np.where(item_uspw["stores_ly"] > 0,
-        (item_uspw["units_ly"] / item_uspw["stores_ly"] / weeks_in_period).round(2), 0)
+        (item_uspw["units_ly"] / item_uspw["stores_ly"] / weeks_in_window).round(2), 0)
     item_uspw["uspw_yoy_pct"] = _yoy_pct(item_uspw["uspw_ty"], item_uspw["uspw_ly"])
 
     if len(item_uspw) > 0:
@@ -1399,13 +1413,17 @@ def _render_sales():
                           delta=f"{uspw_yoy:+.2f} ({yoy_pct:+.1f}%) vs LY {row['uspw_ly']:.2f}")
 
     # ── Store velocity distribution ──────────────────────────────────────────
-    st.markdown("**Store-level velocity distribution**")
-    store_uspw = df.groupby("store_number", as_index=False).agg(
+    st.markdown(f"**Store-level velocity distribution — {window_label}**")
+    st.caption(
+        "Each store's units over the performance window, scaled to a weekly rate "
+        "(so a 1-day or 7-day window stays comparable to the full lookback)."
+    )
+    store_uspw = df_window.groupby("store_number", as_index=False).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
     )
-    store_uspw["uspw_ty"] = (store_uspw["units_ty"] / weeks_in_period).round(1)
-    store_uspw["uspw_ly"] = (store_uspw["units_ly"] / weeks_in_period).round(1)
+    store_uspw["uspw_ty"] = (store_uspw["units_ty"] / weeks_in_window).round(1)
+    store_uspw["uspw_ly"] = (store_uspw["units_ly"] / weeks_in_window).round(1)
 
     ORDER = ["0 (none)", "0-1", "1-3", "3-5", "5-10", "10-20", "20+"]
 
@@ -1460,17 +1478,21 @@ def _render_sales():
 
     # ── Store leaderboard ────────────────────────────────────────────────────
     st.divider()
-    st.subheader("Store leaderboard")
+    st.subheader(f"Store leaderboard — {window_label}")
     st.caption(
-        "Per-store performance over the lookback window. Sort any column; download the full "
-        "list for offline review. Decliner/mover callouts limited to stores that sold last year."
+        "Per-store performance over the sidebar **performance window** (switch it to "
+        "most recent day / last 7 days / full lookback). Sort any column; download the "
+        "full list for offline review. Decliner/mover callouts limited to stores that "
+        "sold last year. On-hand is always each store's latest snapshot."
     )
-    store_rank = df.groupby(["store_number", "state_or_province_code"],
-                            as_index=False, observed=True).agg(
+    store_rank = df_window.groupby(["store_number", "state_or_province_code"],
+                                   as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
         sales_ty=("pos_sales_this_year", "sum"),
     )
+    # On-hand stays point-in-time (latest day in the full frame): a 1-day sales
+    # window shouldn't change what's sitting on the shelf right now.
     _lm = df.groupby("store_number")["business_date"].transform("max") == df["business_date"]
     _oh = df[_lm].groupby("store_number", as_index=False)[
         "store_on_hand_quantity_this_year"].sum().rename(
@@ -1480,7 +1502,7 @@ def _render_sales():
     store_rank["yoy_units"] = store_rank["units_ty"] - store_rank["units_ly"]
     store_rank["yoy_pct"] = _yoy_pct(store_rank["units_ty"], store_rank["units_ly"])
     store_rank["wos"] = np.where(store_rank["units_ty"] > 0,
-        (store_rank["on_hand"] / (store_rank["units_ty"] / weeks_in_period)).round(1), np.nan)
+        (store_rank["on_hand"] / (store_rank["units_ty"] / weeks_in_window)).round(1), np.nan)
 
     lb_l, lb_r = st.columns(2)
     _sold_ly = store_rank[store_rank["units_ly"] > 0]
@@ -1520,10 +1542,12 @@ def _render_sales():
         "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
         "WOS": st.column_config.NumberColumn(format="%.1f wks"),
     })
+    _win_slug = {"Most recent day": "day", "Last 7 days": "7d",
+                 "Full lookback": "full"}.get(perf_window, "window")
     st.download_button(
         "⬇ Download full store list (CSV)",
         data=full_tbl.to_csv(index=False).encode("utf-8"),
-        file_name=f"store_leaderboard_{most_recent.strftime('%Y%m%d')}.csv",
+        file_name=f"store_leaderboard_{_win_slug}_{most_recent.strftime('%Y%m%d')}.csv",
         mime="text/csv",
     )
 
@@ -2265,15 +2289,20 @@ def _render_channels():
         st.info("No omni sales records.")
     else:
         omni_filt = omni_df[omni_df["walmart_item_number"].isin(item_filter)]
+        # KPIs and the channel bar follow the sidebar performance window, applied
+        # to the omni feed's own dates; the mix-over-time chart below always spans
+        # the full range so the window has context.
+        omni_w = omni_filt[omni_filt["business_date"] >= window_start]
 
-        omni_total_ty = float(omni_filt["units_ty"].sum())
-        omni_total_ly = float(omni_filt["units_ly"].sum())
+        omni_total_ty = float(omni_w["units_ty"].sum())
+        omni_total_ly = float(omni_w["units_ly"].sum())
         omni_yoy = ((omni_total_ty - omni_total_ly) / omni_total_ly * 100) if omni_total_ly else 0
 
-        in_store_ty = float(df["pos_quantity_this_year"].sum())
-        in_store_ly = float(df["pos_quantity_last_year"].sum())
+        in_store_ty = float(df_window["pos_quantity_this_year"].sum())
+        in_store_ly = float(df_window["pos_quantity_last_year"].sum())
         in_store_yoy = ((in_store_ty - in_store_ly) / in_store_ly * 100) if in_store_ly else 0
 
+        st.caption(f"KPIs and channel totals: **{window_label}**.")
         ch_k1, ch_k2, ch_k3 = st.columns(3)
         ch_k1.metric("In-store units", f"{int(in_store_ty):,}", f"{in_store_yoy:+.1f}% YoY")
         ch_k2.metric("Omni units (all channels)", f"{int(omni_total_ty):,}", f"{omni_yoy:+.1f}% YoY")
@@ -2282,8 +2311,8 @@ def _render_channels():
                      help="Online, pickup, ship-from-store, etc.")
 
         # Channel mix
-        st.markdown("**Sales by service channel**")
-        by_chan = omni_filt.groupby("service_channel", as_index=False, observed=True).agg(
+        st.markdown(f"**Sales by service channel — {window_label}**")
+        by_chan = omni_w.groupby("service_channel", as_index=False, observed=True).agg(
             units_ty=("units_ty", "sum"),
             units_ly=("units_ly", "sum"),
             sales_ty=("sales_ty", "sum"),
@@ -2384,19 +2413,24 @@ def _render_channels():
         if ret_filt.empty:
             st.info("No returns for selected items.")
         else:
-            ret_ty_total = int(ret_filt["returns_ty"].sum())
-            ret_ly_total = int(ret_filt["returns_ly"].sum())
+            # KPIs follow the sidebar performance window; the weekly trend and
+            # reason breakdown below keep the full range (a 1-day reason split
+            # is too sparse to point at a root cause).
+            ret_w = ret_filt[ret_filt["return_date"] >= window_start]
+            ret_ty_total = int(ret_w["returns_ty"].sum())
+            ret_ly_total = int(ret_w["returns_ly"].sum())
             ret_yoy = ((ret_ty_total - ret_ly_total) / ret_ly_total * 100) if ret_ly_total else 0
-            # Return rate = returns / units sold
-            units_total = float(df["pos_quantity_this_year"].sum())
+            # Return rate = returns / units sold, both over the same window
+            units_total = float(df_window["pos_quantity_this_year"].sum())
             ret_rate = (ret_ty_total / units_total * 100) if units_total else 0
 
+            st.caption(f"KPIs: **{window_label}**.")
             r_k1, r_k2, r_k3 = st.columns(3)
             r_k1.metric("Returns (units)", f"{ret_ty_total:,}", f"{ret_yoy:+.1f}% YoY",
                         delta_color="inverse")
             r_k2.metric("Return rate", f"{ret_rate:.2f}%",
-                        help="returns / units sold over the period")
-            r_k3.metric("Return $ (TY)", f"${ret_filt['return_sales_ty'].sum():,.0f}")
+                        help="returns / units sold over the selected performance window")
+            r_k3.metric("Return $ (TY)", f"${ret_w['return_sales_ty'].sum():,.0f}")
 
             # Weekly trend
             ret_filt["week_start"] = _walmart_week_start(ret_filt["return_date"])
@@ -2423,9 +2457,10 @@ def _render_channels():
             # ── Returns by reason ────────────────────────────────────────────
             st.markdown("**Why product comes back (return reason)**")
             st.caption(
-                "Breaks returns down by Walmart's return-reason code. A spike concentrated in "
-                "one reason (damage, quality, wrong item) points at a fixable root cause rather "
-                "than general softness."
+                "Breaks returns down by Walmart's return-reason code over the **full date "
+                "range** (a short window is too sparse to read). A spike concentrated in "
+                "one reason (damage, quality, wrong item) points at a fixable root cause "
+                "rather than general softness."
             )
             by_reason = ret_filt.groupby("return_reason", as_index=False, observed=True).agg(
                 returns_ty=("returns_ty", "sum"),
@@ -2454,7 +2489,9 @@ def _render_distribution():
     # ── NEW: Modular coverage (distribution gap) ─────────────────────────────
     st.subheader("Modular coverage gap")
     st.caption(
-        "Stores in the active modular plan vs. stores that actually sold this item. "
+        "Stores in the active modular plan vs. stores that actually sold this item "
+        "anywhere in the **full date range**. The performance window doesn't apply "
+        "here — one quiet day shouldn't count a store as a coverage gap. "
         "The gap = execution failure (item should be carried but isn't moving)."
     )
 
@@ -2510,9 +2547,10 @@ def _render_distribution():
 
     # ── Performance by state ─────────────────────────────────────────────────
     st.divider()
-    st.subheader("Performance by state")
+    st.subheader(f"Performance by state — {window_label}")
+    st.caption("Follows the sidebar performance window (most recent day / last 7 days / full lookback).")
 
-    state_perf_all = df.groupby("state_or_province_code", as_index=False, observed=True).agg(
+    state_perf_all = df_window.groupby("state_or_province_code", as_index=False, observed=True).agg(
         units_ty=("pos_quantity_this_year", "sum"),
         units_ly=("pos_quantity_last_year", "sum"),
         sales_ty=("pos_sales_this_year", "sum"),
