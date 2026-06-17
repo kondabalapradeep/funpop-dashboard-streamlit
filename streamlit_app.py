@@ -2247,7 +2247,8 @@ def _render_inventory():
                   help="Average daily in-warehouse over the coming 7 days, last year.")
 
         # Chart: in-house + in-warehouse across the combined window. The last-year
-        # look-ahead is dashed; a rule marks the actual → last-year boundary.
+        # look-ahead sits on a shaded band (and is drawn dashed); a rule marks the
+        # actual → last-year boundary.
         chart_long = combined.melt(
             id_vars=["business_date", "source"],
             value_vars=["in_house", "in_whse"],
@@ -2257,6 +2258,16 @@ def _render_inventory():
             {"in_house": "In house", "in_whse": "In warehouse"})
         x_enc = alt.X("business_date:T", title=None,
                       axis=alt.Axis(format="%b %d", labelAngle=-30))
+        layers = []
+        # Shade the future (last-year outlook) days so they read as a projection,
+        # not actuals — from the last actual day through the last outlook day.
+        if not fut.empty:
+            band = pd.DataFrame({"start": [la_today],
+                                 "end": [fut["business_date"].max()]})
+            layers.append(
+                alt.Chart(band).mark_rect(color="#791F1F", opacity=0.10).encode(
+                    x="start:T", x2="end:T")
+            )
         lines = alt.Chart(chart_long).mark_line(point=True, strokeWidth=2.5).encode(
             x=x_enc,
             y=alt.Y("units:Q", title="Units"),
@@ -2269,18 +2280,23 @@ def _render_inventory():
             tooltip=[alt.Tooltip("business_date:T", title="Date", format="%a %b %d"),
                      "measure", "source", alt.Tooltip("units:Q", format=",")],
         )
-        boundary = alt.Chart(pd.DataFrame({"d": [la_today]})).mark_rule(
-            color="#791F1F", strokeDash=[3, 3]).encode(x="d:T")
-        st.altair_chart(alt.layer(lines, boundary).properties(height=320),
-                        width='stretch')
-        st.caption("Solid = this year's actuals · dashed = last year's levels (next 7 days). "
-                   "Red line marks the latest day of actual data.")
+        layers.append(lines)
+        layers.append(
+            alt.Chart(pd.DataFrame({"d": [la_today]})).mark_rule(
+                color="#791F1F", strokeDash=[3, 3]).encode(x="d:T")
+        )
+        st.altair_chart(alt.layer(*layers).properties(height=320), width='stretch')
+        st.caption("Solid lines = this year's actuals · shaded band + dashed lines = "
+                   "last year's levels for the next 7 days. Red line marks the latest "
+                   "day of actual data.")
 
         if fut.empty and not la_err:
             st.info("Last-year levels for the next 7 days aren't available yet — "
                     "showing actuals only.")
 
-        # Table — the year-ago numbers, day by day.
+        # Table — the year-ago numbers, day by day. Future (last-year) rows get a
+        # shaded background so they're set apart from the actuals, matching the
+        # chart's shaded outlook band.
         show_la = combined[["weekday", "date_str", "source", "in_house", "in_whse",
                             "ly_in_house", "ly_in_whse"]].copy()
         show_la.columns = ["Day", "Date", "Source", "In house", "In warehouse",
@@ -2289,8 +2305,14 @@ def _render_inventory():
         show_la[_whole] = show_la[_whole].round().astype(int)
         for c in ["LY in house", "LY in warehouse"]:
             show_la[c] = show_la[c].round().astype("Int64")
+        _future_mask = (show_la["Source"] == "Last yr").to_numpy()
+        styled_la = show_la.style.apply(
+            lambda _col: ["background-color: rgba(121, 31, 31, 0.10)" if f else ""
+                          for f in _future_mask],
+            axis=0,
+        )
         st.dataframe(
-            show_la, width='stretch', hide_index=True,
+            styled_la, width='stretch', hide_index=True,
             column_config={
                 c: st.column_config.NumberColumn(format="%d")
                 for c in ["In house", "In warehouse", "LY in house", "LY in warehouse"]
