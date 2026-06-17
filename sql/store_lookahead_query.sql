@@ -2,7 +2,7 @@
 -- "week look-ahead". The dashboard's main store frame only spans the rolling
 -- Standard lookback (~4-5 weeks; 120 days max via the slider), so last year's
 -- levels for the *upcoming* week aren't in it. This pulls last year's in-store
--- on-hand ("in house") and in-warehouse for a window around the year-ago anchor
+-- on-hand, in-warehouse, and in-transit for a window around the year-ago anchor
 -- (CURRENT_DATE - 364 days = the same Walmart fiscal weekday one year prior),
 -- which the app shifts forward 52 weeks (364 days) and combines with this year's
 -- actuals: actuals up to the latest data day, then last year's levels for the
@@ -29,7 +29,7 @@ WITH store_dim_d AS (
 store_invt_d AS (
   SELECT
     bus_dt, store_nbr, wm_item_nbr,
-    ty_on_hand_qty, ty_in_whse_qty
+    ty_on_hand_qty, ty_in_whse_qty, ty_in_trnst_qty
   FROM `{project}.{dataset}.store_invt`
   WHERE wm_item_nbr IN UNNEST(@active_items)
     AND bus_dt BETWEEN
@@ -44,8 +44,9 @@ SELECT
   si.bus_dt                            AS inventory_date,
   si.wm_item_nbr                       AS walmart_item_number,
   sd.state_prov_cd                     AS state_or_province_code,
-  SUM(COALESCE(si.ty_on_hand_qty, 0))  AS store_on_hand_quantity,
-  SUM(COALESCE(si.ty_in_whse_qty, 0))  AS store_in_warehouse_quantity
+  SUM(COALESCE(si.ty_on_hand_qty, 0))   AS store_on_hand_quantity,
+  SUM(COALESCE(si.ty_in_whse_qty, 0))   AS store_in_warehouse_quantity,
+  SUM(COALESCE(si.ty_in_trnst_qty, 0))  AS store_in_transit_quantity
 FROM store_invt_d AS si
 LEFT JOIN store_dim_d AS sd
   ON si.store_nbr = sd.store_nbr

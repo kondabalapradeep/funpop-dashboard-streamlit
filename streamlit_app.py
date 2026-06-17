@@ -496,12 +496,12 @@ def load_backroom_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.D
 
 @st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_store_lookahead_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
-    """Same-period-last-year store inventory (in-store on-hand + in-warehouse) for
-    the Inventory tab's week look-ahead. The main store frame only spans the
-    recent lookback, so last year's levels for the upcoming week aren't in it;
-    this dedicated query fetches them at date×item×state grain. The app shifts the
-    dates forward 52 weeks and combines them with this year's actuals. Small
-    frame, so no pre-shrink transform is registered for it."""
+    """Same-period-last-year store inventory (in-store on-hand, in-warehouse, and
+    in-transit) for the Inventory tab's week look-ahead. The main store frame only
+    spans the recent lookback, so last year's levels for the upcoming week aren't
+    in it; this dedicated query fetches them at date×item×state grain. The app
+    shifts the dates forward 52 weeks and combines them with this year's actuals.
+    Small frame, so no pre-shrink transform is registered for it."""
     try:
         df = _cached_query("store_lookahead_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
@@ -511,8 +511,42 @@ def load_store_lookahead_data(lookback_days: int, refresh_slot: str = "") -> tup
             df["inventory_date"] = pd.to_datetime(df["inventory_date"])
             _shrink_frame(df,
                 int_cols=["walmart_item_number", "store_on_hand_quantity",
-                          "store_in_warehouse_quantity"],
+                          "store_in_warehouse_quantity", "store_in_transit_quantity"],
                 cat_cols=["state_or_province_code"])
+        return df, None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
+def load_dc_lookahead_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    """Same-period-last-year DC on-hand (eaches) for the Inventory tab's week
+    look-ahead, at date×item grain (network-wide, like the rest of the DC views).
+    Converts warehouse packs → eaches the same way as load_dc_data: prefer the
+    feed's per-row eaches-per-pack, fall back to constants.CASE_PACK_UNITS only
+    where it's missing. Not registered in SNAPSHOT_TRANSFORMS — like dc_query.sql,
+    the pack→eaches conversion isn't idempotent (it drops the pack-size column it
+    depends on), so it must run exactly once, here, after the snapshot read."""
+    try:
+        df = _cached_query("dc_lookahead_query.sql", [
+            bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
+            bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
+        ])
+        if df.empty:
+            return df, None
+        df["inventory_date"] = pd.to_datetime(df["inventory_date"])
+        oh = pd.to_numeric(
+            df["on_hand_warehouse_inventory_in_units_this_year"], errors="coerce").fillna(0)
+        if "warehouse_pack_each_quantity" in df.columns:
+            pack_each = pd.to_numeric(df["warehouse_pack_each_quantity"], errors="coerce").fillna(0)
+            fallback = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+            multiplier = pack_each.where(pack_each > 0, fallback)
+        else:
+            multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+        df["dc_on_hand"] = (oh * multiplier).round().astype("int32")
+        df = df.drop(columns=["warehouse_pack_each_quantity",
+                              "on_hand_warehouse_inventory_in_units_this_year"], errors="ignore")
+        _shrink_frame(df, int_cols=["walmart_item_number"])
         return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
@@ -2166,12 +2200,12 @@ def _render_inventory():
 
     # ── Week look-ahead: actuals so far + last-year for the next 7 days ────────
     # The daily flow above is history only. For planning the coming week, this
-    # overlays last year's in-store on-hand ("in house") and in-warehouse on top
-    # of this year's actuals: actuals through the latest data day, then last
-    # year's levels — shifted forward 52 weeks (364 days) to the same Walmart
-    # fiscal weekday — for the next 7 days. Last year's levels aren't in the main
-    # store frame (it spans only the recent lookback), so they come from the
-    # dedicated same-period-last-year loader.
+    # extends the same pipeline stages — in store, in warehouse, in transit, DC
+    # on-hand, total network — past the latest data day: this year's actuals
+    # through that day, then last year's levels (shifted forward 52 weeks / 364
+    # days to the same Walmart fiscal weekday) for the next 7 days. Last year's
+    # levels aren't in the main store/DC frames (they span only the recent
+    # lookback), so they come from the dedicated same-period-last-year loaders.
     st.divider()
     st.subheader("Inventory week look-ahead (actuals + last-year)")
 
@@ -2179,44 +2213,70 @@ def _render_inventory():
     la_actual_start = la_today - timedelta(days=6)   # last 7 actual days, for context
     la_future_end = la_today + timedelta(days=7)     # the next 7 days
     st.caption(
-        f"Daily **in house** (in-store on-hand) and **in warehouse** units: this year's "
+        f"Daily inventory by stage — in store, in warehouse, in transit, DC on-hand, "
+        f"and total network (in store + in transit + DC on-hand): this year's "
         f"**actuals** through {la_today.strftime('%b %d')}, then **last year's** levels for "
         f"the next 7 days ({(la_today + timedelta(days=1)).strftime('%b %d')}–"
         f"{la_future_end.strftime('%b %d')}) as a same-week-last-year planning proxy. "
-        "Last-year days are matched by Walmart fiscal weekday (52 weeks back). "
-        "Respects the sidebar item and state filters."
+        "Last-year days are matched by Walmart fiscal weekday (52 weeks back). Store "
+        "stages respect the sidebar item + state filters; DC on-hand is network-wide "
+        "(item-filtered), as elsewhere on the tab."
     )
 
     la_df, la_err = load_store_lookahead_data(lookback, slot)
+    dla_df, dla_err = load_dc_lookahead_data(lookback, slot)
 
-    # This year's actuals for the recent window, from the already-loaded store
-    # frame (so they honour the active item + state filters automatically).
+    # This year's actuals for the recent window. Store stages come from the already
+    # loaded (item + state filtered) store frame; DC on-hand from the network-wide
+    # dc frame — exactly the split the daily flow above uses.
     act = (
         df[(df["business_date"] >= la_actual_start) & (df["business_date"] <= la_today)]
         .groupby("business_date", as_index=False)
-        .agg(in_house=("store_on_hand_quantity_this_year", "sum"),
-             in_whse=("store_in_warehouse_quantity_this_year", "sum"))
+        .agg(in_store=("store_on_hand_quantity_this_year", "sum"),
+             in_whse=("store_in_warehouse_quantity_this_year", "sum"),
+             in_transit=("store_in_transit_quantity_this_year", "sum"))
     )
+    if not dc_df.empty:
+        dc_act = (
+            dc_df[dc_df["inventory_date"] >= la_actual_start]
+            .groupby("inventory_date", as_index=False)
+            .agg(dc_oh=("on_hand_warehouse_inventory_in_units_this_year", "sum"))
+            .rename(columns={"inventory_date": "business_date"})
+        )
+        act = act.merge(dc_act, on="business_date", how="left")
+    if "dc_oh" not in act.columns:
+        act["dc_oh"] = 0.0
     act["source"] = "Actual"
 
-    # Last year's levels: scope to the same items/states, shift each date forward
-    # 364 days (52 weeks → same weekday), and total by day.
-    ly_daily = pd.DataFrame(columns=["business_date", "in_house", "in_whse"])
+    # Last year's store stages: scope to the same items/states, shift each date
+    # forward 364 days (52 weeks → same weekday), and total by day.
+    ly_store = pd.DataFrame(columns=["business_date", "in_store", "in_whse", "in_transit"])
     if la_err:
-        _section_error("Last-year inventory look-ahead", la_err)
+        _section_error("Last-year store inventory look-ahead", la_err)
     elif not la_df.empty:
         ly = la_df[la_df["walmart_item_number"].isin(item_filter)]
         if state_sel:
             ly = ly[ly["state_or_province_code"].astype(str).isin(state_sel)]
         if not ly.empty:
             ly = ly.assign(business_date=ly["inventory_date"] + pd.Timedelta(days=364))
-            ly_daily = (
+            ly_store = (
                 ly.groupby("business_date", as_index=False)
-                .agg(in_house=("store_on_hand_quantity", "sum"),
-                     in_whse=("store_in_warehouse_quantity", "sum"))
+                .agg(in_store=("store_on_hand_quantity", "sum"),
+                     in_whse=("store_in_warehouse_quantity", "sum"),
+                     in_transit=("store_in_transit_quantity", "sum"))
             )
 
-    # Future portion = last-year levels mapped onto the next 7 days.
+    # Last year's DC on-hand (network-wide, item-filtered), shifted the same way.
+    ly_dc = pd.DataFrame(columns=["business_date", "dc_oh"])
+    if dla_err:
+        _section_error("Last-year DC inventory look-ahead", dla_err)
+    elif not dla_df.empty:
+        d = dla_df[dla_df["walmart_item_number"].isin(item_filter)]
+        if not d.empty:
+            d = d.assign(business_date=d["inventory_date"] + pd.Timedelta(days=364))
+            ly_dc = d.groupby("business_date", as_index=False).agg(dc_oh=("dc_on_hand", "sum"))
+
+    ly_daily = ly_store.merge(ly_dc, on="business_date", how="outer")
     fut = ly_daily[(ly_daily["business_date"] > la_today)
                    & (ly_daily["business_date"] <= la_future_end)].copy()
     fut["source"] = "Last yr"
@@ -2224,87 +2284,86 @@ def _render_inventory():
     if act.empty and fut.empty:
         st.info("Not enough data to build the inventory look-ahead.")
     else:
-        combined = pd.concat([act, fut], ignore_index=True).sort_values("business_date")
-        # Year-ago reference for the actual rows (blanked on last-year rows, where
-        # the shown value already *is* last year). Lets you read this-year vs
-        # last-year side by side over the recent days.
-        ya = ly_daily.rename(columns={"in_house": "ly_in_house", "in_whse": "ly_in_whse"})
-        combined = combined.merge(ya, on="business_date", how="left")
-        combined.loc[combined["source"] != "Actual", ["ly_in_house", "ly_in_whse"]] = np.nan
+        combined = pd.concat([act, fut], ignore_index=True)
+        # Concatenating a datetime column with an empty (object-dtype) look-ahead
+        # frame — when both LY sources are missing — coerces business_date to
+        # object; restore it so the .dt accessors below work.
+        combined["business_date"] = pd.to_datetime(combined["business_date"])
+        combined = combined.sort_values("business_date")
+        _stages = ["in_store", "in_whse", "in_transit", "dc_oh"]
+        for c in _stages:
+            combined[c] = pd.to_numeric(combined.get(c), errors="coerce").fillna(0)
+        # Total network = in store + in transit + DC on-hand. In-warehouse is
+        # excluded (it would double-count DC stock earmarked for stores), matching
+        # the daily flow above.
+        combined["total_network"] = (
+            combined["in_store"] + combined["in_transit"] + combined["dc_oh"])
         combined["weekday"] = combined["business_date"].dt.strftime("%a")
         combined["date_str"] = combined["business_date"].dt.strftime("%b %d")
 
-        latest_house = float(act["in_house"].iloc[-1]) if not act.empty else 0.0
-        n_fut = len(fut)
+        fut_rows = combined[combined["source"] == "Last yr"]
+        n_fut = len(fut_rows)
+        latest = combined[(combined["source"] == "Actual")
+                          & (combined["business_date"] == la_today)]
+        latest_net = float(latest["total_network"].iloc[0]) if not latest.empty else 0.0
         m1, m2, m3 = st.columns(3)
-        m1.metric("In house now (actual)", f"{latest_house:,.0f}",
-                  help=f"In-store on-hand on {la_today.strftime('%b %d')}.")
-        m2.metric("Next 7 days in house — last yr (avg/day)",
-                  f"{fut['in_house'].sum() / n_fut:,.0f}" if n_fut else "—",
+        m1.metric("Total network now (actual)", f"{latest_net:,.0f}",
+                  help=f"In store + in transit + DC on-hand on {la_today.strftime('%b %d')}.")
+        m2.metric("Next 7 days network — last yr (avg/day)",
+                  f"{fut_rows['total_network'].mean():,.0f}" if n_fut else "—",
+                  help="Average daily total network over the coming 7 days, last year.")
+        m3.metric("Next 7 days in store — last yr (avg/day)",
+                  f"{fut_rows['in_store'].mean():,.0f}" if n_fut else "—",
                   help="Average daily in-store on-hand over the coming 7 days, last year.")
-        m3.metric("Next 7 days in warehouse — last yr (avg/day)",
-                  f"{fut['in_whse'].sum() / n_fut:,.0f}" if n_fut else "—",
-                  help="Average daily in-warehouse over the coming 7 days, last year.")
 
-        # Chart: in-house + in-warehouse across the combined window. The last-year
-        # look-ahead sits on a shaded band (and is drawn dashed); a rule marks the
-        # actual → last-year boundary.
-        chart_long = combined.melt(
-            id_vars=["business_date", "source"],
-            value_vars=["in_house", "in_whse"],
-            var_name="measure", value_name="units",
-        )
-        chart_long["measure"] = chart_long["measure"].map(
-            {"in_house": "In house", "in_whse": "In warehouse"})
-        x_enc = alt.X("business_date:T", title=None,
-                      axis=alt.Axis(format="%b %d", labelAngle=-30))
+        # Chart: stacked bars = inventory position by stage (in store + in transit +
+        # DC on-hand = total network), matching the daily flow above. The future
+        # (last-year) days are shaded so they read as a projection, not actuals.
+        chart_src = combined.sort_values("business_date")  # chronological left→right
+        order = list(chart_src["date_str"])
+        stage_order = ["In store", "In transit", "DC on-hand"]
+        chart_df = chart_src.rename(columns={
+            "in_store": "In store", "in_transit": "In transit", "dc_oh": "DC on-hand"})
+        pos_long = chart_df.melt(id_vars=["date_str"], value_vars=stage_order,
+                                 var_name="Stage", value_name="Units")
+        x_enc = alt.X("date_str:N", sort=order, title=None,
+                      axis=alt.Axis(labelAngle=-30))
         layers = []
-        # Shade the future (last-year outlook) days so they read as a projection,
-        # not actuals — from the last actual day through the last outlook day.
-        if not fut.empty:
-            band = pd.DataFrame({"start": [la_today],
-                                 "end": [fut["business_date"].max()]})
+        fut_days = chart_src.loc[chart_src["source"] == "Last yr", ["date_str"]]
+        if not fut_days.empty:
             layers.append(
-                alt.Chart(band).mark_rect(color="#791F1F", opacity=0.10).encode(
-                    x="start:T", x2="end:T")
+                alt.Chart(fut_days).mark_rect(color="#791F1F", opacity=0.10).encode(x=x_enc)
             )
-        lines = alt.Chart(chart_long).mark_line(point=True, strokeWidth=2.5).encode(
-            x=x_enc,
-            y=alt.Y("units:Q", title="Units"),
-            color=alt.Color("measure:N", title=None,
-                            scale=alt.Scale(domain=["In house", "In warehouse"],
-                                            range=["#185FA5", "#C49A2E"])),
-            strokeDash=alt.StrokeDash("source:N", title=None,
-                                      scale=alt.Scale(domain=["Actual", "Last yr"],
-                                                      range=[[1, 0], [6, 4]])),
-            tooltip=[alt.Tooltip("business_date:T", title="Date", format="%a %b %d"),
-                     "measure", "source", alt.Tooltip("units:Q", format=",")],
-        )
-        layers.append(lines)
         layers.append(
-            alt.Chart(pd.DataFrame({"d": [la_today]})).mark_rule(
-                color="#791F1F", strokeDash=[3, 3]).encode(x="d:T")
+            alt.Chart(pos_long).mark_bar().encode(
+                x=x_enc,
+                y=alt.Y("Units:Q", title="Units in network", stack="zero"),
+                color=alt.Color("Stage:N", title="Stage",
+                                scale=alt.Scale(domain=stage_order,
+                                                range=["#185FA5", "#C49A2E", "#27500A"])),
+                tooltip=["date_str", "Stage", alt.Tooltip("Units:Q", format=",")],
+            )
         )
-        st.altair_chart(alt.layer(*layers).properties(height=320), width='stretch')
-        st.caption("Solid lines = this year's actuals · shaded band + dashed lines = "
-                   "last year's levels for the next 7 days. Red line marks the latest "
-                   "day of actual data.")
+        st.altair_chart(alt.layer(*layers).properties(height=340), width='stretch')
+        st.caption("Bars = inventory position by stage (in store + in transit + DC on-hand "
+                   "= total network); in-warehouse is shown in the table only, to avoid "
+                   "double-counting DC stock. Shaded days = last year's levels for the "
+                   "next 7 days.")
 
-        if fut.empty and not la_err:
+        if fut.empty and not (la_err or dla_err):
             st.info("Last-year levels for the next 7 days aren't available yet — "
                     "showing actuals only.")
 
-        # Table — the year-ago numbers, day by day. Future (last-year) rows get a
-        # shaded background so they're set apart from the actuals, matching the
-        # chart's shaded outlook band.
-        show_la = combined[["weekday", "date_str", "source", "in_house", "in_whse",
-                            "ly_in_house", "ly_in_whse"]].copy()
-        show_la.columns = ["Day", "Date", "Source", "In house", "In warehouse",
-                           "LY in house", "LY in warehouse"]
-        _whole = ["In house", "In warehouse"]
+        # Table — same columns as the daily flow above, ordered latest first so the
+        # furthest look-ahead day sits on top. Future (last-year) rows are shaded to
+        # set them apart from the actuals.
+        show_la = combined.sort_values("business_date", ascending=False)[
+            ["weekday", "date_str", "source", "in_store", "in_whse", "in_transit",
+             "dc_oh", "total_network"]].copy()
+        show_la.columns = ["Day", "Date", "Source", "In store", "In warehouse",
+                           "In transit", "DC on-hand", "Total network"]
+        _whole = ["In store", "In warehouse", "In transit", "DC on-hand", "Total network"]
         show_la[_whole] = show_la[_whole].round().astype(int)
-        for c in ["LY in house", "LY in warehouse"]:
-            show_la[c] = show_la[c].round().astype("Int64")
         _future_mask = (show_la["Source"] == "Last yr").to_numpy()
         styled_la = show_la.style.apply(
             lambda _col: ["background-color: rgba(121, 31, 31, 0.10)" if f else ""
@@ -2313,10 +2372,7 @@ def _render_inventory():
         )
         st.dataframe(
             styled_la, width='stretch', hide_index=True,
-            column_config={
-                c: st.column_config.NumberColumn(format="%d")
-                for c in ["In house", "In warehouse", "LY in house", "LY in warehouse"]
-            },
+            column_config={c: st.column_config.NumberColumn(format="%d") for c in _whole},
         )
 
     # ── NEW: Phantom Inventory ───────────────────────────────────────────────
