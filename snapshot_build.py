@@ -58,6 +58,7 @@ def query_jobs(lookback: int):
         ("returns_query.sql", [items, lb]),
         ("modular_query.sql", [items]),
         ("backroom_query.sql", [items, lb]),
+        ("store_lookahead_query.sql", [items, lb]),
     ]
 
 

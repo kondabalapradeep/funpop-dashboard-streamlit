@@ -17,6 +17,7 @@ A Streamlit app that pulls live data from BigQuery using your service-account JS
 | `sql/dc_query.sql` | The DC query. |
 | `sql/forecast_query.sql` | Daily demand-forecast query (powers the Forecast tab). |
 | `sql/dc_alignment_query.sql` | Store→DC alignment (rolls store forecast up to DCs). |
+| `sql/store_lookahead_query.sql` | Same-period-last-year store inventory (in-house + in-warehouse) for the Inventory tab's week look-ahead. |
 | `requirements.txt` | Python deps. |
 | `.streamlit/secrets.toml.example` | Template — copy locally to `secrets.toml`, paste into Streamlit Cloud's UI for production. |
 | `.gitignore` | Keeps `secrets.toml`, `*.json`, and `snapshot_data/` out of git. |
@@ -107,6 +108,7 @@ That's it — no BigQuery write access or GCP console changes are required. Afte
 - Last-7-days tracker table
 - 4-week daily trend chart
 - Store inventory snapshot (on-hand, in-warehouse, in-transit, weeks of supply)
+- **Inventory week look-ahead** — a combined daily series of in-house (in-store on-hand) and in-warehouse units: this year's actuals through the latest data day, then **last year's** levels (shifted forward 52 weeks to the same Walmart fiscal weekday) for the next 7 days as a planning proxy. Last year's levels aren't in the main store frame (it spans only the recent lookback, 120 days max), so they come from a dedicated same-period-last-year query (`sql/store_lookahead_query.sql`). Respects the sidebar item and state filters.
 - Full store rankings table (sortable, filterable, with status)
 - DC analysis section (KPIs, critical/overstock callouts, full table) — appears only if DC query returns data
 - **Store Actions tab** — flags stores with a *physically rep-fixable* problem and lets you **download a CSV dispatch list** (store number, address, city, state, zip + priority/issue) to hand to a field-service company. To react fast without chasing daily noise on low-volume SKUs, it compares each store's **recent 3-day** selling rate against its own **trailing ~21-day run-rate** (a stable baseline), plus a velocity-scaled *"went dark"* check that flags a stocked store the moment its expected lost units (normal rate × silent days) cross a floor — so a brisk seller is caught after ~1 silent day, a slow seller only after a longer gap. Flags: went dark, idle backroom stock, declining vs normal (severity scales with the drop), stuck stock, chronic out-of-stock with supply available, and underperformance vs peers. Stores are ranked by estimated lost units/week. The tab has its own **item scope** control (all items / both bins / shelf only) so it works independently of the sidebar filter, and the on-hand / decline / "went dark" thresholds are adjustable. Addresses come from a **static store directory** built once by the snapshot job (`store_directory.py` introspects `store_dim`'s columns, so it auto-adapts to the dataset's actual address/zip names) and committed as `snapshot_data/store_directory.parquet`; the app reads it straight from disk and only queries `store_dim` live as a fallback. If no address columns exist it degrades to store number + state.
