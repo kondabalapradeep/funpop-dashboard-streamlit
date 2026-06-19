@@ -15,7 +15,9 @@ A Streamlit app that pulls live data from BigQuery using your service-account JS
 | `store_directory.py` | Builds the static store mailing-address directory for the Store Actions export. |
 | `sql/store_query.sql` | The store JOIN query. |
 | `sql/dc_query.sql` | The DC query. |
-| `sql/forecast_query.sql` | Daily demand-forecast query (powers the Forecast tab). |
+| `forecast_source.py` | Resolves the daily demand-forecast table at runtime (see Forecast tab note below) and builds its query. |
+| `sql/forecast_query.sql` | Reference template for the forecast query shape (the real table is discovered at runtime). |
+| `docs/data_element_glossary.xlsx` / `.csv` | Walmart BI Link data-element glossary — the authoritative field reference (`.csv` is the greppable extract). |
 | `sql/dc_alignment_query.sql` | Store→DC alignment (rolls store forecast up to DCs). |
 | `sql/store_lookahead_query.sql` | Same-period-last-year store inventory (on-hand + in-warehouse + in-transit) for the Inventory tab's week look-ahead. |
 | `sql/dc_lookahead_query.sql` | Same-period-last-year DC on-hand for the week look-ahead's DC on-hand / total-network columns. |
@@ -97,6 +99,17 @@ The snapshot builder runs in GitHub Actions, so it needs its own copy of the rea
 That's it — no BigQuery write access or GCP console changes are required. After adding the secrets, open the **Actions** tab → **Build dashboard snapshot** → **Run workflow** to build the first snapshot and confirm it succeeds.
 
 > The job force-pushes a small `snapshot_data` set to the `snapshot-data` branch each time the data changes (≈ once a day, when the feed lands). That branch always holds exactly one commit, so the repo stays small and the app is **not** redeployed by snapshot updates. If you ever want to stop it, disable the **Build dashboard snapshot** workflow.
+
+---
+
+## Forecast tab data source
+
+The Forecast tab needs a **daily** store-item demand forecast (`forecast_date`, `store_number`, `walmart_item_number`, `forecast_quantity`). The physical table name varies per BI Link export — an earlier hard-coded `daily_demand_forecast` matched no real table, which made the tab show *"Forecast data is temporarily unavailable."*
+
+The app now **discovers the forecast table at runtime** (`forecast_source.py`): it asks BigQuery's `INFORMATION_SCHEMA` which table carries the BI Link forecast columns (`fcst_dt` + `fcst_tot_dmand_each_qty`/`final_fcst_each_qty`, keyed by `store_nbr` + `wm_item_nbr`) and builds the query against it. No table name to maintain by hand.
+
+- If you know the exact table, pin it and skip discovery: add `forecast_table = "your_table"` under `[bigquery]` in secrets (and set the `FORECAST_TABLE` Actions secret so the snapshot builder uses it too).
+- If the tab still reports no forecast: the dataset may only hold a **weekly** forecast (`store_demand_forecast`, keyed by `fcst_wm_yr_wk_nbr`) — the tab needs a daily `fcst_dt` feed. Confirm a daily forecast table exists in the dataset. Field names are documented in `docs/data_element_glossary.csv`.
 
 ---
 

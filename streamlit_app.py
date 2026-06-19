@@ -27,7 +27,7 @@ Data sources (BigQuery, dv_supplier dataset):
   store_dim (addresses, static committed directory) ─→ load_store_directory
   dc_item + dc_dim                                 ─→ load_dc_data
   dc_alignment                                     ─→ load_dc_alignment
-  daily_demand_forecast                            ─→ load_forecast_data
+  <daily demand forecast, table discovered at runtime> ─→ load_forecast_data
   omni_sales                                       ─→ load_omni_data
   ecom_invt + omni_item_dimensions                 ─→ load_ecom_inv_data
   store_returns                                    ─→ load_returns_data
@@ -60,6 +60,7 @@ from constants import (
     SHELF_ITEMS,
     item_group_label,
 )
+import forecast_source
 import snapshot
 import store_directory
 import transforms
@@ -259,7 +260,8 @@ def _read_prior_day_snapshot(sql_filename: str, params):
     return snapshot.read_snapshot(snapshot.snapshot_key(sql_filename, alt))
 
 
-def _cached_query(sql_filename: str, params=None, meta: dict | None = None) -> pd.DataFrame:
+def _cached_query(sql_filename: str, params=None, meta: dict | None = None,
+                  sql_override: str | None = None) -> pd.DataFrame:
     """Fetch a query result, preferring the durable BigQuery snapshot written
     by snapshot_build.py (run on a schedule by GitHub Actions) over a live pull.
 
@@ -274,7 +276,15 @@ def _cached_query(sql_filename: str, params=None, meta: dict | None = None) -> p
     the caller can report where the data actually came from.
 
     The sidebar "Refresh data" button sets _force_live_refresh so it bypasses
-    the snapshot and still confirms the very latest data."""
+    the snapshot and still confirms the very latest data.
+
+    ``sql_override`` supplies the SQL to run on the live path instead of reading
+    ``sql_filename`` from disk — a string, or a zero-arg callable that returns
+    one. It is only consulted on a snapshot miss, so the forecast loader (whose
+    real table name is resolved at runtime — see forecast_source) does no
+    discovery when a forecast snapshot exists. The snapshot is still keyed by
+    ``sql_filename`` + params, so a snapshot built for that filename is served
+    unchanged."""
     params = params or []
     if not _FORCE_LIVE_REFRESH:
         try:
@@ -289,7 +299,11 @@ def _cached_query(sql_filename: str, params=None, meta: dict | None = None) -> p
             logger.warning("snapshot lookup skipped for %s: %s", sql_filename, e)
     if meta is not None:
         meta["source"] = "live"
-    return _run_query(_load_sql(sql_filename), params)
+    if sql_override is None:
+        sql = _load_sql(sql_filename)
+    else:
+        sql = sql_override() if callable(sql_override) else sql_override
+    return _run_query(sql, params)
 
 
 # ─── Primary data loaders ────────────────────────────────────────────────────
@@ -399,18 +413,67 @@ def load_dc_alignment(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]
         return pd.DataFrame(), str(e)
 
 
+class _ForecastSourceMissing(Exception):
+    """Raised on the live path when no usable daily forecast table is present.
+    Carried separately from query failures so the tab can show an honest 'not
+    configured' note instead of the generic 'temporarily unavailable' retry."""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _forecast_spec(refresh_slot: str = "") -> dict | None:
+    """Resolve which dataset table holds the daily store demand forecast.
+
+    The physical name varies per BI Link export, so we discover it from
+    INFORMATION_SCHEMA rather than hard-code a guess (the old
+    ``daily_demand_forecast`` matched no real table and made the whole tab
+    error). Cached per refresh slot — a cheap metadata read that also lets the
+    tab recover on its own if the table appears later. An explicit
+    ``[bigquery].forecast_table`` secret pins the name and skips discovery."""
+    project = _get_sa_info()["project_id"]
+    dataset = st.secrets["bigquery"]["dataset"]
+    try:
+        override = st.secrets["bigquery"].get("forecast_table") or None
+    except Exception:  # noqa: BLE001 - secret is optional
+        override = None
+    return forecast_source.discover_forecast_spec(_run_query, project, dataset, override_table=override)
+
+
 @st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
 def load_forecast_data(lookback_days: int, refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    # Resolve the forecast table lazily: discovery only runs on a snapshot miss
+    # (the live path). When a forecast snapshot exists, _cached_query serves it
+    # without touching BigQuery — so cold starts stay snapshot-fast.
+    def _build_forecast_sql() -> str:
+        spec = _forecast_spec(refresh_slot)
+        if not spec or spec.get("grain") != "daily":
+            raise _ForecastSourceMissing()
+        project = _get_sa_info()["project_id"]
+        dataset = st.secrets["bigquery"]["dataset"]
+        return forecast_source.build_forecast_sql(spec, project, dataset)
+
     try:
         df = _cached_query("forecast_query.sql", [
             bigquery.ArrayQueryParameter("active_items", "INT64", ACTIVE_ITEMS),
             bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback_days),
-        ])
+        ], sql_override=_build_forecast_sql)
         # Shared with the snapshot builder (transforms.py): forecast_quantity
         # arrives as boxed Decimals over ~273k rows, so the builder pre-shrinks
         # this frame too and the cold-start read here is a cheap no-op.
         df = transforms.process_forecast_frame(df)
         return df, None
+    except _ForecastSourceMissing:
+        # A configuration gap, not a transient error. Log the specifics
+        # server-side (the page is public); return a user-safe, marked message.
+        spec = _forecast_spec(refresh_slot)
+        if spec and spec.get("grain") == "weekly":
+            logger.warning("forecast source: only a weekly table (%r) found; no daily fcst_dt feed",
+                           spec.get("table"))
+            return pd.DataFrame(), ("CONFIG: Only a weekly demand forecast is available in the dataset; "
+                                    "the Forecast tab needs a daily forecast feed (fcst_dt).")
+        logger.warning("forecast source: no daily forecast table found in the dataset")
+        return pd.DataFrame(), ("CONFIG: No daily store demand-forecast table was found in the dataset. "
+                                "It needs a daily feed with a forecast date (fcst_dt) and quantity "
+                                "(fcst_tot_dmand_each_qty or final_fcst_each_qty).")
     except Exception as e:
         return pd.DataFrame(), str(e)
 
@@ -2004,7 +2067,14 @@ def _render_forecast():
 
     fcst_df, fcst_err = load_forecast_data(lookback, slot)
     if fcst_err:
-        _section_error("Forecast data", fcst_err)
+        # CONFIG: = a known setup gap (no daily forecast source), not a transient
+        # error — show it plainly instead of the generic "check back shortly".
+        # The message is intentionally free of project/dataset/table names.
+        if fcst_err.startswith("CONFIG:"):
+            st.warning("🔮 Forecast unavailable — " + fcst_err[len("CONFIG:"):].strip()
+                       + " See the README's *Forecast tab data source* note.")
+        else:
+            _section_error("Forecast data", fcst_err)
     elif fcst_df.empty:
         st.info("No forecast records returned for the selected items and lookback window.")
     else:

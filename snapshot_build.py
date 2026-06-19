@@ -26,6 +26,7 @@ import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+import forecast_source
 import snapshot
 import transforms
 from constants import ACTIVE_ITEMS
@@ -66,6 +67,19 @@ def query_jobs(lookback: int):
 def load_sql(filename: str, project: str, dataset: str) -> str:
     text = (SQL_DIR / filename).read_text()
     return text.replace("{project}", project).replace("{dataset}", dataset)
+
+
+def forecast_sql(run_query, project: str, dataset: str) -> str | None:
+    """Build the daily forecast query against the table discovered in the dataset
+    (see forecast_source). The physical name varies per BI Link export, so the
+    static sql/forecast_query.sql name isn't used directly. Returns None when no
+    daily forecast table is present, so the build skips it instead of failing.
+    ``FORECAST_TABLE`` env var pins the name if discovery should be bypassed."""
+    spec = forecast_source.discover_forecast_spec(
+        run_query, project, dataset, override_table=os.environ.get("FORECAST_TABLE") or None)
+    if not spec or spec.get("grain") != "daily":
+        return None
+    return forecast_source.build_forecast_sql(spec, project, dataset)
 
 
 def _committed_store_max_date(store_key: str):
@@ -144,10 +158,22 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"  WARN: writing {store_filename} failed: {e}", file=sys.stderr)
 
+    run_query = lambda sql: client.query(
+        sql, job_config=bigquery.QueryJobConfig()
+    ).to_dataframe(create_bqstorage_client=False)
+
     for filename, params in jobs[1:]:
         try:
+            if filename == "forecast_query.sql":
+                sql = forecast_sql(run_query, project, dataset)
+                if sql is None:
+                    print("  WARN: no daily forecast table discovered; skipping forecast snapshot",
+                          file=sys.stderr)
+                    continue
+            else:
+                sql = load_sql(filename, project, dataset)
             df = client.query(
-                load_sql(filename, project, dataset),
+                sql,
                 job_config=bigquery.QueryJobConfig(query_parameters=params),
             ).to_dataframe(create_bqstorage_client=False)
             # Pre-shrink the heavy frames the app would re-shrink on cold start
@@ -177,9 +203,6 @@ def main() -> int:
     try:
         import store_directory
         built_keys.add(store_directory.DIRECTORY_FILENAME)
-        run_query = lambda sql: client.query(
-            sql, job_config=bigquery.QueryJobConfig()
-        ).to_dataframe(create_bqstorage_client=False)
         dir_df = store_directory.build_directory_df(run_query, project, dataset)
         if store_directory.DIRECTORY_FILENAME and not dir_df.empty:
             updated = snapshot.write_if_changed(store_directory.DIRECTORY_FILENAME, dir_df)
