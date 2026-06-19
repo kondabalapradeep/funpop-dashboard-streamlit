@@ -6,6 +6,11 @@ Tab structure:
                       estimated lost sales $ and in-stock % service level)
   Sales & Velocity  — Weekly sales, AUR/price trend, YoY units bridge (distribution
                       vs velocity), U/S/W, velocity-tier heatmap, store leaderboard
+  Sales Drivers     — Why sales are up/down vs LY for the selected window: a
+                      distribution/velocity/price sales-dollar bridge, a demand-vs-
+                      availability (stockout) diagnosis that weighs the inventory
+                      feed against sales, item/state/store contributors, and the
+                      weekly trajectory (sales gap vs in-stock rate)
   Forecast          — Upcoming demand forecast vs sales, attainment & bias, store
                       replenishment watchlist, and DC demand coverage
   Inventory & DC    — Weekly inventory, phantom inventory, DC pipeline (true alignment)
@@ -637,11 +642,19 @@ STATE_FIPS = {
 US_STATES_TOPO_URL = "https://vega.github.io/vega-datasets/data/us-10m.json"
 
 
-def _waterfall_chart(steps: list, value_fmt: str = ",.0f", height: int = 300):
+def _waterfall_chart(steps: list, value_fmt: str = ",.0f", height: int = 300,
+                     y_title: str = "Units", currency: bool = False):
     """Build a left-to-right waterfall from a list of {label, amount, kind} dicts.
     kind='total' draws a full-height bar from zero (anchors); kind='delta' floats
     from the running total. Used for the YoY units bridge (LY → distribution →
-    velocity → TY)."""
+    velocity → TY) and the Sales Drivers sales-dollar bridge. Pass currency=True
+    to label/tooltip amounts as dollars and y_title to relabel the axis; the
+    defaults keep the original unit-bridge behaviour."""
+    def _label(amt):
+        if currency:
+            return f"{'+' if amt >= 0 else '-'}${abs(amt):,.0f}"
+        return f"{amt:+{value_fmt}}"
+    tip_fmt = "$,.0f" if currency else value_fmt
     running = 0.0
     rows = []
     for s in steps:
@@ -654,20 +667,20 @@ def _waterfall_chart(steps: list, value_fmt: str = ",.0f", height: int = 300):
             end = running
             band = "Up" if s["amount"] >= 0 else "Down"
         rows.append({**s, "start": start, "end": end, "band": band,
-                     "label_amt": ("" if s["kind"] == "total" else f"{s['amount']:+{value_fmt}}")})
+                     "label_amt": ("" if s["kind"] == "total" else _label(s["amount"]))})
     wf = pd.DataFrame(rows)
     order = list(wf["label"])
     base = alt.Chart(wf).encode(
         x=alt.X("label:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)))
     bars = base.mark_bar(size=46).encode(
-        y=alt.Y("start:Q", title="Units"),
+        y=alt.Y("start:Q", title=y_title),
         y2="end:Q",
         color=alt.Color("band:N", scale=alt.Scale(
             domain=["Total", "Up", "Down"], range=["#185FA5", "#27500A", "#791F1F"]),
             legend=None),
         tooltip=[alt.Tooltip("label:N", title=""),
-                 alt.Tooltip("amount:Q", format=value_fmt, title="Effect"),
-                 alt.Tooltip("end:Q", format=value_fmt, title="Cumulative")])
+                 alt.Tooltip("amount:Q", format=tip_fmt, title="Effect"),
+                 alt.Tooltip("end:Q", format=tip_fmt, title="Cumulative")])
     labels = base.mark_text(dy=-6, color="#333", fontWeight="bold").encode(
         y=alt.Y("end:Q"), text=alt.Text("label_amt:N"))
     return (bars + labels).properties(height=height)
@@ -878,9 +891,10 @@ st.caption(
 
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
-tab_overview, tab_sales, tab_forecast, tab_inv, tab_channels, tab_dist, tab_actions = st.tabs([
+tab_overview, tab_sales, tab_drivers, tab_forecast, tab_inv, tab_channels, tab_dist, tab_actions = st.tabs([
     "📊 Overview",
     "📈 Sales & Velocity",
+    "🔍 Sales Drivers",
     "🔮 Forecast",
     "📦 Inventory & DC",
     "🛒 Channels",
@@ -893,7 +907,7 @@ tab_overview, tab_sales, tab_forecast, tab_inv, tab_channels, tab_dist, tab_acti
 #   TAB 1 — OVERVIEW
 # ═══════════════════════════════════════════════════════════════════════════
 # Each tab body is an st.fragment: a widget inside a tab (scope radio, slider,
-# search box) reruns only that tab's code instead of recomputing all seven tabs'
+# search box) reruns only that tab's code instead of recomputing all eight tabs'
 # aggregations over the ~544k-row frame — the difference between a sub-second
 # and a multi-second interaction. Sidebar widgets still trigger a full rerun.
 @st.fragment
@@ -1611,7 +1625,375 @@ def _render_sales():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 3 — FORECAST
+#   TAB 3 — SALES DRIVERS (what's behind the change, incl. the inventory cause)
+# ═══════════════════════════════════════════════════════════════════════════
+# Answers one question for the current filters: *why* are sales up or down vs the
+# same period last year? It works entirely off the POS + store-inventory frame
+# already in memory — no extra queries — and (a) splits the sales-dollar change
+# into distribution, velocity and price effects (an exact, additive bridge),
+# (b) weighs how much of any move is a fixable availability (stockout) problem
+# vs a true demand shift by reading the inventory feed against sales, and
+# (c) localises the change to the items, states and stores moving it. Every
+# number follows the sidebar item/state filters and the performance window;
+# only the closing trajectory chart spans the full date range, for context.
+@st.fragment
+def _render_drivers():
+    st.caption(
+        f"Why sales moved versus the **same period last year**, for the current selection "
+        f"({item_view}{_state_note}) over the **{window_label}**. Reads the inventory feed "
+        f"against sales to separate a fixable availability problem from a true demand shift, "
+        f"then localises the change to items, states and stores. Follows the sidebar filters "
+        f"and performance window; the trajectory chart at the bottom spans the full range."
+    )
+
+    # ── Window aggregates (TY vs LY) ─────────────────────────────────────────
+    units_ty = float(df_window["pos_quantity_this_year"].sum())
+    units_ly = float(df_window["pos_quantity_last_year"].sum())
+    sales_ty = float(df_window["pos_sales_this_year"].sum())
+    sales_ly = float(df_window["pos_sales_last_year"].sum())
+    d_units = units_ty - units_ly
+    d_sales = sales_ty - sales_ly
+    units_pct = (d_units / units_ly * 100) if units_ly else 0.0
+    sales_pct = (d_sales / sales_ly * 100) if sales_ly else 0.0
+
+    if not sales_ly and not units_ly:
+        st.info(
+            "No same-period-last-year sales in this window, so there's no baseline to explain "
+            "a change against. Widen the lookback or clear the item/state filters."
+        )
+        return
+
+    # ── Sales-dollar bridge: distribution × velocity × price ─────────────────
+    # Δsales = Δunits·AUR_ly + ΔAUR·units_ty, and Δunits splits exactly into a
+    # distribution effect (Δ selling-stores × LY per-store rate) and a velocity
+    # effect (Δ per-store rate × TY selling-stores). Multiplying the two unit
+    # effects by LY AUR puts all three on a dollar footing that sums to Δsales.
+    stores_ty = int(df_window[df_window["pos_quantity_this_year"] > 0]["store_number"].nunique())
+    stores_ly = int(df_window[df_window["pos_quantity_last_year"] > 0]["store_number"].nunique())
+    rate_ty = (units_ty / stores_ty) if stores_ty else 0.0   # units per selling store
+    rate_ly = (units_ly / stores_ly) if stores_ly else 0.0
+    aur_ty = (sales_ty / units_ty) if units_ty else 0.0
+    aur_ly = (sales_ly / units_ly) if units_ly else 0.0
+    dist_units = (stores_ty - stores_ly) * rate_ly
+    velo_units = (rate_ty - rate_ly) * stores_ty
+    dist_dollars = dist_units * aur_ly
+    velo_dollars = velo_units * aur_ly
+    price_dollars = (aur_ty - aur_ly) * units_ty
+
+    # Primary driver = the biggest contributor in the direction of the net change.
+    _drivers = [
+        ("distribution — the number of stores selling", dist_dollars),
+        ("velocity — units sold per selling store", velo_dollars),
+        ("price — average unit retail", price_dollars),
+    ]
+    primary_name, primary_val = (max(_drivers, key=lambda x: x[1]) if d_sales >= 0
+                                 else min(_drivers, key=lambda x: x[1]))
+
+    # ── Verdict banner ───────────────────────────────────────────────────────
+    if sales_pct <= -10:
+        _fn, _icon = st.error, "🔴"
+    elif sales_pct < -2:
+        _fn, _icon = st.warning, "🟡"
+    elif sales_pct > 2:
+        _fn, _icon = st.success, "🟢"
+    else:
+        _fn, _icon = st.info, "ℹ️"
+    _dir = "up" if d_sales >= 0 else "down"
+    _fn(
+        f"**Sales are {_dir} {abs(sales_pct):.1f}% YoY** this window "
+        f"(${sales_ty:,.0f} vs ${sales_ly:,.0f}, {d_sales:+,.0f}). "
+        f"The biggest driver is **{primary_name}** ({primary_val:+,.0f}).",
+        icon=_icon,
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Sales TY", f"${sales_ty:,.0f}", f"{sales_pct:+.1f}% YoY")
+    k2.metric("Sales LY", f"${sales_ly:,.0f}", help="Same period last year.")
+    k3.metric("Units TY", f"{units_ty:,.0f}", f"{units_pct:+.1f}% YoY")
+    k4.metric("Net sales change", f"${d_sales:+,.0f}", delta_color="off",
+              help="This year minus last year, for this window.")
+
+    # ── What moved sales dollars ─────────────────────────────────────────────
+    st.divider()
+    st.subheader(f"What moved sales dollars — {window_label}")
+    st.caption(
+        "Splits the year-over-year **sales-dollar** change into three exact, additive effects: "
+        "**distribution** (change in stores selling × last year's per-store rate), "
+        "**velocity** (change in units per selling store × this year's store count), and "
+        "**price** (change in average unit retail × this year's units). Distribution and "
+        "velocity are the demand/availability levers; price is margin / markdown."
+    )
+    steps = [
+        {"label": "LY sales", "amount": sales_ly, "kind": "total"},
+        {"label": "Distribution", "amount": dist_dollars, "kind": "delta"},
+        {"label": "Velocity", "amount": velo_dollars, "kind": "delta"},
+        {"label": "Price", "amount": price_dollars, "kind": "delta"},
+        {"label": "TY sales", "amount": sales_ty, "kind": "total"},
+    ]
+    bcol, scol = st.columns([3, 2])
+    with bcol:
+        st.altair_chart(
+            _waterfall_chart(steps, height=320, y_title="Sales ($)", currency=True),
+            width='stretch')
+    with scol:
+        st.metric("Selling stores", f"{stores_ty:,}", delta=f"{stores_ty - stores_ly:+,} vs LY")
+        st.metric("Units / selling store", f"{rate_ty:,.1f}",
+                  delta=f"{((rate_ty - rate_ly) / rate_ly * 100) if rate_ly else 0:+.1f}% vs LY")
+        st.metric("Avg unit retail", f"${aur_ty:,.2f}",
+                  delta=f"{((aur_ty - aur_ly) / aur_ly * 100) if aur_ly else 0:+.1f}% vs LY")
+    st.caption(
+        f"Distribution **${dist_dollars:+,.0f}**  ·  velocity **${velo_dollars:+,.0f}**  ·  "
+        f"price **${price_dollars:+,.0f}**  →  net **${d_sales:+,.0f}**."
+    )
+
+    # ── Demand vs availability (the inventory cause) ──────────────────────────
+    # The bridge above can't tell a true demand drop from product simply not being
+    # on the shelf — both show up as lost velocity. This reads the inventory feed
+    # to size the recoverable (stockout) piece and judge whether stock levels are
+    # the constraint.
+    st.divider()
+    st.subheader("Is it demand or availability?")
+    st.caption(
+        "Velocity falls for two very different reasons: customers buying less (a demand "
+        "problem) or product not on the shelf (a fixable availability problem). This weighs "
+        "the inventory feed against sales — estimated sales lost to stockouts, the in-stock "
+        "rate, and whether on-hand is the constraint — to tell them apart."
+    )
+
+    # Per-store normal daily velocity from the full lookback (a stable baseline),
+    # credited to every out-of-stock store-day inside the window — so we never
+    # invent demand a store hasn't shown. Mirrors the Overview tab's method.
+    store_vel = df.groupby("store_number")["pos_quantity_this_year"].sum() / period_days
+    win_sd_oh = df_window.groupby(["store_number", "business_date"], as_index=False)[
+        "store_on_hand_quantity_this_year"].sum()
+    win_sd_oh["is_oos"] = win_sd_oh["store_on_hand_quantity_this_year"] == 0
+    oos_sd = win_sd_oh[win_sd_oh["is_oos"]].copy()
+    oos_sd["exp_units"] = oos_sd["store_number"].map(store_vel).fillna(0.0)
+    lost_units = float(oos_sd["exp_units"].sum())
+    lost_sales = lost_units * (aur_ty if aur_ty else aur_ly)
+    oos_store_days = int(len(oos_sd))
+    total_store_days = int(len(win_sd_oh))
+    instock_pct = (100 * (1 - oos_store_days / total_store_days)) if total_store_days else 100.0
+
+    # On-hand YoY at the window's latest day (the frame carries LY on-hand), plus
+    # weeks of supply on the recent run-rate (last 14 days, as the Inventory tab).
+    _snap = df_window[df_window["business_date"] == df_window["business_date"].max()]
+    oh_ty = float(_snap["store_on_hand_quantity_this_year"].sum())
+    oh_ly = float(_snap["store_on_hand_quantity_last_year"].sum())
+    oh_yoy = ((oh_ty - oh_ly) / oh_ly * 100) if oh_ly else 0.0
+    inv_recent = df[df["business_date"] >= most_recent - timedelta(days=13)]
+    inv_recent_days = max(1, inv_recent["business_date"].dt.normalize().nunique())
+    weekly_runrate = float(inv_recent["pos_quantity_this_year"].sum()) / inv_recent_days * 7
+    wos = (oh_ty / weekly_runrate) if weekly_runrate else float("inf")
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Est. sales lost to stockouts", f"${lost_sales:,.0f}",
+              delta=f"≈ {lost_units:,.0f} units", delta_color="off",
+              help="Every out-of-stock store-day in the window credited the store's own "
+                   "normal daily velocity (full-lookback rate), priced at this year's AUR. "
+                   "Conservative — never credits demand a store hasn't shown.")
+    a2.metric("In-stock % (window)", f"{instock_pct:.1f}%",
+              help="Share of store-days with on-hand > 0. 95%+ is the retail service-level target.")
+    a3.metric("Store on-hand YoY", f"{oh_yoy:+.1f}%", delta_color="off",
+              help=f"On-hand {oh_ty:,.0f} TY vs {oh_ly:,.0f} LY at the latest day in the window.")
+    a4.metric("Weeks of supply", (f"{wos:.1f} wks" if np.isfinite(wos) else "—"),
+              help="Store on-hand ÷ recent weekly sell-through (last 14 days).")
+
+    if d_sales < 0:
+        gap = -d_sales
+        share = (lost_sales / gap) if gap > 0 else 0.0
+        if instock_pct < 96.0 or share >= 0.25:
+            st.warning(
+                f"**Availability is a meaningful driver of the decline.** Stockouts cost an "
+                f"estimated **${lost_sales:,.0f}** this window — about **{min(share, 1) * 100:.0f}% "
+                f"of the ${gap:,.0f} shortfall** — with in-stock at **{instock_pct:.1f}%**. Much of "
+                f"this is recoverable through replenishment and on-shelf execution; the Store "
+                f"Actions tab lists the specific stores to dispatch.",
+                icon="📦")
+        else:
+            _overstocked = (np.isfinite(wos) and wos >= 6) or oh_yoy > 10
+            _tail = (f", yet on-hand is **{oh_yoy:+.0f}% YoY** at **{wos:.1f} wks** of supply — "
+                     f"stock is building against softer demand (markdown / return risk)."
+                     if _overstocked else
+                     ". The product is on the shelf; customers are simply buying less per store.")
+            st.info(
+                f"**This looks demand-driven, not a supply problem.** In-stock is healthy at "
+                f"**{instock_pct:.1f}%** and stockouts explain only ~{share * 100:.0f}% of the "
+                f"shortfall{_tail} The lever here is demand (assortment, price, promotion), not "
+                f"replenishment.",
+                icon="🛒")
+    elif d_sales > 0:
+        if instock_pct < 96.0 and lost_sales > 0:
+            st.success(
+                f"**Sales are growing**, but stockouts still left an estimated **${lost_sales:,.0f}** "
+                f"on the table (in-stock {instock_pct:.1f}%) — closing that gap is additional upside.",
+                icon="🟢")
+        else:
+            _tail = (f" On-hand is **{oh_yoy:+.0f}% YoY** at {wos:.1f} wks of supply — keep it "
+                     f"positioned to sustain the run." if np.isfinite(wos) else "")
+            st.success(
+                f"**Sales are growing** with in-stock at **{instock_pct:.1f}%** — demand is being "
+                f"met, not constrained by supply.{_tail}",
+                icon="🟢")
+    else:
+        st.info("Sales are essentially flat versus last year for this window.")
+
+    # ── Where the change is concentrated ──────────────────────────────────────
+    st.divider()
+    st.subheader("Where the change is concentrated")
+    st.caption(
+        "The same net change, broken out by item, state and store so you can see what's "
+        "actually moving it — and, at store level, whether each mover is a stockout or a "
+        "demand story."
+    )
+    metric_choice = st.radio(
+        "Measure contributions in", ["Sales ($)", "Units"], index=0, horizontal=True,
+        key="drivers_contrib_metric")
+    use_dollars = metric_choice == "Sales ($)"
+    ty_col = "pos_sales_this_year" if use_dollars else "pos_quantity_this_year"
+    ly_col = "pos_sales_last_year" if use_dollars else "pos_quantity_last_year"
+    val_fmt = "$%.0f" if use_dollars else "%d"
+    chart_fmt = "$,.0f" if use_dollars else ",.0f"
+
+    def _diverging(frame, cat_col, cat_title, height):
+        order = list(frame.sort_values("change")[cat_col].astype(str))
+        return alt.Chart(frame).mark_bar().encode(
+            x=alt.X("change:Q", title=f"YoY change ({metric_choice})",
+                    axis=alt.Axis(format=chart_fmt)),
+            y=alt.Y(f"{cat_col}:N", sort=order, title=cat_title),
+            color=alt.Color("dir:N", scale=alt.Scale(domain=["Up", "Down"],
+                            range=["#27500A", "#791F1F"]), legend=None),
+            tooltip=[alt.Tooltip(f"{cat_col}:N", title=cat_title),
+                     alt.Tooltip("ty:Q", title="TY", format=chart_fmt),
+                     alt.Tooltip("ly:Q", title="LY", format=chart_fmt),
+                     alt.Tooltip("change:Q", title="Change", format=chart_fmt),
+                     alt.Tooltip("yoy_pct:Q", title="YoY %", format=".1f")],
+        ).properties(height=height)
+
+    # By item (Full + Half bins collapse to "Bins").
+    st.markdown("**By item**")
+    item_chg = df_window.groupby("item_group", as_index=False, observed=True).agg(
+        ty=(ty_col, "sum"), ly=(ly_col, "sum")).rename(columns={"item_group": "item"})
+    item_chg["item"] = item_chg["item"].astype(str)
+    item_chg["change"] = item_chg["ty"] - item_chg["ly"]
+    item_chg["yoy_pct"] = _yoy_pct(item_chg["ty"], item_chg["ly"])
+    item_chg["dir"] = np.where(item_chg["change"] >= 0, "Up", "Down")
+    st.altair_chart(_diverging(item_chg, "item", "Item", max(120, len(item_chg) * 46)),
+                    width='stretch')
+
+    # By state — biggest drags and lifts.
+    st.markdown("**By state — biggest drags and lifts**")
+    state_chg = df_window.groupby("state_or_province_code", as_index=False, observed=True).agg(
+        ty=(ty_col, "sum"), ly=(ly_col, "sum"))
+    state_chg["state"] = state_chg["state_or_province_code"].astype(str)
+    state_chg["change"] = state_chg["ty"] - state_chg["ly"]
+    state_chg["yoy_pct"] = _yoy_pct(state_chg["ty"], state_chg["ly"])
+    top_states = pd.concat([state_chg.nsmallest(8, "change"),
+                            state_chg.nlargest(8, "change")]).drop_duplicates(subset="state")
+    top_states["dir"] = np.where(top_states["change"] >= 0, "Up", "Down")
+    if not top_states.empty:
+        st.altair_chart(
+            _diverging(top_states, "state", "State", max(160, len(top_states) * 26)),
+            width='stretch')
+
+    # By store — biggest movers, with a likely cause tagged from the inventory feed.
+    st.markdown("**By store — biggest movers (with likely cause)**")
+    store_chg = df_window.groupby(["store_number", "state_or_province_code"],
+                                  as_index=False, observed=True).agg(
+        ty_u=("pos_quantity_this_year", "sum"), ly_u=("pos_quantity_last_year", "sum"),
+        ty_s=("pos_sales_this_year", "sum"), ly_s=("pos_sales_last_year", "sum"))
+    store_chg["change"] = ((store_chg["ty_s"] - store_chg["ly_s"]) if use_dollars
+                           else (store_chg["ty_u"] - store_chg["ly_u"]))
+    _lm = (df_window.groupby("store_number")["business_date"].transform("max")
+           == df_window["business_date"])
+    latest_oh = df_window[_lm].groupby("store_number")["store_on_hand_quantity_this_year"].sum()
+    oos_days_by_store = oos_sd.groupby("store_number").size()
+    store_chg["on_hand"] = store_chg["store_number"].map(latest_oh).fillna(0).astype(int)
+    store_chg["oos_days"] = store_chg["store_number"].map(oos_days_by_store).fillna(0).astype(int)
+    # A decliner that's currently out of stock (or went OOS during the window) is an
+    # availability story; one that's still stocked but selling less is a demand story.
+    store_chg["cause"] = np.where(
+        store_chg["change"] >= 0, "—",
+        np.where((store_chg["on_hand"] == 0) | (store_chg["oos_days"] >= 1),
+                 "📦 Stockout", "🛒 Demand"))
+    dcol, gcol = st.columns(2)
+    with dcol:
+        st.markdown("Top decliners")
+        dec = store_chg.nsmallest(12, "change")[
+            ["store_number", "state_or_province_code", "change", "on_hand", "cause"]].copy()
+        dec.columns = ["Store", "State", "Change", "On-hand", "Likely cause"]
+        st.dataframe(dec, width='stretch', hide_index=True, column_config={
+            "Change": st.column_config.NumberColumn(format=val_fmt),
+            "On-hand": st.column_config.NumberColumn(format="%d")})
+    with gcol:
+        st.markdown("Top gainers")
+        gn = store_chg.nlargest(12, "change")[
+            ["store_number", "state_or_province_code", "change", "on_hand"]].copy()
+        gn.columns = ["Store", "State", "Change", "On-hand"]
+        st.dataframe(gn, width='stretch', hide_index=True, column_config={
+            "Change": st.column_config.NumberColumn(format=val_fmt),
+            "On-hand": st.column_config.NumberColumn(format="%d")})
+
+    # ── Trajectory: weekly sales gap vs in-stock rate ─────────────────────────
+    # Whole-range context the window can't show: is the YoY deficit (or surplus)
+    # widening or closing, and does it track the in-stock rate? A deepening gap
+    # that moves with falling in-stock points to availability; a gap while
+    # in-stock holds points to demand.
+    st.divider()
+    st.subheader("Trajectory — is the gap widening or closing?")
+    st.caption(
+        "Weekly YoY sales gap (this year minus last year) across the full date range, with the "
+        "in-stock rate overlaid. Partial weeks are scaled to a 7-day equivalent. Spans the full "
+        "range regardless of the performance window, for context."
+    )
+    wk = df.groupby("walmart_calendar_week", as_index=False).agg(
+        sales_ty=("pos_sales_this_year", "sum"),
+        sales_ly=("pos_sales_last_year", "sum"),
+        days_in_week=("business_date", "nunique"))
+    _norm = _week_norm_factor(wk["days_in_week"])
+    wk["sales_ty"] = wk["sales_ty"] * _norm
+    wk["sales_ly"] = wk["sales_ly"] * _norm
+    wk["gap"] = wk["sales_ty"] - wk["sales_ly"]
+    wk["dir"] = np.where(wk["gap"] >= 0, "Up", "Down")
+    wk["is_partial"] = wk["days_in_week"] < 7
+    wk["week_label"] = _wm_week_label(wk["walmart_calendar_week"], wk["is_partial"])
+    wk = wk.sort_values("walmart_calendar_week").reset_index(drop=True)
+    # Weekly in-stock %: share of store-days with on-hand > 0.
+    _sdoh = df.groupby(["walmart_calendar_week", "business_date", "store_number"],
+                       as_index=False)["store_on_hand_quantity_this_year"].sum()
+    _sdoh["oos"] = _sdoh["store_on_hand_quantity_this_year"] == 0
+    _wk_is = _sdoh.groupby("walmart_calendar_week", as_index=False).agg(
+        oos_sd=("oos", "sum"), tot_sd=("oos", "size"))
+    _wk_is["instock_pct"] = 100 * (1 - _wk_is["oos_sd"] / _wk_is["tot_sd"])
+    wk = wk.merge(_wk_is[["walmart_calendar_week", "instock_pct"]],
+                  on="walmart_calendar_week", how="left")
+
+    if not wk.empty:
+        _order = list(wk["week_label"])
+        _x = alt.X("week_label:N", sort=_order, title="Week", axis=alt.Axis(labelAngle=-30))
+        gap_bars = alt.Chart(wk).mark_bar().encode(
+            x=_x,
+            y=alt.Y("gap:Q", title="Weekly YoY sales gap ($)"),
+            color=alt.Color("dir:N", scale=alt.Scale(domain=["Up", "Down"],
+                            range=["#27500A", "#791F1F"]), legend=None),
+            tooltip=["week_label",
+                     alt.Tooltip("sales_ty:Q", title="Sales TY", format="$,.0f"),
+                     alt.Tooltip("sales_ly:Q", title="Sales LY", format="$,.0f"),
+                     alt.Tooltip("gap:Q", title="YoY gap", format="$,.0f"),
+                     alt.Tooltip("instock_pct:Q", title="In-stock %", format=".1f")])
+        instock_line = alt.Chart(wk).mark_line(point=True, strokeWidth=2.5, color="#185FA5").encode(
+            x=_x,
+            y=alt.Y("instock_pct:Q", title="In-stock %", scale=alt.Scale(zero=False)),
+            tooltip=["week_label", alt.Tooltip("instock_pct:Q", title="In-stock %", format=".1f")])
+        st.altair_chart(
+            alt.layer(gap_bars, instock_line).resolve_scale(y="independent").properties(height=340),
+            width='stretch')
+        st.caption("Bars = weekly YoY sales gap (green = ahead of LY, red = behind, left axis). "
+                   "Blue line = in-stock % (right axis).")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TAB 4 — FORECAST
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_forecast():
@@ -1913,7 +2295,7 @@ def _render_forecast():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 4 — INVENTORY & DC
+#   TAB 5 — INVENTORY & DC
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_inventory():
@@ -2507,7 +2889,7 @@ def _render_inventory():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 5 — CHANNELS (omni sales, ecom inventory, returns)
+#   TAB 6 — CHANNELS (omni sales, ecom inventory, returns)
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_channels():
@@ -2717,7 +3099,7 @@ def _render_channels():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 6 — DISTRIBUTION
+#   TAB 7 — DISTRIBUTION
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_distribution():
@@ -2842,7 +3224,7 @@ def _render_distribution():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 7 — STORE ACTIONS (field-intervention list + vendor export)
+#   TAB 8 — STORE ACTIONS (field-intervention list + vendor export)
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_actions():
@@ -3176,6 +3558,8 @@ with tab_overview:
     _render_overview()
 with tab_sales:
     _render_sales()
+with tab_drivers:
+    _render_drivers()
 with tab_forecast:
     _render_forecast()
 with tab_inv:
