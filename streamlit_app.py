@@ -1638,12 +1638,42 @@ def _render_sales():
 # only the closing trajectory chart spans the full date range, for context.
 @st.fragment
 def _render_drivers():
+    # Per-tab performance window: scope this whole analysis to a single day, the
+    # last 7 days, or the full lookback — independent of the sidebar, and (being
+    # inside the fragment) switchable without rerunning the other tabs. Defaults
+    # to the sidebar's current Performance window. Reassigning df_window /
+    # window_label here shadows the module-level pair for the rest of this
+    # function, so every section below picks up the local window automatically.
+    _win_opts = ["Most recent day", "Last 7 days", "Full lookback"]
+    win_choice = st.radio(
+        "Performance window",
+        options=_win_opts,
+        index=_win_opts.index(perf_window) if perf_window in _win_opts else 0,
+        horizontal=True,
+        key="drivers_perf_window",
+        help="Scope this tab's analysis to a single day, the last 7 days, or the full "
+             "lookback. Independent of the sidebar Performance window (defaults to it).",
+    )
+    if win_choice == "Most recent day":
+        df_window = df[df["business_date"] == most_recent]
+        window_label = f"Day of {most_recent.strftime('%b %d, %Y')}"
+    elif win_choice == "Last 7 days":
+        _cut7 = most_recent - timedelta(days=6)
+        df_window = df[df["business_date"] >= _cut7]
+        window_label = (f"Last 7 days ({_cut7.strftime('%b %d')}–"
+                        f"{most_recent.strftime('%b %d')})")
+    else:
+        df_window = df
+        window_label = (f"Full lookback ({df['business_date'].min().strftime('%b %d')}–"
+                        f"{most_recent.strftime('%b %d')}, {period_days} data days)")
+
     st.caption(
         f"Why sales moved versus the **same period last year**, for the current selection "
         f"({item_view}{_state_note}) over the **{window_label}**. Reads the inventory feed "
         f"against sales to separate a fixable availability problem from a true demand shift, "
-        f"then localises the change to items, states and stores. Follows the sidebar filters "
-        f"and performance window; the trajectory chart at the bottom spans the full range."
+        f"then localises the change to items, states and stores. Follows the sidebar item / "
+        f"state filters; pick the time window above. The trajectory chart at the bottom spans "
+        f"the full date range for context."
     )
 
     # ── Window aggregates (TY vs LY) ─────────────────────────────────────────
