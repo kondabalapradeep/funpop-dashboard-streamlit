@@ -9,3 +9,6 @@ google-auth
 pyarrow
 db-dtypes
 altair
+# Weather tab: NWS-style filled-contour maps (interpolation + render).
+matplotlib
+scipy

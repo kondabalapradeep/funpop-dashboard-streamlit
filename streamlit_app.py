@@ -17,6 +17,9 @@ Tab structure:
   Channels          — Omni sales (+ channel-mix over time), eComm inventory, store
                       returns (+ returns by reason)
   Distribution      — Modular coverage, state performance (choropleth + ranked bar)
+  Weather           — NWS-style national maps of daily high temperature and
+                      precipitation for the past 7 days + up to 16 forecast days,
+                      live from Open-Meteo (free, no API key; not snapshotted)
   Store Actions     — Flags stores with a rep-fixable problem over the last 7 days
                       (phantom/backroom stock, sales collapse, chronic OOS) and
                       exports a ranked dispatch list with mailing address for a
@@ -64,6 +67,7 @@ import forecast_source
 import snapshot
 import store_directory
 import transforms
+import weather_source
 
 # Walmart is in Bentonville (Central Time). Daily BI Link feeds typically
 # land around 7am Central, sometimes later.
@@ -954,7 +958,8 @@ st.caption(
 
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
-tab_overview, tab_sales, tab_drivers, tab_forecast, tab_inv, tab_channels, tab_dist, tab_actions = st.tabs([
+(tab_overview, tab_sales, tab_drivers, tab_forecast, tab_inv, tab_channels,
+ tab_dist, tab_weather, tab_actions) = st.tabs([
     "📊 Overview",
     "📈 Sales & Velocity",
     "🔍 Sales Drivers",
@@ -962,6 +967,7 @@ tab_overview, tab_sales, tab_drivers, tab_forecast, tab_inv, tab_channels, tab_d
     "📦 Inventory & DC",
     "🛒 Channels",
     "🗺️ Distribution",
+    "🌤️ Weather",
     "🚩 Store Actions",
 ])
 
@@ -3623,6 +3629,56 @@ baseline keeps low-volume daily noise from triggering false dispatches.
             )
 
 
+# ─── Weather tab (live Open-Meteo, deliberately not snapshotted) ─────────────
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def load_weather_grid():
+    """Live US weather grid from Open-Meteo. Weather is real-time, so it is fetched
+    on view and cached ~3h — never written to the parquet snapshot (a stored copy
+    would only go stale). Returns ``weather_source.fetch_weather_grid()``."""
+    return weather_source.fetch_weather_grid()
+
+
+def _render_weather():
+    st.subheader("US weather — daily highs & precipitation")
+    st.caption(
+        "Smooth national maps of daily **high temperature** and **precipitation**, "
+        "styled after NOAA's National Digital Forecast Database. Live from "
+        "[Open-Meteo](https://open-meteo.com) (free, no API key) — the past 7 days "
+        "plus today and up to 16 forecast days. Independent of the BigQuery feed and "
+        "the snapshot; fetched fresh on view (cached ~3h)."
+    )
+    try:
+        with st.spinner("Fetching weather…"):
+            grid = load_weather_grid()
+    except Exception as e:
+        _section_error("Weather data", e)
+        return
+
+    dates = grid["dates"]
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        metric = st.radio("Metric", ["High temperature", "Precipitation"],
+                          key="weather_metric")
+    with c2:
+        idx = st.select_slider(
+            "Day",
+            options=list(range(len(dates))),
+            value=weather_source.today_index(dates),
+            format_func=lambda i: weather_source.day_label(dates[i], i),
+            key="weather_day",
+            help="Left of 'today' = observed; right = forecast (up to 16 days).",
+        )
+
+    metric_key = "temp" if metric.startswith("High") else "precip"
+    fig = weather_source.render_map(grid, idx, metric_key)
+    st.pyplot(fig, clear_figure=True)
+    st.caption(
+        "Daily highs (°F) and daily totals (in) interpolated from a ~2° national "
+        "grid and clipped to the US outline. Alaska, Hawaii and territories are not "
+        "shown on the contiguous-US map. Labels are baked into the image (no hover)."
+    )
+
+
 # ─── Render the tabs ─────────────────────────────────────────────────────────
 with tab_overview:
     _render_overview()
@@ -3638,6 +3694,8 @@ with tab_channels:
     _render_channels()
 with tab_dist:
     _render_distribution()
+with tab_weather:
+    _render_weather()
 with tab_actions:
     _render_actions()
 

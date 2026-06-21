@@ -57,6 +57,9 @@ its forecast columns and builds the query. Used by both the app
 
 - `streamlit_app.py` — the app (auth, loaders, all tab rendering).
 - `forecast_source.py` — runtime forecast-table discovery + SQL builder.
+- `weather_source.py` — Weather tab: live Open-Meteo grid fetch (free, no API key)
+  + NWS-style filled-contour map render. Real-time, so fetched on view (cached ~3h)
+  and **never snapshotted**; the US boundary ships in `data/us_states_conus.geojson`.
 - `transforms.py` — dtype-shrinking transforms shared by app + builder.
 - `snapshot.py` / `snapshot_build.py` — durable snapshot read / build.
 - `constants.py` — `ACTIVE_ITEMS` and item labels/pack sizes (single source of truth).
