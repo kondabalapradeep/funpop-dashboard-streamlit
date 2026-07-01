@@ -9,6 +9,8 @@ google-auth
 pyarrow
 db-dtypes
 altair
+# Distribution tab: interactive (zoom/pan/click) merchandising-zone map.
+plotly
 # Weather tab: NWS-style filled-contour maps (interpolation + render).
 matplotlib
 scipy
