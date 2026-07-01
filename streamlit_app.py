@@ -3356,16 +3356,21 @@ def _render_distribution():
         base = (alt.Chart(states_topo)
                 .mark_geoshape(fill="#f7f7f7", stroke="#b0b0b0", strokeWidth=0.6))
 
+        # mdse_sub_zone_number is best-effort (see store_zone_map's column
+        # discovery) — only tooltip it when the source actually had it.
+        zone_tooltip = [alt.Tooltip("store_number:Q", title="Store #", format="d"),
+                         alt.Tooltip("state_or_province_code:N", title="State"),
+                         alt.Tooltip("zone:N", title="Major zone")]
+        if "mdse_sub_zone_number" in zdf.columns:
+            zone_tooltip.append(alt.Tooltip("mdse_sub_zone_number:Q", title="Sub zone", format="d"))
+
         points = alt.Chart(zdf).mark_circle(size=16, opacity=0.75).encode(
             longitude="longitude:Q",
             latitude="latitude:Q",
             color=alt.Color("zone:N", sort=zone_domain,
                             scale=alt.Scale(domain=zone_domain, scheme="category10"),
                             legend=alt.Legend(title="Major zone", orient="right")),
-            tooltip=[alt.Tooltip("store_number:Q", title="Store #", format="d"),
-                     alt.Tooltip("state_or_province_code:N", title="State"),
-                     alt.Tooltip("zone:N", title="Major zone"),
-                     alt.Tooltip("mdse_sub_zone_number:Q", title="Sub zone", format="d")],
+            tooltip=zone_tooltip,
         )
 
         cities_df = pd.DataFrame(MAJOR_US_CITIES, columns=["city", "latitude", "longitude"])
