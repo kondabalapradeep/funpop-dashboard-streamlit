@@ -55,17 +55,24 @@ import altair as alt
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+# The zone map plots one point per store (~4-5k rows) — under Vega-Lite's
+# default 5,000-row inline-data cap but close enough that a store-count uptick
+# would trip it silently. The frame is tiny either way, so just disable the cap.
+alt.data_transformers.disable_max_rows()
+
 from constants import (
     ACTIVE_ITEMS,
     BIN_ITEMS,
     CASE_PACK_UNITS,
     ITEM_LABELS,
+    MAJOR_US_CITIES,
     SHELF_ITEMS,
     item_group_label,
 )
 import forecast_source
 import snapshot
 import store_directory
+import store_zone_map
 import transforms
 import weather_source
 
@@ -657,6 +664,30 @@ def load_store_directory(refresh_slot: str = "") -> tuple[pd.DataFrame, str | No
         project = _get_sa_info()["project_id"]
         dataset = st.secrets["bigquery"]["dataset"]
         return store_directory.build_directory_df(_run_query, project, dataset), None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+# Merchandising-zone + geo lookup for the Distribution tab's zone map. Same
+# "static committed file, live query as fallback" shape as load_store_directory
+# above — zone assignment and store lat/long are reference data that doesn't
+# move day to day, so there's no need to pull it on every cold start.
+@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+def load_zone_map_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    try:
+        if store_zone_map.MAP_PATH.exists():
+            df = pd.read_parquet(store_zone_map.MAP_PATH)
+        else:
+            raw = snapshot.fetch_remote(store_zone_map.MAP_PATH.name)
+            df = pd.read_parquet(io.BytesIO(raw)) if raw is not None else pd.DataFrame()
+        if not df.empty:
+            return store_zone_map.clean_zone_map_df(df), None
+    except Exception as e:  # noqa: BLE001 - a bad file must fall back to live
+        logger.warning("zone map snapshot read failed: %s", e)
+    try:
+        project = _get_sa_info()["project_id"]
+        dataset = st.secrets["bigquery"]["dataset"]
+        return store_zone_map.build_zone_map_df(_run_query, project, dataset), None
     except Exception as e:
         return pd.DataFrame(), str(e)
 
@@ -3297,6 +3328,65 @@ def _render_distribution():
                  alt.Tooltip("yoy_pct:Q", format=".1f", title="YoY %"),
                  alt.Tooltip("stores:Q", title="Stores")],
     ).properties(height=420)), width='stretch')
+
+    # ── Merchandising zones ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Merchandising zones")
+    st.caption(
+        "Each store's assigned merchandise major zone (BI Link `mdse_maj_zone_nbr`) — "
+        "major zones horizontally divide the country, numbered in multiples of 10. "
+        "Zone assignment and store location are static reference data that essentially "
+        "never change, so this map is read from a point-in-time snapshot rather than "
+        "re-pulled on every load. Use the sidebar **🔄 Refresh data** button to force "
+        "a fresh pull if a store's zone has changed."
+    )
+
+    zone_df, zone_err = load_zone_map_data(slot)
+    if zone_err:
+        _section_error("Zone map data", zone_err)
+    elif zone_df.empty:
+        st.info("No store zone/location data returned.")
+    else:
+        zone_order = sorted(int(z) for z in zone_df["mdse_major_zone_number"].dropna().unique())
+        zone_domain = [f"Zone {z}" for z in zone_order]
+        zdf = zone_df.copy()
+        zdf["zone"] = "Zone " + zdf["mdse_major_zone_number"].astype(int).astype(str)
+
+        states_topo = alt.topo_feature(US_STATES_TOPO_URL, "states")
+        base = (alt.Chart(states_topo)
+                .mark_geoshape(fill="#f7f7f7", stroke="#b0b0b0", strokeWidth=0.6))
+
+        points = alt.Chart(zdf).mark_circle(size=16, opacity=0.75).encode(
+            longitude="longitude:Q",
+            latitude="latitude:Q",
+            color=alt.Color("zone:N", sort=zone_domain,
+                            scale=alt.Scale(domain=zone_domain, scheme="category10"),
+                            legend=alt.Legend(title="Major zone", orient="right")),
+            tooltip=[alt.Tooltip("store_number:Q", title="Store #", format="d"),
+                     alt.Tooltip("state_or_province_code:N", title="State"),
+                     alt.Tooltip("zone:N", title="Major zone"),
+                     alt.Tooltip("mdse_sub_zone_number:Q", title="Sub zone", format="d")],
+        )
+
+        cities_df = pd.DataFrame(MAJOR_US_CITIES, columns=["city", "latitude", "longitude"])
+        city_points = alt.Chart(cities_df).mark_point(
+            shape="diamond", size=45, color="black", filled=True, opacity=0.9,
+        ).encode(longitude="longitude:Q", latitude="latitude:Q")
+        city_labels = alt.Chart(cities_df).mark_text(
+            dy=-8, fontSize=10, fontWeight="bold", color="#222",
+        ).encode(longitude="longitude:Q", latitude="latitude:Q", text="city:N")
+
+        zone_map = (base + points + city_points + city_labels).project("albersUsa").properties(
+            height=480,
+            title=f"{zdf['store_number'].nunique():,} stores across {len(zone_order)} major zones",
+        )
+        st.altair_chart(zone_map, width='stretch')
+
+        zone_summary = zdf.groupby(["mdse_major_zone_number", "zone"], as_index=False).agg(
+            stores=("store_number", "nunique"),
+            states=("state_or_province_code", "nunique"),
+        ).sort_values("mdse_major_zone_number")[["zone", "stores", "states"]]
+        st.dataframe(zone_summary, width='stretch', hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
