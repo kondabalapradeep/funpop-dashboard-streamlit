@@ -52,6 +52,8 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import altair as alt
+import plotly.express as px
+import plotly.graph_objects as go
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -738,6 +740,30 @@ STATE_FIPS = {
 }
 # Client-side fetch (Vega renders in the browser, so the server never reaches out).
 US_STATES_TOPO_URL = "https://vega.github.io/vega-datasets/data/us-10m.json"
+
+
+@st.cache_resource(show_spinner=False)
+def _state_lines_geo_trace():
+    """State-boundary line trace for the zone map, built from the repo's local
+    geojson (weather_source.BOUNDARY_PATH) rather than Plotly's scope="usa",
+    which lazy-fetches its base atlas from cdn.plot.ly in the viewer's browser
+    — an external dependency worth avoiding now that the boundary file already
+    ships in the repo for the Weather tab. Polygon/MultiPolygon rings are
+    flattened into one Scattergeo line trace, None-separated between rings."""
+    geo = json.loads(weather_source.BOUNDARY_PATH.read_text())
+    lons, lats = [], []
+    for feat in geo["features"]:
+        geom = feat["geometry"]
+        rings = geom["coordinates"] if geom["type"] == "Polygon" else [
+            ring for poly in geom["coordinates"] for ring in poly]
+        for ring in rings:
+            lons.extend([pt[0] for pt in ring] + [None])
+            lats.extend([pt[1] for pt in ring] + [None])
+    return go.Scattergeo(
+        lon=lons, lat=lats, mode="lines",
+        line=dict(width=0.8, color="#b0b0b0"),
+        hoverinfo="skip", showlegend=False, name="",
+    )
 
 
 def _waterfall_chart(steps: list, value_fmt: str = ",.0f", height: int = 300,
@@ -3348,44 +3374,83 @@ def _render_distribution():
         st.info("No store zone/location data returned.")
     else:
         zone_order = sorted(int(z) for z in zone_df["mdse_major_zone_number"].dropna().unique())
-        zone_domain = [f"Zone {z}" for z in zone_order]
         zdf = zone_df.copy()
         zdf["zone"] = "Zone " + zdf["mdse_major_zone_number"].astype(int).astype(str)
 
-        states_topo = alt.topo_feature(US_STATES_TOPO_URL, "states")
-        base = (alt.Chart(states_topo)
-                .mark_geoshape(fill="#f7f7f7", stroke="#b0b0b0", strokeWidth=0.6))
+        # city/store_type are best-effort (see store_zone_map's column discovery)
+        # — a display-only fallback keeps the hover/click detail uniform without
+        # touching the real columns used by the zone_summary stats below.
+        zdf["city_display"] = zdf["city"].fillna("—") if "city" in zdf.columns else "—"
+        zdf["store_type_display"] = zdf["store_type"].fillna("—") if "store_type" in zdf.columns else "—"
+        zdf["state_display"] = zdf["state_or_province_code"].fillna("—")
 
-        # mdse_sub_zone_number is best-effort (see store_zone_map's column
-        # discovery) — only tooltip it when the source actually had it.
-        zone_tooltip = [alt.Tooltip("store_number:Q", title="Store #", format="d"),
-                         alt.Tooltip("state_or_province_code:N", title="State"),
-                         alt.Tooltip("zone:N", title="Major zone")]
-        if "mdse_sub_zone_number" in zdf.columns:
-            zone_tooltip.append(alt.Tooltip("mdse_sub_zone_number:Q", title="Sub zone", format="d"))
+        palette = px.colors.qualitative.T10
+        zone_colors = {f"Zone {z}": palette[i % len(palette)] for i, z in enumerate(zone_order)}
 
-        points = alt.Chart(zdf).mark_circle(size=16, opacity=0.75).encode(
-            longitude="longitude:Q",
-            latitude="latitude:Q",
-            color=alt.Color("zone:N", sort=zone_domain,
-                            scale=alt.Scale(domain=zone_domain, scheme="category10"),
-                            legend=alt.Legend(title="Major zone", orient="right")),
-            tooltip=zone_tooltip,
-        )
+        fig = go.Figure()
+        fig.add_trace(_state_lines_geo_trace())
+        for z in zone_order:
+            zone_label = f"Zone {z}"
+            sub = zdf[zdf["mdse_major_zone_number"] == z]
+            fig.add_trace(go.Scattergeo(
+                lon=sub["longitude"], lat=sub["latitude"],
+                mode="markers",
+                name=zone_label,
+                marker=dict(size=6, color=zone_colors[zone_label], opacity=0.75),
+                customdata=sub[["store_number", "city_display", "state_display",
+                                "store_type_display"]].to_numpy(),
+                hovertemplate=(
+                    "<b>Store %{customdata[0]}</b><br>"
+                    "%{customdata[1]}, %{customdata[2]}<br>"
+                    "%{customdata[3]}<br>"
+                    f"{zone_label}<extra></extra>"
+                ),
+            ))
 
         cities_df = pd.DataFrame(MAJOR_US_CITIES, columns=["city", "latitude", "longitude"])
-        city_points = alt.Chart(cities_df).mark_point(
-            shape="diamond", size=45, color="black", filled=True, opacity=0.9,
-        ).encode(longitude="longitude:Q", latitude="latitude:Q")
-        city_labels = alt.Chart(cities_df).mark_text(
-            dy=-8, fontSize=10, fontWeight="bold", color="#222",
-        ).encode(longitude="longitude:Q", latitude="latitude:Q", text="city:N")
+        fig.add_trace(go.Scattergeo(
+            lon=cities_df["longitude"], lat=cities_df["latitude"],
+            mode="markers+text",
+            name="Major cities",
+            marker=dict(size=7, color="black", symbol="diamond"),
+            text=cities_df["city"], textposition="top center",
+            textfont=dict(size=10, color="#222"),
+            hoverinfo="text", hovertext=cities_df["city"],
+            showlegend=False,
+        ))
 
-        zone_map = (base + points + city_points + city_labels).project("albersUsa").properties(
-            height=480,
-            title=f"{zdf['store_number'].nunique():,} stores across {len(zone_order)} major zones",
+        # visible=False (rather than scope="usa") keeps this fully local — no
+        # client-side fetch to cdn.plot.ly for a base atlas; state lines come
+        # from _state_lines_geo_trace() above instead.
+        fig.update_geos(
+            visible=False, showland=False, showcountries=False, showsubunits=False,
+            showcoastlines=False, showlakes=False, showframe=False,
+            projection_type="albers usa",
+            lonaxis_range=[-125, -66], lataxis_range=[24, 50],
         )
-        st.altair_chart(zone_map, width='stretch')
+        fig.update_layout(
+            height=560,
+            margin=dict(l=0, r=0, t=10, b=0),
+            legend_title_text="Major zone",
+        )
+
+        st.caption(
+            f"**{zdf['store_number'].nunique():,} stores** across **{len(zone_order)} major zones**. "
+            "Scroll or use the toolbar to zoom, drag to pan, click a legend entry to isolate a zone, "
+            "and click a dot for that store's details below the map."
+        )
+        event = st.plotly_chart(
+            fig, width='stretch', on_select="rerun", selection_mode="points",
+            config={"scrollZoom": True}, key="zone_map_chart",
+        )
+
+        picked = [p["customdata"] for p in event.selection.points if p.get("customdata")]
+        if picked:
+            st.markdown("**Selected store(s)**")
+            st.dataframe(
+                pd.DataFrame(picked, columns=["Store #", "City", "State", "Store type"]).drop_duplicates(),
+                width='stretch', hide_index=True,
+            )
 
         zone_summary = zdf.groupby(["mdse_major_zone_number", "zone"], as_index=False).agg(
             stores=("store_number", "nunique"),

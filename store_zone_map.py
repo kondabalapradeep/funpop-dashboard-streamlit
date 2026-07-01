@@ -8,11 +8,12 @@ straight from disk instead of querying store_dim on every load.
 
 ``store_nbr``/``state_prov_cd``/``mdse_maj_zone_nbr`` are confirmed BI Link
 columns on store_dim (store_query.sql already joins them from the same
-table). ``mdse_sub_zone_nbr``/``lat_dgr``/``long_dgr`` are the glossary's BI
+table). Sub-zone, lat/long, city and store type/banner are the glossary's BI
 Link names but were never exercised against this deployment's actual schema,
-so — like store_directory.py's address fields — those three are resolved via
-INFORMATION_SCHEMA rather than hard-coded, so a naming difference degrades to
-a missing (optional) column instead of throwing.
+so — like store_directory.py's address fields — those are resolved via
+INFORMATION_SCHEMA rather than hard-coded: lat/long are required (no map
+without them), the rest degrade to a missing (optional) column instead of
+throwing.
 """
 from pathlib import Path
 
@@ -27,6 +28,10 @@ _CANDIDATES = {
     "mdse_sub_zone_number": ["mdse_sub_zone_nbr", "sub_zone_nbr", "sub_zone"],
     "latitude": ["lat_dgr", "latitude"],
     "longitude": ["long_dgr", "longitude", "lon_dgr", "lng_dgr"],
+    "city": ["city_name", "city"],
+    # banner_desc is the human-readable format ("Walmart Supercenter", "Neighborhood
+    # Market", ...); store_type_cd is a single-letter code — prefer the readable one.
+    "store_type": ["banner_desc", "store_type_cd", "store_type"],
 }
 
 
@@ -53,6 +58,9 @@ def clean_zone_map_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["latitude", "longitude"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ["city", "store_type"]:
+        if c in df.columns:
+            df[c] = df[c].astype("string").str.strip()
     return df.dropna(subset=[c for c in ["mdse_major_zone_number", "latitude", "longitude"]
                               if c in df.columns])
 
@@ -76,6 +84,8 @@ def build_zone_map_df(run_query, project: str, dataset: str) -> pd.DataFrame:
     if not lat_col or not lon_col:
         raise ValueError("no latitude/longitude column found on store_dim")
     sub_col = best_col(cols, _CANDIDATES["mdse_sub_zone_number"])
+    city_col = best_col(cols, _CANDIDATES["city"])
+    type_col = best_col(cols, _CANDIDATES["store_type"])
 
     selects = [
         "  store_nbr                    AS store_number",
@@ -86,6 +96,10 @@ def build_zone_map_df(run_query, project: str, dataset: str) -> pd.DataFrame:
     ]
     if sub_col:
         selects.append(f"  ANY_VALUE({sub_col}) AS mdse_sub_zone_number")
+    if city_col:
+        selects.append(f"  ANY_VALUE(CAST({city_col} AS STRING)) AS city")
+    if type_col:
+        selects.append(f"  ANY_VALUE(CAST({type_col} AS STRING)) AS store_type")
     sql = ("SELECT\n" + ",\n".join(selects) +
            f"\nFROM `{project}.{dataset}.store_dim`\nGROUP BY store_nbr")
     return clean_zone_map_df(run_query(sql))
