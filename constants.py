@@ -44,3 +44,28 @@ CASE_PACK_UNITS = {
     658442130: 208,  # Full Bin
     666209064: 6,    # Shelf
 }
+
+# Reference points for the Distribution tab's merchandising-zone map — major
+# US cities, for orientation only (not store locations). (name, lat, lon).
+MAJOR_US_CITIES = [
+    ("New York", 40.7128, -74.0060),
+    ("Los Angeles", 34.0522, -118.2437),
+    ("Chicago", 41.8781, -87.6298),
+    ("Houston", 29.7601, -95.3701),
+    ("Phoenix", 33.4484, -112.0740),
+    ("Philadelphia", 39.9526, -75.1652),
+    ("San Antonio", 29.4241, -98.4936),
+    ("Dallas", 32.7767, -96.7970),
+    ("Seattle", 47.6062, -122.3321),
+    ("Denver", 39.7392, -104.9903),
+    ("Atlanta", 33.7490, -84.3880),
+    ("Miami", 25.7617, -80.1918),
+    ("Minneapolis", 44.9778, -93.2650),
+    ("Boston", 42.3601, -71.0589),
+    ("Detroit", 42.3314, -83.0458),
+    ("Kansas City", 39.0997, -94.5786),
+    ("Salt Lake City", 40.7608, -111.8910),
+    ("New Orleans", 29.9511, -90.0715),
+    ("Nashville", 36.1627, -86.7816),
+    ("Portland", 45.5152, -122.6784),
+]

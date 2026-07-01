@@ -212,6 +212,21 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"  WARN: store directory build failed: {e}", file=sys.stderr)
 
+    # Static store -> merchandising-zone + lat/long lookup for the Distribution
+    # tab's zone map. Same reasoning as store_directory above: zone assignment
+    # and store location are reference data that doesn't move day to day.
+    try:
+        import store_zone_map
+        built_keys.add(store_zone_map.MAP_FILENAME)
+        zone_df = store_zone_map.build_zone_map_df(run_query, project, dataset)
+        if store_zone_map.MAP_FILENAME and not zone_df.empty:
+            updated = snapshot.write_if_changed(store_zone_map.MAP_FILENAME, zone_df)
+            changed = changed or updated
+            print(f"  store_zone_map: {len(zone_df):,} rows -> {store_zone_map.MAP_FILENAME} "
+                  f"({'updated' if updated else 'unchanged'})")
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARN: store zone map build failed: {e}", file=sys.stderr)
+
     # Drop any parquet from an earlier build that this run did not (re)produce.
     # The snapshot key embeds the day's rolling lookback, so without this prune
     # old files linger and get served as "fresh" the next time the app's key
