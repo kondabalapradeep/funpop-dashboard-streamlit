@@ -1156,13 +1156,15 @@ def _render_overview():
         ).properties(height=300))
         st.altair_chart(chart, width='stretch')
     with c_r:
-        show = daily[["weekday", "date_str", "units_ty", "units_ly", "yoy_units",
-                      "yoy_pct", "stores_selling"]].iloc[::-1].copy()
+        show = daily[["weekday", "business_date", "units_ty", "units_ly", "yoy_units",
+                      "yoy_pct", "stores_selling"]].sort_values(
+                          "business_date", ascending=False).copy()
         show["stores_selling"] = show["stores_selling"].astype(int)
         show[["units_ly", "yoy_units"]] = show[["units_ly", "yoy_units"]].astype(int)
         show.columns = ["Day", "Date", "Units TY", "Units LY", "YoY Units", "YoY %", "Stores Selling"]
         st.dataframe(show, width='stretch', hide_index=True, height=380,
-                     column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%")})
+                     column_config={"YoY %": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "Date": st.column_config.DateColumn(format="MMM DD")})
 
     # ── Item performance ─────────────────────────────────────────────────────
     # Full + Half bins are rolled into one "Bins" line; the half/full split
