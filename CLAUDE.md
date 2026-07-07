@@ -1,7 +1,7 @@
 # FunPop Dashboard — working notes for Claude
 
 A Streamlit dashboard (`streamlit_app.py`) that reads Walmart **BI Link** supplier
-data from BigQuery and renders eight tabs. Hosted on Streamlit Community Cloud;
+data from BigQuery and renders ten tabs. Hosted on Streamlit Community Cloud;
 cold loads are served from a parquet **snapshot** built on a schedule by GitHub
 Actions (`snapshot_build.py` → `snapshot-data` branch) with a live BigQuery query
 as the fallback.

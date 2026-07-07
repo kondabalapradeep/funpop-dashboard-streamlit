@@ -14,3 +14,6 @@ plotly
 # Weather tab: NWS-style filled-contour maps (interpolation + render).
 matplotlib
 scipy
+# Sell-Through tab: buyer-facing Excel export (optional — tab degrades to
+# CSV-only if missing).
+xlsxwriter
