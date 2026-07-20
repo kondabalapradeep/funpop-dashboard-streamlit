@@ -11,6 +11,8 @@ Tab structure:
                       availability (stockout) diagnosis that weighs the inventory
                       feed against sales, item/state/store contributors, and the
                       weekly trajectory (sales gap vs in-stock rate)
+  Pricing           — AUR movement, price-driven sales change, item/state
+                      price realization, and where price changes intersect with volume.
   Forecast          — Upcoming demand forecast vs sales, attainment & bias, store
                       replenishment watchlist, and DC demand coverage
   Inventory & DC    — Weekly inventory, phantom inventory, DC pipeline (true alignment)
@@ -1079,11 +1081,12 @@ st.caption(
 
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
-(tab_overview, tab_sales, tab_drivers, tab_forecast, tab_inv, tab_sellthru,
+(tab_overview, tab_sales, tab_drivers, tab_pricing, tab_forecast, tab_inv, tab_sellthru,
  tab_channels, tab_dist, tab_weather, tab_actions) = st.tabs([
     "📊 Overview",
     "📈 Sales & Velocity",
     "🔍 Sales Drivers",
+    "💵 Pricing",
     "🔮 Forecast",
     "📦 Inventory & DC",
     "🎯 Sell-Through",
@@ -2186,7 +2189,141 @@ def _render_drivers():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   TAB 4 — FORECAST
+#   TAB 4 — PRICING
+# ═══════════════════════════════════════════════════════════════════════════
+@st.fragment
+def _render_pricing():
+    st.caption(
+        f"Pricing sections use the sidebar **Performance window**, currently *{window_label}*, "
+        "except the weekly AUR trend, which spans the full selected date range."
+    )
+
+    units_ty = float(df_window["pos_quantity_this_year"].sum())
+    units_ly = float(df_window["pos_quantity_last_year"].sum())
+    sales_ty = float(df_window["pos_sales_this_year"].sum())
+    sales_ly = float(df_window["pos_sales_last_year"].sum())
+    aur_ty = (sales_ty / units_ty) if units_ty else 0.0
+    aur_ly = (sales_ly / units_ly) if units_ly else 0.0
+    aur_delta = aur_ty - aur_ly
+    aur_pct = (aur_delta / aur_ly * 100) if aur_ly else 0.0
+    price_effect = aur_delta * units_ty
+    units_effect = (units_ty - units_ly) * aur_ly
+    sales_delta = sales_ty - sales_ly
+
+    if not units_ty and not units_ly:
+        st.info("No unit sales in the selected performance window, so pricing cannot be calculated.")
+        return
+
+    st.subheader(f"Pricing scorecard — {window_label}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Blended AUR TY", f"${aur_ty:,.2f}", f"{aur_pct:+.1f}% vs LY")
+    c2.metric("Blended AUR LY", f"${aur_ly:,.2f}", help="Same-period last-year average unit retail.")
+    c3.metric("Price-driven sales change", f"${price_effect:+,.0f}", delta_color="off",
+              help="(TY AUR - LY AUR) × TY units. Positive means pricing lifted sales dollars; negative means AUR erosion.")
+    c4.metric("Total sales change", f"${sales_delta:+,.0f}", delta_color="off",
+              help="TY sales minus LY sales in the selected window.")
+
+    if sales_delta:
+        st.caption(
+            f"Price contributed **${price_effect:+,.0f}** while unit volume/mix contributed "
+            f"**${units_effect:+,.0f}**. Together they reconcile to the net sales change of "
+            f"**${sales_delta:+,.0f}** (rounding may differ slightly)."
+        )
+
+    # Weekly AUR trend across the full lookback.
+    st.divider()
+    st.subheader("Weekly AUR trend")
+    weekly_price = df.groupby("walmart_calendar_week", as_index=False).agg(
+        units_ty=("pos_quantity_this_year", "sum"),
+        units_ly=("pos_quantity_last_year", "sum"),
+        sales_ty=("pos_sales_this_year", "sum"),
+        sales_ly=("pos_sales_last_year", "sum"),
+        days_in_week=("business_date", "nunique"),
+    ).sort_values("walmart_calendar_week")
+    if not weekly_price.empty:
+        weekly_price["week_label"] = _wm_week_label(
+            weekly_price["walmart_calendar_week"], weekly_price["days_in_week"] < 7
+        )
+        weekly_price["aur_ty"] = np.where(weekly_price["units_ty"] > 0, weekly_price["sales_ty"] / weekly_price["units_ty"], np.nan)
+        weekly_price["aur_ly"] = np.where(weekly_price["units_ly"] > 0, weekly_price["sales_ly"] / weekly_price["units_ly"], np.nan)
+        weekly_price["aur_change"] = weekly_price["aur_ty"] - weekly_price["aur_ly"]
+        trend = weekly_price.melt(
+            id_vars=["week_label", "walmart_calendar_week"],
+            value_vars=["aur_ty", "aur_ly"], var_name="Period", value_name="AUR"
+        ).dropna(subset=["AUR"])
+        trend["Period"] = trend["Period"].map({"aur_ty": "This Year", "aur_ly": "Last Year"})
+        st.altair_chart((alt.Chart(trend).mark_line(point=True, strokeWidth=2.5).encode(
+            x=alt.X("week_label:N", sort=list(weekly_price["week_label"]), title="Week", axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("AUR:Q", title="Average unit retail ($)", scale=alt.Scale(zero=False)),
+            color=alt.Color("Period:N", scale=alt.Scale(domain=["This Year", "Last Year"], range=["#185FA5", "#A0A09A"])),
+            tooltip=["week_label", "Period", alt.Tooltip("AUR:Q", format="$.2f")],
+        ).properties(height=300)), width="stretch")
+
+    # Item price realization.
+    st.divider()
+    st.subheader("Price realization by item")
+    item_price = df_window.groupby("item_group", observed=True, as_index=False).agg(
+        units_ty=("pos_quantity_this_year", "sum"), units_ly=("pos_quantity_last_year", "sum"),
+        sales_ty=("pos_sales_this_year", "sum"), sales_ly=("pos_sales_last_year", "sum"),
+    )
+    if not item_price.empty:
+        item_price["AUR TY"] = np.where(item_price["units_ty"] > 0, item_price["sales_ty"] / item_price["units_ty"], np.nan)
+        item_price["AUR LY"] = np.where(item_price["units_ly"] > 0, item_price["sales_ly"] / item_price["units_ly"], np.nan)
+        item_price["AUR Δ"] = item_price["AUR TY"] - item_price["AUR LY"]
+        item_price["AUR Δ %"] = np.where(item_price["AUR LY"] > 0, item_price["AUR Δ"] / item_price["AUR LY"] * 100, np.nan)
+        item_price["Price impact $"] = item_price["AUR Δ"] * item_price["units_ty"]
+        show = item_price.rename(columns={"item_group": "Item", "units_ty": "Units TY", "sales_ty": "Sales TY ($)"})[
+            ["Item", "Units TY", "Sales TY ($)", "AUR TY", "AUR LY", "AUR Δ", "AUR Δ %", "Price impact $"]
+        ].sort_values("Price impact $")
+        st.dataframe(show, width="stretch", hide_index=True, column_config={
+            "Sales TY ($)": st.column_config.NumberColumn(format="$%.0f"),
+            "AUR TY": st.column_config.NumberColumn(format="$%.2f"),
+            "AUR LY": st.column_config.NumberColumn(format="$%.2f"),
+            "AUR Δ": st.column_config.NumberColumn(format="$%.2f"),
+            "AUR Δ %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Price impact $": st.column_config.NumberColumn(format="$%.0f"),
+        })
+
+    # Where price changes intersect volume by state.
+    st.divider()
+    st.subheader("Where AUR changes meet volume")
+    state_price = df_window.groupby("state_or_province_code", as_index=False).agg(
+        units_ty=("pos_quantity_this_year", "sum"), units_ly=("pos_quantity_last_year", "sum"),
+        sales_ty=("pos_sales_this_year", "sum"), sales_ly=("pos_sales_last_year", "sum"),
+    )
+    state_price = state_price[(state_price["units_ty"] > 0) | (state_price["units_ly"] > 0)].copy()
+    if not state_price.empty:
+        state_price["AUR TY"] = np.where(state_price["units_ty"] > 0, state_price["sales_ty"] / state_price["units_ty"], np.nan)
+        state_price["AUR LY"] = np.where(state_price["units_ly"] > 0, state_price["sales_ly"] / state_price["units_ly"], np.nan)
+        state_price["AUR Δ"] = state_price["AUR TY"] - state_price["AUR LY"]
+        state_price["Units Δ %"] = np.where(state_price["units_ly"] > 0, (state_price["units_ty"] - state_price["units_ly"]) / state_price["units_ly"] * 100, np.nan)
+        state_price["Price impact $"] = state_price["AUR Δ"] * state_price["units_ty"]
+        scatter = state_price.dropna(subset=["AUR Δ", "Units Δ %"])
+        if not scatter.empty:
+            st.altair_chart((alt.Chart(scatter).mark_circle(opacity=0.8).encode(
+                x=alt.X("AUR Δ:Q", title="AUR change vs LY ($)"),
+                y=alt.Y("Units Δ %:Q", title="Unit change vs LY (%)"),
+                size=alt.Size("units_ty:Q", title="TY units", scale=alt.Scale(range=[80, 900])),
+                color=alt.Color("Price impact $:Q", title="Price impact", scale=alt.Scale(scheme="redblue")),
+                tooltip=[alt.Tooltip("state_or_province_code:N", title="State"),
+                         alt.Tooltip("AUR TY:Q", format="$.2f"), alt.Tooltip("AUR LY:Q", format="$.2f"),
+                         alt.Tooltip("AUR Δ:Q", format="$.2f"), alt.Tooltip("Units Δ %:Q", format=".1f"),
+                         alt.Tooltip("Price impact $:Q", format="$,.0f")],
+            ).properties(height=340)), width="stretch")
+        ranked = state_price.rename(columns={"state_or_province_code": "State", "units_ty": "Units TY"})[
+            ["State", "Units TY", "AUR TY", "AUR LY", "AUR Δ", "Units Δ %", "Price impact $"]
+        ].sort_values("Price impact $").head(15)
+        st.dataframe(ranked, width="stretch", hide_index=True, column_config={
+            "AUR TY": st.column_config.NumberColumn(format="$%.2f"),
+            "AUR LY": st.column_config.NumberColumn(format="$%.2f"),
+            "AUR Δ": st.column_config.NumberColumn(format="$%.2f"),
+            "Units Δ %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Price impact $": st.column_config.NumberColumn(format="$%.0f"),
+        })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TAB 5 — FORECAST
 # ═══════════════════════════════════════════════════════════════════════════
 @st.fragment
 def _render_forecast():
@@ -4350,6 +4487,8 @@ with tab_sales:
     _render_sales()
 with tab_drivers:
     _render_drivers()
+with tab_pricing:
+    _render_pricing()
 with tab_forecast:
     _render_forecast()
 with tab_inv:
