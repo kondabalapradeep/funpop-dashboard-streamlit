@@ -3102,6 +3102,10 @@ def _render_inventory():
 # which aggregate to store-week grain in BigQuery so the longer window doesn't
 # blow up the app's memory footprint.
 #
+# Two report views: the default weekly breakdown, and a "season total" that
+# collapses the whole window into one roll-up line (season units sold against
+# the current inventory position — no weekly series or charts).
+#
 # Definitions (same conventions as Inventory & DC):
 #   Sell-through % = units sold ÷ (units sold + ending store on-hand). BI Link
 #     carries no store-receipts feed, so this receipt-free form stands in for
@@ -3112,10 +3116,16 @@ def _render_inventory():
 
 
 def _sellthrough_xlsx(weekly: pd.DataFrame, stores: pd.DataFrame,
-                      as_of: str, period_note: str) -> bytes | None:
-    """Two-sheet buyer workbook: the weekly summary plus per-store detail.
+                      as_of: str, period_note: str,
+                      summary_sheet: str = "Weekly sell-through",
+                      summary_note: str | None = None) -> bytes | None:
+    """Two-sheet buyer workbook: the summary (weekly by default; the season
+    roll-up view passes its own sheet name and note) plus per-store detail.
     Returns None when the optional xlsxwriter engine isn't installed, so the
     tab degrades to CSV-only instead of erroring."""
+    if summary_note is None:
+        summary_note = (f"As of {as_of} · Walmart BI Link · Full + Half bins "
+                        f"combined · * = in-progress week")
     try:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
@@ -3127,9 +3137,7 @@ def _sellthrough_xlsx(weekly: pd.DataFrame, stores: pd.DataFrame,
             pct_fmt = wb.add_format({"num_format": '0.0"%"'})
             wos_fmt = wb.add_format({"num_format": "0.0"})
             for sheet, frame, note in (
-                ("Weekly sell-through", weekly,
-                 f"As of {as_of} · Walmart BI Link · Full + Half bins combined · "
-                 f"* = in-progress week"),
+                (summary_sheet, weekly, summary_note),
                 ("Store detail", stores, period_note),
             ):
                 frame.to_excel(xw, sheet_name=sheet, index=False,
@@ -3185,6 +3193,15 @@ def _render_sellthrough():
         "would double-count DC on-hand). Store figures follow the sidebar state "
         "filter; DC figures are network-wide."
     )
+
+    season_view = st.radio(
+        "Report view",
+        ["Weekly by Walmart week", "Season total (one roll-up, week 5 → today)"],
+        horizontal=True,
+        help="Season total collapses the whole window into a single line: all "
+             "units sold since Walmart week 5 against the current inventory "
+             "position — no weekly breakdown.",
+    ) != "Weekly by Walmart week"
 
     # ── Weekly roll-up (Walmart weeks, Sat–Fri) ──────────────────────────────
     # The loader's frame is already store×week grain with the ending inventory
@@ -3267,25 +3284,55 @@ def _render_sellthrough():
               if store_oh_ly_now else 0.0)
     _wks = lambda v: f"{v:.1f} wks" if np.isfinite(v) else "—"
 
+    # Season totals: the whole window as ONE roll-up, with the receipt-free
+    # sell-through formula applied to the full period — season units sold
+    # against the CURRENT ending inventory (same convention the store-level
+    # detail already uses).
+    season_units = float(wk["units"].sum())
+    season_units_ly = float(wk["units_ly"].sum())
+    season_st = (season_units / (season_units + store_oh_now) * 100
+                 if (season_units + store_oh_now) > 0 else np.nan)
+    season_st_ly = (season_units_ly / (season_units_ly + store_oh_ly_now) * 100
+                    if (season_units_ly + store_oh_ly_now) > 0 else np.nan)
+    season_pipe_st = (season_units / (season_units + pipeline_now) * 100
+                      if (season_units + pipeline_now) > 0 else np.nan)
+
     st.subheader("Bin sell-through at a glance")
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Store on-hand (bins)", f"{store_oh_now:,.0f}", f"{oh_yoy:+.1f}% YoY")
-    k2.metric("Total pipeline", f"{pipeline_now:,.0f}",
-              help="Store on-hand + in-transit + DC on-hand")
-    if last_full is not None and np.isfinite(last_full["st_pct"]):
-        _delta = (f"{last_full['st_pct'] - prev_full['st_pct']:+.1f} pts wk/wk"
-                  if prev_full is not None and np.isfinite(prev_full["st_pct"]) else None)
-        k3.metric(f"Sell-through % ({last_full['week_label']})",
-                  f"{last_full['st_pct']:.1f}%", _delta,
-                  help="Last completed Walmart week: units ÷ (units + ending store on-hand)")
+    if season_view:
+        _units_yoy = ((season_units - season_units_ly) / season_units_ly * 100
+                      if season_units_ly else 0.0)
+        k1.metric("Season units sold", f"{season_units:,.0f}",
+                  f"{_units_yoy:+.1f}% vs LY")
+        _delta = (f"{season_st - season_st_ly:+.1f} pts vs LY"
+                  if np.isfinite(season_st) and np.isfinite(season_st_ly) else None)
+        k2.metric("Season sell-through %",
+                  f"{season_st:.1f}%" if np.isfinite(season_st) else "—", _delta,
+                  help="Whole season: units sold ÷ (units sold + current store on-hand)")
+        k3.metric("Store on-hand (bins)", f"{store_oh_now:,.0f}", f"{oh_yoy:+.1f}% YoY")
+        k4.metric("Total pipeline", f"{pipeline_now:,.0f}",
+                  help="Store on-hand + in-transit + DC on-hand")
+        k5.metric("Pipeline WOS",
+                  _wks(pipeline_now / weekly_rate) if weekly_rate else "—",
+                  help="Total pipeline ÷ recent weekly bin sell rate")
     else:
-        k3.metric("Sell-through % (last full week)", "—")
-    k4.metric("Store WOS",
-              _wks(store_oh_now / weekly_rate) if weekly_rate else "—",
-              help="Store on-hand ÷ recent weekly bin sell rate")
-    k5.metric("Pipeline WOS",
-              _wks(pipeline_now / weekly_rate) if weekly_rate else "—",
-              help="Total pipeline ÷ recent weekly bin sell rate")
+        k1.metric("Store on-hand (bins)", f"{store_oh_now:,.0f}", f"{oh_yoy:+.1f}% YoY")
+        k2.metric("Total pipeline", f"{pipeline_now:,.0f}",
+                  help="Store on-hand + in-transit + DC on-hand")
+        if last_full is not None and np.isfinite(last_full["st_pct"]):
+            _delta = (f"{last_full['st_pct'] - prev_full['st_pct']:+.1f} pts wk/wk"
+                      if prev_full is not None and np.isfinite(prev_full["st_pct"]) else None)
+            k3.metric(f"Sell-through % ({last_full['week_label']})",
+                      f"{last_full['st_pct']:.1f}%", _delta,
+                      help="Last completed Walmart week: units ÷ (units + ending store on-hand)")
+        else:
+            k3.metric("Sell-through % (last full week)", "—")
+        k4.metric("Store WOS",
+                  _wks(store_oh_now / weekly_rate) if weekly_rate else "—",
+                  help="Store on-hand ÷ recent weekly bin sell rate")
+        k5.metric("Pipeline WOS",
+                  _wks(pipeline_now / weekly_rate) if weekly_rate else "—",
+                  help="Total pipeline ÷ recent weekly bin sell rate")
     _dc_note = (f"DC snapshot **{dc_date.strftime('%b %d, %Y')}**" if dc_date is not None
                 else "DC data unavailable — pipeline figures are store-side only")
     st.caption(
@@ -3295,73 +3342,112 @@ def _render_sellthrough():
         f"**{dc_oo_now:,.0f}** sit outside the pipeline total."
     )
 
-    # ── Weekly sell-through trend ────────────────────────────────────────────
-    st.divider()
-    st.subheader("Weekly sell-through %")
-    stm = wk.melt(id_vars=["week_label"], value_vars=["st_pct", "st_pct_ly"],
-                  var_name="Period", value_name="ST")
-    stm["Period"] = stm["Period"].map({"st_pct": "This Year", "st_pct_ly": "Last Year"})
-    stm = stm.dropna(subset=["ST"])
-    st.altair_chart((alt.Chart(stm).mark_line(point=True, strokeWidth=2.5).encode(
-        x=alt.X("week_label:N", sort=list(wk["week_label"]), title="Week",
-                axis=alt.Axis(labelAngle=-30)),
-        y=alt.Y("ST:Q", title="Sell-through %"),
-        color=alt.Color("Period:N", scale=alt.Scale(domain=["This Year", "Last Year"],
-                        range=["#185FA5", "#A0A09A"])),
-        tooltip=["week_label", "Period",
-                 alt.Tooltip("ST:Q", format=".1f", title="Sell-through %")],
-    ).properties(height=280)), width='stretch')
-
-    # ── Ending inventory position by week ────────────────────────────────────
-    st.subheader("Ending inventory position by week")
-    st.caption(
-        "Where the pipeline sits at the end of each Walmart week: on the shelf "
-        "(store on-hand), on the road (in-transit) or back at the DC. A growing "
-        "stack with flat sell-through means inventory is building, not moving."
-    )
-    _stage_order = ["Store on-hand", "In transit", "DC on-hand"]
-    pm = wk.melt(id_vars=["week_label"], value_vars=["store_oh", "in_transit", "dc_oh"],
-                 var_name="Stage", value_name="Units")
-    pm["Stage"] = pm["Stage"].map({"store_oh": "Store on-hand",
-                                   "in_transit": "In transit", "dc_oh": "DC on-hand"})
-    pm["stage_order"] = pm["Stage"].map({s: i for i, s in enumerate(_stage_order)})
-    st.altair_chart((alt.Chart(pm).mark_bar().encode(
-        x=alt.X("week_label:N", sort=list(wk["week_label"]), title="Week",
-                axis=alt.Axis(labelAngle=-30)),
-        y=alt.Y("Units:Q", title="Units"),
-        color=alt.Color("Stage:N", scale=alt.Scale(domain=_stage_order,
-                        range=["#185FA5", "#1BAF7A", "#EDA100"]), sort=_stage_order),
-        order=alt.Order("stage_order:Q"),
-        tooltip=["week_label", "Stage", alt.Tooltip("Units:Q", format=",")],
-    ).properties(height=300)), width='stretch')
-    if wk["is_partial"].any():
-        st.caption("Weeks marked `*` are in progress — sell-through % there is "
-                   "week-to-date, not a full week.")
-
-    # ── Weekly summary table (the buyer report) ──────────────────────────────
-    st.divider()
-    st.subheader("Weekly summary — buyer report")
-    buyer = wk[["week_label", "week_end", "days_in_week", "units", "store_oh",
-                "st_pct", "in_transit", "dc_oh", "pipeline", "pipe_st_pct",
-                "in_whse", "dc_oo", "store_wos", "pipe_wos"]].copy()
-    buyer["week_end"] = buyer["week_end"].dt.strftime("%Y-%m-%d")
-    for c in ["units", "store_oh", "in_transit", "dc_oh", "pipeline", "in_whse", "dc_oo"]:
-        buyer[c] = buyer[c].round().astype(int)
-    for c in ["st_pct", "pipe_st_pct", "store_wos", "pipe_wos"]:
-        buyer[c] = buyer[c].round(1)
-    buyer.columns = ["Week", "Week ending", "Days", "Units sold",
-                     "Store on-hand (EOW)", "Sell-through %", "In transit",
-                     "DC on-hand", "Total pipeline", "Pipeline sell-through %",
-                     "In warehouse", "DC on-order", "Store WOS", "Pipeline WOS"]
     _pct_cfg = st.column_config.NumberColumn(format="%.1f%%")
     _wos_cfg = st.column_config.NumberColumn(format="%.1f wks")
-    st.dataframe(buyer.iloc[::-1], width='stretch', hide_index=True,
-                 column_config={
-                     "Sell-through %": _pct_cfg,
-                     "Pipeline sell-through %": _pct_cfg,
-                     "Store WOS": _wos_cfg,
-                     "Pipeline WOS": _wos_cfg,
-                 })
+
+    if not season_view:
+        # ── Weekly sell-through trend ────────────────────────────────────────
+        st.divider()
+        st.subheader("Weekly sell-through %")
+        stm = wk.melt(id_vars=["week_label"], value_vars=["st_pct", "st_pct_ly"],
+                      var_name="Period", value_name="ST")
+        stm["Period"] = stm["Period"].map({"st_pct": "This Year", "st_pct_ly": "Last Year"})
+        stm = stm.dropna(subset=["ST"])
+        st.altair_chart((alt.Chart(stm).mark_line(point=True, strokeWidth=2.5).encode(
+            x=alt.X("week_label:N", sort=list(wk["week_label"]), title="Week",
+                    axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("ST:Q", title="Sell-through %"),
+            color=alt.Color("Period:N", scale=alt.Scale(domain=["This Year", "Last Year"],
+                            range=["#185FA5", "#A0A09A"])),
+            tooltip=["week_label", "Period",
+                     alt.Tooltip("ST:Q", format=".1f", title="Sell-through %")],
+        ).properties(height=280)), width='stretch')
+
+        # ── Ending inventory position by week ────────────────────────────────
+        st.subheader("Ending inventory position by week")
+        st.caption(
+            "Where the pipeline sits at the end of each Walmart week: on the shelf "
+            "(store on-hand), on the road (in-transit) or back at the DC. A growing "
+            "stack with flat sell-through means inventory is building, not moving."
+        )
+        _stage_order = ["Store on-hand", "In transit", "DC on-hand"]
+        pm = wk.melt(id_vars=["week_label"], value_vars=["store_oh", "in_transit", "dc_oh"],
+                     var_name="Stage", value_name="Units")
+        pm["Stage"] = pm["Stage"].map({"store_oh": "Store on-hand",
+                                       "in_transit": "In transit", "dc_oh": "DC on-hand"})
+        pm["stage_order"] = pm["Stage"].map({s: i for i, s in enumerate(_stage_order)})
+        st.altair_chart((alt.Chart(pm).mark_bar().encode(
+            x=alt.X("week_label:N", sort=list(wk["week_label"]), title="Week",
+                    axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("Units:Q", title="Units"),
+            color=alt.Color("Stage:N", scale=alt.Scale(domain=_stage_order,
+                            range=["#185FA5", "#1BAF7A", "#EDA100"]), sort=_stage_order),
+            order=alt.Order("stage_order:Q"),
+            tooltip=["week_label", "Stage", alt.Tooltip("Units:Q", format=",")],
+        ).properties(height=300)), width='stretch')
+        if wk["is_partial"].any():
+            st.caption("Weeks marked `*` are in progress — sell-through % there is "
+                       "week-to-date, not a full week.")
+
+        # ── Weekly summary table (the buyer report) ──────────────────────────
+        st.divider()
+        st.subheader("Weekly summary — buyer report")
+        buyer = wk[["week_label", "week_end", "days_in_week", "units", "store_oh",
+                    "st_pct", "in_transit", "dc_oh", "pipeline", "pipe_st_pct",
+                    "in_whse", "dc_oo", "store_wos", "pipe_wos"]].copy()
+        buyer["week_end"] = buyer["week_end"].dt.strftime("%Y-%m-%d")
+        for c in ["units", "store_oh", "in_transit", "dc_oh", "pipeline", "in_whse", "dc_oo"]:
+            buyer[c] = buyer[c].round().astype(int)
+        for c in ["st_pct", "pipe_st_pct", "store_wos", "pipe_wos"]:
+            buyer[c] = buyer[c].round(1)
+        buyer.columns = ["Week", "Week ending", "Days", "Units sold",
+                         "Store on-hand (EOW)", "Sell-through %", "In transit",
+                         "DC on-hand", "Total pipeline", "Pipeline sell-through %",
+                         "In warehouse", "DC on-order", "Store WOS", "Pipeline WOS"]
+        st.dataframe(buyer.iloc[::-1], width='stretch', hide_index=True,
+                     column_config={
+                         "Sell-through %": _pct_cfg,
+                         "Pipeline sell-through %": _pct_cfg,
+                         "Store WOS": _wos_cfg,
+                         "Pipeline WOS": _wos_cfg,
+                     })
+    else:
+        # ── Season summary (one roll-up, no weekly breakdown) ────────────────
+        st.divider()
+        st.subheader("Season summary — buyer report")
+        st.caption(
+            f"The whole season on one line: units sold from Walmart week 5 through "
+            f"{latest.strftime('%b %d, %Y')} against the current inventory position. "
+            f"Sell-through % = season units ÷ (season units + current store "
+            f"on-hand); WOS uses the recent sell rate (last {recent_days} data days)."
+        )
+        _rd1 = lambda v: round(v, 1) if np.isfinite(v) else np.nan
+        buyer = pd.DataFrame([{
+            "Season": f"{wk['week_label'].iloc[0]} – {wk['week_label'].iloc[-1]}",
+            "Through": latest.strftime("%Y-%m-%d"),
+            "Days": int(wk["days_in_week"].sum()),
+            "Units sold": int(round(season_units)),
+            "Units sold LY": int(round(season_units_ly)),
+            "Store on-hand (current)": int(round(store_oh_now)),
+            "Sell-through %": _rd1(season_st),
+            "LY sell-through %": _rd1(season_st_ly),
+            "In transit": int(round(in_transit_now)),
+            "DC on-hand": int(round(dc_oh_now)),
+            "Total pipeline": int(round(pipeline_now)),
+            "Pipeline sell-through %": _rd1(season_pipe_st),
+            "In warehouse": int(round(in_whse_now)),
+            "DC on-order": int(round(dc_oo_now)),
+            "Store WOS": _rd1(store_oh_now / weekly_rate) if weekly_rate else np.nan,
+            "Pipeline WOS": _rd1(pipeline_now / weekly_rate) if weekly_rate else np.nan,
+        }])
+        st.dataframe(buyer, width='stretch', hide_index=True,
+                     column_config={
+                         "Sell-through %": _pct_cfg,
+                         "LY sell-through %": _pct_cfg,
+                         "Pipeline sell-through %": _pct_cfg,
+                         "Store WOS": _wos_cfg,
+                         "Pipeline WOS": _wos_cfg,
+                     })
 
     # ── Store-level detail (rides along in the Excel export) ────────────────
     period_start = stw["week_first_day"].min()
@@ -3402,21 +3488,34 @@ def _render_sellthrough():
     period_note = (f"Per store, bins combined · units sold "
                    f"{period_start.strftime('%b %d, %Y')} – {as_of} · "
                    f"on-hand as of {as_of}")
-    xlsx_bytes = _sellthrough_xlsx(buyer, store_detail, as_of, period_note)
+    if season_view:
+        xlsx_bytes = _sellthrough_xlsx(
+            buyer, store_detail, as_of, period_note,
+            summary_sheet="Season sell-through",
+            summary_note=f"As of {as_of} · Walmart BI Link · Full + Half bins "
+                         f"combined · one roll-up since Walmart week 5")
+        csv_label = "⬇ Season summary (CSV)"
+        xlsx_label = "⬇ Buyer workbook (Excel: season + store detail)"
+        base_name = f"funpop_bin_sellthrough_season_{stamp}"
+    else:
+        xlsx_bytes = _sellthrough_xlsx(buyer, store_detail, as_of, period_note)
+        csv_label = "⬇ Weekly summary (CSV)"
+        xlsx_label = "⬇ Buyer workbook (Excel: weekly + store detail)"
+        base_name = f"funpop_bin_sellthrough_{stamp}"
     e1, e2 = st.columns(2)
     with e1:
         st.download_button(
-            "⬇ Weekly summary (CSV)",
+            csv_label,
             data=buyer.to_csv(index=False).encode("utf-8"),
-            file_name=f"funpop_bin_sellthrough_{stamp}.csv",
+            file_name=f"{base_name}.csv",
             mime="text/csv",
         )
     with e2:
         if xlsx_bytes:
             st.download_button(
-                "⬇ Buyer workbook (Excel: weekly + store detail)",
+                xlsx_label,
                 data=xlsx_bytes,
-                file_name=f"funpop_bin_sellthrough_{stamp}.xlsx",
+                file_name=f"{base_name}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         else:
