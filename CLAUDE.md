@@ -70,6 +70,11 @@ its forecast columns and builds the query. Used by both the app
 
 - All date filters anchor on `CURRENT_DATE('America/Chicago')` (BI Link feeds land
   ~7am Central, ~1 day lag).
+- The Sell-Through tab does **not** use the sidebar lookback: it has its own fixed
+  window (Walmart week 5 of the current fiscal year → current week), served by
+  `sql/sellthrough_store_query.sql` / `sql/sellthrough_dc_query.sql`, which derive
+  the week bounds in-SQL and aggregate to store-week grain so the longer window
+  stays a small frame.
 - Secondary loaders are fault-tolerant: a bad source yields a section-local
   warning via `_section_error`, not a page crash. Raw BigQuery errors are logged
   server-side only (the dashboard is public).

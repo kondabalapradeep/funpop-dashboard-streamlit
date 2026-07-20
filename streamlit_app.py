@@ -637,6 +637,64 @@ def load_dc_lookahead_data(lookback_days: int, refresh_slot: str = "") -> tuple[
         return pd.DataFrame(), str(e)
 
 
+@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+def load_sellthrough_store_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    """Store×week bin roll-up for the Sell-Through tab, spanning Walmart week 5
+    of the current fiscal year through the current week. The tab is a fixed
+    program-to-date buyer report, so its window is independent of the sidebar
+    lookback; the ~20+ weeks stay a small frame because the query aggregates to
+    store-week grain in BigQuery (no lookback param — the window is derived
+    in-SQL, which also keeps the snapshot key stable day to day)."""
+    try:
+        df = _cached_query("sellthrough_store_query.sql", [
+            bigquery.ArrayQueryParameter("bin_items", "INT64", BIN_ITEMS),
+        ])
+        if not df.empty:
+            for c in ["week_first_day", "week_end"]:
+                df[c] = pd.to_datetime(df[c])
+            _shrink_frame(df,
+                int_cols=["walmart_calendar_week", "store_number", "days_in_week",
+                          "units_ty", "units_ly", "eow_on_hand_ty", "eow_on_hand_ly",
+                          "eow_in_whse_ty", "eow_in_transit_ty"],
+                cat_cols=["state_or_province_code"])
+        return df, None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+def load_sellthrough_dc_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
+    """Daily DC bin position over the Sell-Through tab's week-5→current window.
+    Packs → eaches conversion mirrors load_dc_data: the feed's per-row
+    eaches-per-pack first, constants.CASE_PACK_UNITS only where it's missing.
+    Not snapshot-pre-shrunk for the same reason as dc_query.sql — the conversion
+    drops the pack-size column it depends on, so it must run exactly once here."""
+    try:
+        df = _cached_query("sellthrough_dc_query.sql", [
+            bigquery.ArrayQueryParameter("bin_items", "INT64", BIN_ITEMS),
+        ])
+        if df.empty:
+            return df, None
+        df["inventory_date"] = pd.to_datetime(df["inventory_date"])
+        qty_cols = ["on_hand_warehouse_inventory_in_units_this_year",
+                    "on_order_warehouse_quantity_in_units_this_year"]
+        for c in qty_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        if "warehouse_pack_each_quantity" in df.columns:
+            pack_each = pd.to_numeric(df["warehouse_pack_each_quantity"], errors="coerce").fillna(0)
+            fallback = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+            multiplier = pack_each.where(pack_each > 0, fallback)
+        else:
+            multiplier = df["walmart_item_number"].map(CASE_PACK_UNITS).fillna(1)
+        for c in qty_cols:
+            df[c] = (df[c] * multiplier).round().astype("int32")
+        df = df.drop(columns=["warehouse_pack_each_quantity"], errors="ignore")
+        _shrink_frame(df, int_cols=["walmart_item_number", "distribution_center_number"])
+        return df, None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
 # ─── Store directory (mailing addresses for the field-ops export) ────────────
 # The daily store_query intentionally drops store name/city/address to keep the
 # heavy ~550k-row frame small (see load_store_data), so it only carries the
@@ -3038,6 +3096,12 @@ def _render_inventory():
 # (the state filter still applies to store figures; DC figures stay
 # network-wide, consistent with the rest of the dashboard).
 #
+# Reporting window: Walmart week 5 of the current fiscal year through the
+# current week — program-to-date, NOT the sidebar lookback. The data comes from
+# the tab's own loaders (load_sellthrough_store_data / load_sellthrough_dc_data),
+# which aggregate to store-week grain in BigQuery so the longer window doesn't
+# blow up the app's memory footprint.
+#
 # Definitions (same conventions as Inventory & DC):
 #   Sell-through % = units sold ÷ (units sold + ending store on-hand). BI Link
 #     carries no store-receipts feed, so this receipt-free form stands in for
@@ -3092,16 +3156,30 @@ def _sellthrough_xlsx(weekly: pd.DataFrame, stores: pd.DataFrame,
 
 @st.fragment
 def _render_sellthrough():
-    bins = df_all[df_all["walmart_item_number"].isin(BIN_ITEMS)]
-    if bins.empty:
-        st.warning("No bin-item data in the current window — nothing to report.")
+    stw, stw_err = load_sellthrough_store_data(slot)
+    if stw_err:
+        _section_error("Sell-through data", stw_err)
         return
-    dc_bins = (dc_df_all[dc_df_all["walmart_item_number"].isin(BIN_ITEMS)]
-               if not dc_df_all.empty else pd.DataFrame())
+    if stw.empty:
+        st.warning("No bin-item data between Walmart week 5 and the current "
+                   "week — nothing to report.")
+        return
+    if state_sel:
+        stw = stw[stw["state_or_province_code"].astype(str).isin(state_sel)]
+        if stw.empty:
+            st.warning("No bin-item data for the selected states.")
+            return
+    dc_bins, dc_err = load_sellthrough_dc_data(slot)
+    if dc_err:
+        # DC data is context, not the backbone — degrade to store-side figures.
+        _section_error("Sell-through DC data", dc_err)
+        dc_bins = pd.DataFrame()
 
     st.caption(
         "**Bins only — Full + Half combined** (shelf item excluded; the sidebar item "
-        "filter does not apply here). **Sell-through %** = units sold ÷ (units sold + "
+        "filter does not apply here). Reporting window: **Walmart week 5 through the "
+        "current week** — the sidebar date range does not apply either. "
+        "**Sell-through %** = units sold ÷ (units sold + "
         "ending store on-hand). **Total pipeline** = store on-hand + in-transit + DC "
         "on-hand; in-warehouse is shown for context but excluded from the total (it "
         "would double-count DC on-hand). Store figures follow the sidebar state "
@@ -3109,24 +3187,20 @@ def _render_sellthrough():
     )
 
     # ── Weekly roll-up (Walmart weeks, Sat–Fri) ──────────────────────────────
-    wk = bins.groupby("walmart_calendar_week", as_index=False).agg(
-        units=("pos_quantity_this_year", "sum"),
-        units_ly=("pos_quantity_last_year", "sum"),
-        days_in_week=("business_date", "nunique"),
-        week_end=("business_date", "max"),
+    # The loader's frame is already store×week grain with the ending inventory
+    # (the week's last data day — Friday for complete weeks, the most recent
+    # day for the in-progress one) attached per store, so the weekly view is a
+    # plain sum across stores.
+    wk = stw.groupby("walmart_calendar_week", as_index=False).agg(
+        units=("units_ty", "sum"),
+        units_ly=("units_ly", "sum"),
+        days_in_week=("days_in_week", "first"),
+        week_end=("week_end", "first"),
+        store_oh=("eow_on_hand_ty", "sum"),
+        store_oh_ly=("eow_on_hand_ly", "sum"),
+        in_whse=("eow_in_whse_ty", "sum"),
+        in_transit=("eow_in_transit_ty", "sum"),
     ).sort_values("walmart_calendar_week").reset_index(drop=True)
-
-    # Ending inventory = the week's last day of data (Friday for complete
-    # weeks; the most recent day for the in-progress one).
-    eow = bins[bins["business_date"].isin(wk["week_end"])]
-    wk = wk.merge(
-        eow.groupby("walmart_calendar_week", as_index=False).agg(
-            store_oh=("store_on_hand_quantity_this_year", "sum"),
-            store_oh_ly=("store_on_hand_quantity_last_year", "sum"),
-            in_whse=("store_in_warehouse_quantity_this_year", "sum"),
-            in_transit=("store_in_transit_quantity_this_year", "sum"),
-        ),
-        on="walmart_calendar_week", how="left")
 
     # DC ending position for the same weeks: last DC snapshot within each
     # Walmart week (the DC feed can lag the store feed by a day).
@@ -3161,12 +3235,15 @@ def _render_sellthrough():
     wk["week_label"] = _wm_week_label(wk["walmart_calendar_week"], wk["is_partial"])
 
     # ── KPI strip (latest snapshot) ──────────────────────────────────────────
-    latest = bins["business_date"].max()
-    snap = bins[bins["business_date"] == latest]
-    store_oh_now = float(snap["store_on_hand_quantity_this_year"].sum())
-    store_oh_ly_now = float(snap["store_on_hand_quantity_last_year"].sum())
-    in_whse_now = float(snap["store_in_warehouse_quantity_this_year"].sum())
-    in_transit_now = float(snap["store_in_transit_quantity_this_year"].sum())
+    # The latest week's ending position IS the current snapshot: the loader
+    # anchors each week's inventory to its last data day, so the in-progress
+    # week's row carries the most recent on-hand levels.
+    _last = wk.iloc[-1]
+    latest = _last["week_end"]
+    store_oh_now = float(_last["store_oh"])
+    store_oh_ly_now = float(_last["store_oh_ly"])
+    in_whse_now = float(_last["in_whse"])
+    in_transit_now = float(_last["in_transit"])
     dc_oh_now = dc_oo_now = 0.0
     dc_date = None
     if not dc_bins.empty:
@@ -3176,9 +3253,11 @@ def _render_sellthrough():
         dc_oo_now = float(_dcs["on_order_warehouse_quantity_in_units_this_year"].sum())
     pipeline_now = store_oh_now + in_transit_now + dc_oh_now
 
-    recent = bins[bins["business_date"] >= latest - timedelta(days=13)]
-    recent_days = max(1, recent["business_date"].dt.normalize().nunique())
-    weekly_rate = float(recent["pos_quantity_this_year"].sum()) / recent_days * 7
+    # Recent velocity from the last two Walmart weeks (8–14 data days) — the
+    # weekly-grain stand-in for the old rolling 14-day window.
+    _recent = wk.tail(2)
+    recent_days = max(1, int(_recent["days_in_week"].sum()))
+    weekly_rate = float(_recent["units"].sum()) / recent_days * 7
 
     full_weeks = wk[~wk["is_partial"]]
     last_full = full_weeks.iloc[-1] if not full_weeks.empty else None
@@ -3285,14 +3364,15 @@ def _render_sellthrough():
                  })
 
     # ── Store-level detail (rides along in the Excel export) ────────────────
-    period_start = bins["business_date"].min()
-    period_weeks = max(1 / 7, bins["business_date"].dt.normalize().nunique() / 7)
-    store_detail = bins.groupby("store_number", as_index=False).agg(
+    period_start = stw["week_first_day"].min()
+    period_weeks = max(1 / 7, int(wk["days_in_week"].sum()) / 7)
+    store_detail = stw.groupby("store_number", as_index=False).agg(
         state=("state_or_province_code", "first"),
-        units=("pos_quantity_this_year", "sum"),
+        units=("units_ty", "sum"),
     )
-    _cur_oh = snap.groupby("store_number", as_index=False).agg(
-        on_hand=("store_on_hand_quantity_this_year", "sum"))
+    _cur_oh = (stw[stw["walmart_calendar_week"] == _last["walmart_calendar_week"]]
+               .groupby("store_number", as_index=False)
+               .agg(on_hand=("eow_on_hand_ty", "sum")))
     store_detail = store_detail.merge(_cur_oh, on="store_number", how="left")
     store_detail["on_hand"] = store_detail["on_hand"].fillna(0).astype(int)
     store_detail["st_pct"] = np.round(

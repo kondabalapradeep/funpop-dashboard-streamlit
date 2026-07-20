@@ -29,7 +29,7 @@ from google.oauth2 import service_account
 import forecast_source
 import snapshot
 import transforms
-from constants import ACTIVE_ITEMS
+from constants import ACTIVE_ITEMS, BIN_ITEMS
 
 SQL_DIR = Path(__file__).parent / "sql"
 CENTRAL_TZ = ZoneInfo("America/Chicago")
@@ -49,6 +49,9 @@ def query_jobs(lookback: int):
     loaders in streamlit_app.py."""
     items = bigquery.ArrayQueryParameter("active_items", "INT64", list(ACTIVE_ITEMS))
     lb = bigquery.ScalarQueryParameter("lookback_days", "INT64", lookback)
+    # The Sell-Through tab's fixed week-5→current window takes no lookback param
+    # (the range is derived in-SQL), so its snapshot key is stable day to day.
+    bins = bigquery.ArrayQueryParameter("bin_items", "INT64", list(BIN_ITEMS))
     return [
         ("store_query.sql", [items, lb]),
         ("dc_query.sql", [items, lb]),
@@ -61,6 +64,8 @@ def query_jobs(lookback: int):
         ("backroom_query.sql", [items, lb]),
         ("store_lookahead_query.sql", [items, lb]),
         ("dc_lookahead_query.sql", [items, lb]),
+        ("sellthrough_store_query.sql", [bins]),
+        ("sellthrough_dc_query.sql", [bins]),
     ]
 
 
