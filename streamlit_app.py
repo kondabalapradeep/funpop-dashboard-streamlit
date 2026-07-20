@@ -637,7 +637,8 @@ def load_dc_lookahead_data(lookback_days: int, refresh_slot: str = "") -> tuple[
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=2,
+               show_spinner="Loading sell-through data (full season)...")
 def load_sellthrough_store_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     """Store×week bin roll-up for the Sell-Through tab, spanning Walmart week 5
     of the current fiscal year through the current week. The tab is a fixed
@@ -662,7 +663,8 @@ def load_sellthrough_store_data(refresh_slot: str = "") -> tuple[pd.DataFrame, s
         return pd.DataFrame(), str(e)
 
 
-@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=2,
+               show_spinner="Loading sell-through DC data...")
 def load_sellthrough_dc_data(refresh_slot: str = "") -> tuple[pd.DataFrame, str | None]:
     """Daily DC bin position over the Sell-Through tab's week-5→current window.
     Packs → eaches conversion mirrors load_dc_data: the feed's per-row

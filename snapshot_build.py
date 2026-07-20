@@ -134,11 +134,19 @@ def main() -> int:
         return 1
 
     new_max = pd.to_datetime(store_df["business_date"]).max() if "business_date" in store_df.columns and not store_df.empty else None
+    # A query added to query_jobs mid-day has no parquet yet; the feed gate
+    # would otherwise defer its first snapshot to the next morning while every
+    # app visitor pays the live-query cost. Missing files override the skip.
+    missing = [fn for fn, ps in jobs
+               if not (snapshot.SNAPSHOT_DIR / f"{snapshot.snapshot_key(fn, ps)}.parquet").exists()]
     if prior_max is not None and pd.notna(prior_max) and pd.notna(new_max) and new_max <= prior_max:
-        print(f"Store feed has not advanced (max={new_max.date()}, prior={prior_max.date()}); skipping build.")
-        return 0
-
-    print(f"Store feed advanced (max={new_max}, prior={prior_max}); rebuilding all queries.")
+        if not missing:
+            print(f"Store feed has not advanced (max={new_max.date()}, prior={prior_max.date()}); skipping build.")
+            return 0
+        print(f"Store feed has not advanced (max={new_max.date()}, prior={prior_max.date()}) "
+              f"but {len(missing)} snapshot(s) missing ({', '.join(missing)}); building.")
+    else:
+        print(f"Store feed advanced (max={new_max}, prior={prior_max}); rebuilding all queries.")
 
     # Keys this build is responsible for. Built up-front from the full job list
     # (not from per-query success) so a transient single-query failure can't make
