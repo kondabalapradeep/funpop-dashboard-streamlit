@@ -4,6 +4,10 @@
 
 A Streamlit app that pulls live data from BigQuery using your service-account JSON and renders a dashboard with all the calculations from the original script. Hosted free on Streamlit Community Cloud. Anyone with the link sees the dashboard; clicking **Refresh data** in the sidebar forces a fresh BQ pull.
 
+> **Handing this off to someone else?** See [`TRANSFER.md`](TRANSFER.md) for a
+> complete, step-by-step transfer checklist (code, hosting, credentials, and the
+> GitHub Actions automation).
+
 ## Files
 
 | File | What it is |
