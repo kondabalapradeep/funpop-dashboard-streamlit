@@ -1,0 +1,17 @@
+# Normalize line endings.
+#
+# The working copy on Windows/OneDrive is CRLF while every commit in this
+# repo's history stores LF. With no .gitattributes and core.autocrlf unset,
+# git treated that as a real change: `git diff` reported all 28 tracked files
+# fully rewritten (~6,800 lines), which buries the two-line fix you actually
+# made and makes review or `git blame` useless.
+#
+# text=auto eol=lf  ->  LF in the repository and in the working tree.
+# Windows editors (VS Code, PyCharm, Notepad) all handle LF fine.
+* text=auto eol=lf
+
+# Binary — never touch these.
+*.png binary
+*.jpg binary
+*.parquet binary
+*.xlsx binary

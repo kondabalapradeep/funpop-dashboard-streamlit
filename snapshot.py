@@ -51,9 +51,13 @@ MANIFEST_PATH = SNAPSHOT_DIR / "built_at.txt"
 # Raw-URL base of the snapshot-data branch the workflow force-pushes. The
 # deployed app fetches snapshot files from here when they aren't on local disk.
 # Override with the SNAPSHOT_REMOTE_URL env var if the repo moves.
+# NOTE: the repo was transferred from nathantj123 to kondabalapradeep. GitHub
+# keeps the old owner's URLs redirecting, so the stale value kept working — if
+# it moves again, update this (the publish side needs no change: snapshot.yml
+# pushes to ${GITHUB_REPOSITORY}, which follows the repo automatically).
 SNAPSHOT_REMOTE_URL = os.environ.get(
     "SNAPSHOT_REMOTE_URL",
-    "https://raw.githubusercontent.com/nathantj123/funpop-dashboard-streamlit/snapshot-data",
+    "https://raw.githubusercontent.com/kondabalapradeep/funpop-dashboard-streamlit/snapshot-data",
 ).rstrip("/")
 # Only needed if the repo is made private (raw URLs 404 without auth then).
 # The app can also set this from st.secrets at startup.
