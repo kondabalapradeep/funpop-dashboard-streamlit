@@ -50,6 +50,7 @@ on one source produces a section-local warning rather than a page crash.
 import io
 import json
 import logging
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -223,9 +224,38 @@ def _section_error(label: str, err: object) -> None:
 
 
 # ─── Auth + BigQuery client ──────────────────────────────────────────────────
+# Service-account JSON that has travelled through an email/link scanner comes
+# back with its Google URLs rewritten to a "safe link" redirector (Barracuda
+# LinkProtect wraps the original in the ?a= query param). A rewritten
+# universe_domain makes bigquery.Client() reject the credentials outright
+# ("configured universe domain … does not match"), which killed every tab. Undo
+# the rewrite on the URL-ish fields so a re-pasted secret can't take the app
+# down; the real fix is still a clean paste into the deployment's secrets.
+_SA_URL_FIELDS = ("universe_domain", "token_uri", "auth_uri",
+                  "auth_provider_x509_cert_url", "client_x509_cert_url")
+
+
+def _unwrap_safe_link(value: str) -> str:
+    if "linkprotect.cudasvc.com" not in value:
+        return value
+    original = urllib.parse.parse_qs(urllib.parse.urlsplit(value).query).get("a")
+    return urllib.parse.unquote(original[0]) if original else value
+
+
 @st.cache_resource
 def _get_sa_info():
-    return json.loads(st.secrets["gcp_service_account_json"])
+    info = json.loads(st.secrets["gcp_service_account_json"])
+    for key in _SA_URL_FIELDS:
+        if isinstance(info.get(key), str):
+            info[key] = _unwrap_safe_link(info[key])
+    # universe_domain is a bare host, not a URL — strip any scheme/path that a
+    # rewrite (or a hand edit) left behind.
+    domain = info.get("universe_domain")
+    if isinstance(domain, str):
+        info["universe_domain"] = (
+            urllib.parse.urlsplit(domain).netloc or domain.strip("/ ")
+        ) or "googleapis.com"
+    return info
 
 
 @st.cache_resource
@@ -808,14 +838,27 @@ STATE_FIPS = {
 US_STATES_TOPO_URL = "https://vega.github.io/vega-datasets/data/us-10m.json"
 
 
-@st.cache_resource(show_spinner=False)
-def _state_lines_geo_trace():
-    """State-boundary line trace for the zone map, built from the repo's local
-    geojson (weather_source.BOUNDARY_PATH) rather than Plotly's scope="usa",
-    which lazy-fetches its base atlas from cdn.plot.ly in the viewer's browser
-    — an external dependency worth avoiding now that the boundary file already
-    ships in the repo for the Weather tab. Polygon/MultiPolygon rings are
-    flattened into one Scattergeo line trace, None-separated between rings."""
+@st.cache_data(show_spinner=False)
+def _state_lines_geo_coords():
+    """Flattened (lon, lat) point lists for the state-boundary outline, built
+    from the repo's local geojson (weather_source.BOUNDARY_PATH) rather than
+    Plotly's scope="usa", which lazy-fetches its base atlas from cdn.plot.ly in
+    the viewer's browser — an external dependency worth avoiding now that the
+    boundary file already ships in the repo for the Weather tab.
+    Polygon/MultiPolygon rings are flattened into one line, None-separated
+    between rings.
+
+    Only the *coordinates* are cached, never a graph_objects trace. A cached
+    trace is a single mutable object shared by every browser session, and
+    Figure.add_trace() reaches into that object's live _props dict and pops
+    "type" out of it before putting it back (plotly _plotly_utils/
+    basevalidators.py, BaseDataValidator.validate_coerce). Two sessions
+    rendering this tab at the same moment race on that pop: the loser reads a
+    dict with no "type", the validator falls back to "scatter", and the trace
+    dies with "Invalid property specified for object of type
+    plotly.graph_objs.Scatter: 'lat'". Building a fresh trace per call keeps
+    the expensive geojson parse cached while giving each session its own
+    object."""
     geo = json.loads(weather_source.BOUNDARY_PATH.read_text())
     lons, lats = [], []
     for feat in geo["features"]:
@@ -825,6 +868,13 @@ def _state_lines_geo_trace():
         for ring in rings:
             lons.extend([pt[0] for pt in ring] + [None])
             lats.extend([pt[1] for pt in ring] + [None])
+    return lons, lats
+
+
+def _state_lines_geo_trace():
+    """A fresh state-boundary line trace. See _state_lines_geo_coords() for why
+    this must not be cached."""
+    lons, lats = _state_lines_geo_coords()
     return go.Scattergeo(
         lon=lons, lat=lats, mode="lines",
         line=dict(width=0.8, color="#b0b0b0"),
