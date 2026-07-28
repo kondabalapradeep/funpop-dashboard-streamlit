@@ -60,7 +60,12 @@ jobs:
 
       - name: Ping dashboard (wake the container, warm cache from snapshot)
         env:
-          DASHBOARD_URL: https://funpop-dashboard.streamlit.app/
+          # The deployed app URL. Set the repo variable DASHBOARD_URL
+          # (Settings -> Secrets and variables -> Actions -> Variables) to
+          # your own Streamlit app so a new owner doesn't ping someone
+          # else's app. Falls back to the original URL if the variable is
+          # unset, so existing deployments keep working unchanged.
+          DASHBOARD_URL: ${{ vars.DASHBOARD_URL || 'https://funpop-dashboard.streamlit.app/' }}
         run: |
           cat > ping.mjs <<'EOF'
           import { chromium } from 'playwright';
